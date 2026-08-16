@@ -1,0 +1,7 @@
+title: "PLEX DupeFinder FF"
+version: "1.0.0"
+package_name: "plex_dupefinder_ff"
+developer: "njworange"
+description: "plex_mate 연결 정보를 사용하는 Plex 중복 검사 및 안전한 수동 삭제 플러그인"
+home: "https://github.com/njworange/plex_dupefinder_ff"
+more: "https://raw.githubusercontent.com/njworange/plex_dupefinder_ff/main/README.md"

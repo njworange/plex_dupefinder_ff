@@ -1,0 +1,2 @@
+# FlaskFarm normally provides requests. This file documents the supported range.
+requests>=2.25,<3

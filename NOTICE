@@ -1,0 +1,14 @@
+Plex DupeFinder FF
+Copyright (C) 2026 njworange contributors
+
+This project is distributed under the GNU General Public License v3.0.
+
+Duplicate discovery and configurable scoring concepts were inspired by:
+  plex_dupefinder - https://github.com/l3uddz/plex_dupefinder
+  Copyright its respective contributors, licensed under GPL-3.0.
+
+FlaskFarm integration targets:
+  FlaskFarm - https://github.com/flaskfarm/flaskfarm
+  plex_mate - https://github.com/flaskfarm/plex_mate
+
+Plex is a trademark of Plex, Inc. This project is not affiliated with Plex, Inc.

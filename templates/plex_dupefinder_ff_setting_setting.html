@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('plex_dupefinder_ff.static', filename='pdff.css') }}">
+
+<div class="pdff-toolbar">
+  {{ macros.m_button_group([['globalSettingSaveBtn', '설정 저장']]) }}
+  <button id="connection_btn" type="button" class="btn btn-sm btn-outline-primary">Plex 연결 확인</button>
+  <button id="libraries_btn" type="button" class="btn btn-sm btn-outline-secondary">라이브러리 조회</button>
+</div>
+
+<section class="pdff-panel">
+  <h3 class="pdff-title">plex_mate 연결 상태</h3>
+  <div id="connection_status" class="pdff-empty">연결 확인 버튼을 눌러주세요.</div>
+  <div id="library_status"></div>
+</section>
+
+<form id="setting" name="설정">
+  <nav>
+    {{ macros.m_tab_head_start() }}
+      {{ macros.m_tab_head('general', '기본', true) }}
+      {{ macros.m_tab_head('score', '점수', false) }}
+      {{ macros.m_tab_head('delete', '삭제 안전장치', false) }}
+    {{ macros.m_tab_head_end() }}
+  </nav>
+  <div class="tab-content">
+    {{ macros.m_tab_content_start('general', true) }}
+      {{ macros.setting_input_int('setting_request_timeout', 'Plex 요청 제한시간', value=arg.get('setting_request_timeout', '20'), min=5, max=120, desc='초 단위. DELETE timeout은 자동 재시도하지 않습니다.') }}
+      <div class="alert alert-info small">Plex URL·Token·Machine ID는 작업 시작 시마다 <strong>plex_mate</strong>에서 읽으며 이 플러그인 DB에는 저장하지 않습니다.</div>
+    {{ macros.m_tab_content_end() }}
+
+    {{ macros.m_tab_content_start('score', false) }}
+      <div class="alert alert-info small">점수는 유지 추천 근거일 뿐 삭제 권한이 아닙니다. 형식은 한 줄에 <code>이름=점수</code>입니다.</div>
+      {{ macros.setting_input_textarea('setting_resolution_scores', '해상도 점수', value=arg.get('setting_resolution_scores', ''), row='8') }}
+      {{ macros.setting_input_textarea('setting_video_codec_scores', '비디오 코덱 점수', value=arg.get('setting_video_codec_scores', ''), row='8') }}
+      {{ macros.setting_input_textarea('setting_audio_codec_scores', '오디오 코덱 점수', value=arg.get('setting_audio_codec_scores', ''), row='8', desc='오디오 트랙 수를 합산하지 않고 가장 좋은 트랙 하나만 반영합니다.') }}
+      {{ macros.setting_input_textarea('setting_filename_rules', '파일명 패턴 점수', value=arg.get('setting_filename_rules', ''), row='6', desc='fnmatch 패턴. 멀티파트에서도 규칙당 한 번만 적용합니다.') }}
+      {{ macros.setting_input_text('setting_bitrate_weight', 'Bitrate 가중치', value=arg.get('setting_bitrate_weight', '2')) }}
+      {{ macros.setting_input_text('setting_duration_weight', 'Duration 가중치', value=arg.get('setting_duration_weight', '0.0033333333')) }}
+      {{ macros.setting_input_text('setting_dimension_weight', '가로·세로 가중치', value=arg.get('setting_dimension_weight', '2')) }}
+      {{ macros.setting_input_text('setting_audio_channel_weight', '오디오 채널 가중치', value=arg.get('setting_audio_channel_weight', '1000')) }}
+      {{ macros.setting_checkbox('setting_use_filesize', '파일 크기 점수 사용', value=arg.get('setting_use_filesize', 'False')) }}
+      {{ macros.setting_input_text('setting_filesize_weight', '파일 크기 가중치', value=arg.get('setting_filesize_weight', '0.00001')) }}
+    {{ macros.m_tab_content_end() }}
+
+    {{ macros.m_tab_content_start('delete', false) }}
+      <div class="pdff-danger mb-3"><strong>주의:</strong> Plex Media 삭제는 해당 버전의 실제 파일을 삭제할 수 있습니다. 자동·일괄 삭제는 구현되어 있지 않으며 기본값은 꺼짐입니다.</div>
+      {{ macros.setting_checkbox('setting_delete_enabled', '그룹별 수동 삭제 활성화', value=arg.get('setting_delete_enabled', 'False'), desc='삭제 전 사전확인, 확인문구, 서버·metadata·Media·Part 재검증을 모두 수행합니다.') }}
+      {{ macros.setting_input_textarea('setting_allowed_roots', '삭제 허용 미디어 루트', value=arg.get('setting_allowed_roots', ''), row='6', desc=['한 줄에 하나씩 Plex가 반환하는 절대 경로를 입력합니다.', '비어 있거나 후보 경로가 루트 밖이면 삭제를 차단합니다.']) }}
+      {{ macros.setting_input_int('setting_max_delete_per_run', '스캔 1회당 최대 삭제 수', value=arg.get('setting_max_delete_per_run', '1'), min=1, max=100) }}
+      {{ macros.setting_checkbox('setting_require_guid', 'GUID 필수', value=arg.get('setting_require_guid', 'True')) }}
+      {{ macros.setting_checkbox('setting_block_multipart', '멀티파트 삭제 차단', value=arg.get('setting_block_multipart', 'True')) }}
+    {{ macros.m_tab_content_end() }}
+  </div>
+</form>
+
+<script src="{{ url_for('plex_dupefinder_ff.static', filename='pdff.js') }}"></script>
+<script>
+'use strict';
+var packageName = {{ arg['package_name']|tojson }};
+var wasDeleteEnabled = {{ 'true' if arg.get('setting_delete_enabled', 'False') == 'True' else 'false' }};
+
+function globalSettingSaveBefore() {
+  if (!wasDeleteEnabled && $('#setting_delete_enabled').is(':checked')) {
+    return window.confirm('수동 삭제를 활성화합니다. Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?');
+  }
+  return true;
+}
+
+function renderConnection(data) {
+  var html = '<div class="pdff-grid">' +
+    '<div><span class="pdff-kv-label">Plex URL</span>' + PDFF.esc(data.base_url || '-') + '</div>' +
+    '<div><span class="pdff-kv-label">PMS 버전</span>' + PDFF.esc(data.server_version || '-') + '</div>' +
+    '<div><span class="pdff-kv-label">설정 Machine</span><span class="pdff-code">' + PDFF.esc(data.configured_machine || '-') + '</span></div>' +
+    '<div><span class="pdff-kv-label">서버 Machine</span><span class="pdff-code">' + PDFF.esc(data.server_machine || '-') + '</span></div>' +
+    '</div>';
+  if (!data.machine_match) html += '<div class="pdff-warning mt-3">Machine ID가 비어 있거나 일치하지 않습니다. 읽기 스캔은 가능할 수 있지만 삭제는 차단됩니다.</div>';
+  $('#connection_status').removeClass('pdff-empty').html(html);
+}
+
+$('#connection_btn').on('click', function () {
+  PDFF.request(packageName, 'setting', 'connection_status', {}, 'GET', function (ret) { if (ret.ret === 'success') renderConnection(ret.data); });
+});
+$('#libraries_btn').on('click', function () {
+  PDFF.request(packageName, 'setting', 'libraries', {}, 'GET', function (ret) {
+    if (ret.ret !== 'success') return;
+    renderConnection(ret.data);
+    var items = ret.data.sections || [];
+    var html = '<hr><strong>영화·TV 라이브러리</strong>';
+    items.forEach(function (item) { html += '<div class="pdff-library"><span class="pdff-badge pdff-secondary">' + PDFF.esc(item.type) + '</span><strong>' + PDFF.esc(item.title) + '</strong><span class="pdff-muted">ID ' + PDFF.esc(item.key) + '</span></div>'; });
+    if (!items.length) html += '<div class="pdff-empty">사용 가능한 라이브러리가 없습니다.</div>';
+    $('#library_status').html(html);
+  });
+});
+</script>
+{% endblock %}

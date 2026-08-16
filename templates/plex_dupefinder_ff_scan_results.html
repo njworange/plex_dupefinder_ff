@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('plex_dupefinder_ff.static', filename='pdff.css') }}">
+
+<section class="pdff-panel">
+  <h3 class="pdff-title">중복 결과</h3>
+  <div class="row">
+    <div class="col-md-3"><label class="small text-muted">스캔</label><select id="run_select" class="form-control form-control-sm"></select></div>
+    <div class="col-md-2"><label class="small text-muted">타입</label><select id="type_filter" class="form-control form-control-sm"><option value="">전체</option><option value="movie">영화</option><option value="episode">TV 에피소드</option></select></div>
+    <div class="col-md-2"><label class="small text-muted">안전 상태</label><select id="safe_filter" class="form-control form-control-sm"><option value="">전체</option><option value="safe">삭제 검증 가능</option><option value="blocked">삭제 차단</option></select></div>
+    <div class="col-md-4"><label class="small text-muted">검색</label><input id="keyword_filter" class="form-control form-control-sm" placeholder="제목 또는 라이브러리"></div>
+    <div class="col-md-1 d-flex align-items-end"><button id="filter_btn" class="btn btn-sm btn-primary" type="button">검색</button></div>
+  </div>
+  <div id="result_summary" class="pdff-muted mt-3"></div>
+</section>
+
+<section class="pdff-panel">
+  <div id="group_list" class="pdff-empty">스캔을 선택하세요.</div>
+  <div class="pdff-toolbar justify-content-center mt-3"><button id="prev_page" class="btn btn-sm btn-outline-secondary">이전</button><span id="page_label" class="pdff-muted"></span><button id="next_page" class="btn btn-sm btn-outline-secondary">다음</button></div>
+</section>
+
+<section id="detail_panel" class="pdff-panel" style="display:none">
+  <div class="pdff-toolbar"><h3 id="detail_title" class="pdff-title" style="margin:0">상세 비교</h3><button id="close_detail" type="button" class="btn btn-sm btn-outline-secondary">닫기</button></div>
+  <div id="detail_warning"></div>
+  <div id="candidate_list"></div>
+  <div id="delete_controls" class="pdff-danger" style="display:none">
+    <div class="row">
+      <div class="col-md-5"><label class="small">유지할 버전</label><select id="keep_candidate" class="form-control form-control-sm"></select></div>
+      <div class="col-md-5"><label class="small">삭제할 버전</label><select id="delete_candidate" class="form-control form-control-sm"></select></div>
+      <div class="col-md-2 d-flex align-items-end"><button id="delete_preview_btn" class="btn btn-sm btn-danger" type="button">삭제 사전확인</button></div>
+    </div>
+    <div class="small mt-2">Plex Media 버전과 그 Part 파일이 실제로 삭제될 수 있습니다. 한 번에 한 버전만 처리합니다.</div>
+  </div>
+</section>
+
+<script src="{{ url_for('plex_dupefinder_ff.static', filename='pdff.js') }}"></script>
+<script>
+'use strict';
+var packageName = {{ arg['package_name']|tojson }};
+var requestedRunId = {{ arg.get('requested_run_id', '')|tojson }};
+var csrfToken = {{ arg['csrf_token']|tojson }};
+var currentPage = 1;
+var pageSize = 50;
+var totalPages = 1;
+var currentDetail = null;
+
+function episodeLabel(group) {
+  if (group.media_type !== 'episode') return group.year ? ' (' + group.year + ')' : '';
+  var season = group.parent_index === null ? '?' : String(group.parent_index).padStart(2, '0');
+  var episode = group.index === null ? '?' : String(group.index).padStart(2, '0');
+  return ' · ' + PDFF.esc(group.grandparent_title || '') + ' S' + season + 'E' + episode;
+}
+
+function loadRuns() {
+  PDFF.request(packageName, 'scan', 'runs', {limit: 100}, 'GET', function (ret) {
+    if (ret.ret !== 'success') return;
+    var select = $('#run_select').empty();
+    (ret.data || []).forEach(function (run) {
+      var label = '#' + run.id + ' · ' + run.status + ' · ' + PDFF.date(run.created_at) + ' · ' + run.total_groups + ' groups';
+      select.append(new Option(label, run.id));
+    });
+    if (requestedRunId) select.val(String(requestedRunId));
+    if (select.val()) loadGroups(true); else $('#group_list').text('스캔 이력이 없습니다.');
+  });
+}
+
+function loadGroups(resetPage) {
+  var runId = $('#run_select').val();
+  if (!runId) return;
+  currentDetail = null;
+  $('#detail_panel').hide();
+  if (resetPage) currentPage = 1;
+  var payload = {
+    run_id: runId,
+    page: currentPage,
+    page_size: pageSize,
+    media_type: $('#type_filter').val(),
+    safety: $('#safe_filter').val(),
+    keyword: $('#keyword_filter').val().trim()
+  };
+  PDFF.request(packageName, 'scan', 'groups', payload, 'GET', function (ret) {
+    if (ret.ret !== 'success') return;
+    var result = ret.data || {};
+    currentPage = Number(result.page || 1);
+    totalPages = Math.max(1, Number(result.pages || 1));
+    renderGroups(result.items || [], Number(result.total || 0));
+  });
+}
+
+function applyFilter() {
+  loadGroups(true);
+}
+
+function renderGroups(items, total) {
+  currentPage = Math.max(1, Math.min(totalPages, currentPage));
+  $('#result_summary').text(total + '개 그룹');
+  $('#page_label').text(currentPage + ' / ' + totalPages);
+  $('#prev_page').prop('disabled', currentPage <= 1);
+  $('#next_page').prop('disabled', currentPage >= totalPages);
+  if (!items.length) { $('#group_list').addClass('pdff-empty').text('조건에 맞는 중복 그룹이 없습니다.'); return; }
+  var html = '';
+  items.forEach(function (group) {
+    var flags = (group.safety_flags || []).map(PDFF.flagLabel);
+    html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-7"><strong>' + PDFF.esc(group.title || '-') + '</strong>' + episodeLabel(group) + '<div class="pdff-muted">' + PDFF.esc(group.section_title) + ' · ratingKey ' + PDFF.esc(group.rating_key) + '</div>' + (flags.length ? '<div class="small text-danger">' + PDFF.esc(flags.join(' · ')) + '</div>' : '') + '</div><div class="col-md-3">' + PDFF.badge(group.safe_to_delete ? 'safe' : 'blocked') + ' <span class="pdff-muted">' + PDFF.esc(group.candidate_count) + ' versions</span></div><div class="col-md-2 text-right"><button class="btn btn-sm btn-outline-primary group-detail" data-id="' + PDFF.esc(group.id) + '">상세 비교</button></div></div></article>';
+  });
+  $('#group_list').removeClass('pdff-empty').html(html);
+}
+
+function candidateLabel(candidate) {
+  return 'Media #' + candidate.media_id + ' · ' + (candidate.video_resolution || candidate.height + 'p') + ' · ' + (candidate.video_codec || '-') + ' · ' + candidate.score;
+}
+
+function openGroup(groupId) {
+  PDFF.request(packageName, 'scan', 'group_detail', {group_id: groupId}, 'GET', function (ret) {
+    if (ret.ret !== 'success') return;
+    currentDetail = ret.data;
+    var group = ret.data.group;
+    var candidates = ret.data.candidates || [];
+    $('#detail_title').text((group.title || '-') + ' · Group #' + group.id);
+    var flags = (group.safety_flags || []).map(PDFF.flagLabel);
+    $('#detail_warning').html(group.safe_to_delete ? '<div class="alert alert-success">현재 스냅샷은 삭제 전 재검증 대상입니다. 실제 삭제 권한을 의미하지 않습니다.</div>' : '<div class="pdff-warning mb-3"><strong>삭제 차단:</strong> ' + PDFF.esc(flags.join(' · ') || '안전 조건 불충족') + '</div>');
+    var html = '';
+    candidates.forEach(function (candidate) {
+      var recommended = group.recommended_candidate_id === candidate.id;
+      var paths = (candidate.parts || []).map(function (part) { return part.file || ''; });
+      var breakdown = '';
+      Object.keys(candidate.score_breakdown || {}).forEach(function (key) { breakdown += '<div><span class="pdff-kv-label">' + PDFF.esc(key) + '</span>' + PDFF.esc(candidate.score_breakdown[key]) + '</div>'; });
+      html += '<article class="pdff-candidate' + (recommended ? ' pdff-candidate-recommended' : '') + '"><div class="d-flex justify-content-between"><strong>' + PDFF.esc(candidateLabel(candidate)) + '</strong>' + (recommended ? '<span class="pdff-badge pdff-success">유지 추천</span>' : '') + '</div><div class="pdff-grid mt-2"><div><span class="pdff-kv-label">영상</span>' + PDFF.esc(candidate.width + '×' + candidate.height + ' / ' + candidate.video_codec) + '</div><div><span class="pdff-kv-label">오디오</span>' + PDFF.esc(candidate.audio_codec + ' / ' + candidate.audio_channels + 'ch') + '</div><div><span class="pdff-kv-label">Bitrate</span>' + PDFF.esc(candidate.bitrate) + ' kbps</div><div><span class="pdff-kv-label">크기</span>' + PDFF.esc(PDFF.bytes(candidate.total_size)) + '</div><div><span class="pdff-kv-label">재생시간</span>' + PDFF.esc(PDFF.duration(candidate.duration)) + '</div><div><span class="pdff-kv-label">상태</span>' + PDFF.esc(candidate.deleted ? '삭제됨' : '현재') + '</div></div><div class="pdff-paths">' + PDFF.esc(paths.join('\n') || '경로 정보 없음') + '</div><details class="mt-2"><summary class="small">점수 근거</summary><div class="pdff-breakdown">' + breakdown + '</div></details></article>';
+    });
+    $('#candidate_list').html(html);
+    var allowed = ret.data.delete_enabled && group.safe_to_delete && group.resolution_status === 'open';
+    $('#delete_controls').toggle(allowed);
+    if (allowed) {
+      var keep = $('#keep_candidate').empty();
+      var del = $('#delete_candidate').empty().append(new Option('삭제할 버전을 선택하세요', ''));
+      candidates.filter(function (candidate) { return !candidate.deleted; }).forEach(function (candidate) {
+        keep.append(new Option(candidateLabel(candidate), candidate.id, group.recommended_candidate_id === candidate.id, group.recommended_candidate_id === candidate.id));
+        del.append(new Option(candidateLabel(candidate), candidate.id));
+      });
+    }
+    $('#detail_panel').show()[0].scrollIntoView({behavior:'smooth', block:'start'});
+  });
+}
+
+function previewDelete() {
+  if (!currentDetail) return;
+  var group = currentDetail.group;
+  var keepId = Number($('#keep_candidate').val());
+  var deleteId = Number($('#delete_candidate').val());
+  if (!deleteId) { PDFF.notify('삭제할 버전을 선택하세요.', 'warning'); return; }
+  if (keepId === deleteId) { PDFF.notify('유지 버전과 삭제 버전은 달라야 합니다.', 'warning'); return; }
+  var payload = {group_id: group.id, candidate_id: deleteId, keep_candidate_id: keepId, csrf_token: csrfToken};
+  PDFF.request(packageName, 'scan', 'delete_preview', payload, 'POST', function (ret) {
+    if (ret.ret !== 'success') return;
+    var preview = ret.data;
+    var warning = 'Media #' + preview.delete_media_id + '을 삭제하고 Media #' + preview.keep_media_id + '을 유지합니다.\n실제 파일이 삭제될 수 있습니다.';
+    if (!window.confirm(warning + '\n\n계속하시겠습니까?')) return;
+    var confirmation = window.prompt('아래 문구를 정확히 입력하세요.\n\n' + preview.confirmation, '');
+    if (confirmation !== preview.confirmation) { PDFF.notify('확인 문구가 일치하지 않습니다.', 'warning'); return; }
+    payload.nonce = preview.nonce;
+    payload.confirmation = confirmation;
+    $('#delete_preview_btn').prop('disabled', true);
+    PDFF.request(packageName, 'scan', 'delete_media', payload, 'POST', function (deleteRet) {
+      $('#delete_preview_btn').prop('disabled', false);
+      if (deleteRet.ret === 'success') { PDFF.notify(deleteRet.msg, 'success'); $('#detail_panel').hide(); loadGroups(); }
+    });
+  });
+}
+
+$('#run_select').on('change', function () { loadGroups(true); });
+$('#filter_btn').on('click', applyFilter);
+$('#keyword_filter').on('keydown', function (e) { if (e.key === 'Enter') applyFilter(); });
+$('#prev_page').on('click', function () { if (currentPage > 1) { currentPage -= 1; loadGroups(false); } });
+$('#next_page').on('click', function () { if (currentPage < totalPages) { currentPage += 1; loadGroups(false); } });
+$(document).on('click', '.group-detail', function () { openGroup(Number($(this).data('id'))); });
+$('#close_detail').on('click', function () { $('#detail_panel').hide(); });
+$('#delete_preview_btn').on('click', previewDelete);
+$(document).ready(loadRuns);
+</script>
+{% endblock %}

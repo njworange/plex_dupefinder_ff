@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('plex_dupefinder_ff.static', filename='pdff.css') }}">
+
+<section class="pdff-panel">
+  <h3 class="pdff-title">새 중복 검사</h3>
+  <div class="pdff-toolbar">
+    <button id="load_libraries_btn" type="button" class="btn btn-sm btn-outline-primary">라이브러리 불러오기</button>
+    <button id="start_scan_btn" type="button" class="btn btn-sm btn-primary" disabled>선택 라이브러리 스캔</button>
+  </div>
+  <div id="library_list" class="pdff-empty">라이브러리를 불러오세요.</div>
+  <div class="alert alert-info small mt-3 mb-0">Plex가 중복으로 판단한 영화 또는 에피소드의 Media 버전을 읽습니다. 이 단계에서는 파일을 변경하지 않습니다.</div>
+</section>
+
+<section class="pdff-panel">
+  <h3 class="pdff-title">현재 작업</h3>
+  <div id="current_run" class="pdff-empty">실행 중인 스캔이 없습니다.</div>
+</section>
+
+<section class="pdff-panel">
+  <div class="pdff-toolbar">
+    <h3 class="pdff-title" style="margin:0">최근 스캔</h3>
+    <button id="refresh_runs_btn" type="button" class="btn btn-sm btn-outline-secondary">새로고침</button>
+  </div>
+  <div id="run_list" class="pdff-empty">스캔 이력이 없습니다.</div>
+</section>
+
+<script src="{{ url_for('plex_dupefinder_ff.static', filename='pdff.js') }}"></script>
+<script>
+'use strict';
+var packageName = {{ arg['package_name']|tojson }};
+var csrfToken = {{ arg['csrf_token']|tojson }};
+var savedSectionIds = [];
+try { savedSectionIds = JSON.parse({{ arg.get('scan_last_section_ids', '[]')|tojson }}); } catch (e) { savedSectionIds = []; }
+var currentRunId = null;
+var pollHandle = null;
+
+function selectedIds() {
+  return Array.prototype.slice.call(document.querySelectorAll('.pdff-section:checked')).map(function (node) { return node.value; });
+}
+
+function loadLibraries() {
+  PDFF.request(packageName, 'scan', 'libraries', {}, 'GET', function (ret) {
+    if (ret.ret !== 'success') return;
+    var target = $('#library_list');
+    var items = (ret.data && ret.data.sections) || [];
+    if (!items.length) { target.addClass('pdff-empty').text('영화 또는 TV 라이브러리가 없습니다.'); return; }
+    var html = '';
+    if (!ret.data.machine_configured) html += '<div class="pdff-warning mb-2">plex_mate Machine ID가 비어 있어 삭제는 차단됩니다.</div>';
+    items.forEach(function (item) {
+      var checked = savedSectionIds.indexOf(String(item.key)) >= 0 ? ' checked' : '';
+      html += '<label class="pdff-library"><input class="pdff-section" type="checkbox" value="' + PDFF.esc(item.key) + '"' + checked + '> <span class="pdff-badge pdff-secondary">' + PDFF.esc(item.type) + '</span> <strong>' + PDFF.esc(item.title) + '</strong><span class="pdff-muted">ID ' + PDFF.esc(item.key) + '</span></label>';
+    });
+    target.removeClass('pdff-empty').html(html);
+    $('#start_scan_btn').prop('disabled', selectedIds().length === 0);
+  });
+}
+
+function runCard(run, current) {
+  var active = ['queued', 'running', 'cancelling'].indexOf(run.status) >= 0;
+  var html = '<div class="pdff-grid">' +
+    '<div><span class="pdff-kv-label">Run</span><strong>#' + PDFF.esc(run.id) + '</strong> ' + PDFF.badge(run.status) + '</div>' +
+    '<div><span class="pdff-kv-label">진행률</span>' + PDFF.esc(run.progress) + '%</div>' +
+    '<div><span class="pdff-kv-label">그룹</span>' + PDFF.esc(run.total_groups) + ' (안전 ' + PDFF.esc(run.safe_groups) + ' / 차단 ' + PDFF.esc(run.unsafe_groups) + ')</div>' +
+    '<div><span class="pdff-kv-label">시작</span>' + PDFF.esc(PDFF.date(run.started_at || run.created_at)) + '</div>' +
+    '</div><div class="pdff-progress mt-2"><div style="width:' + Math.max(0, Math.min(100, Number(run.progress || 0))) + '%"></div></div>' +
+    '<div class="pdff-muted mt-2">' + PDFF.esc(run.status_message || '') + '</div>';
+  if (run.error_summary) html += '<div class="small text-danger mt-2">' + PDFF.esc(run.error_summary) + '</div>';
+  html += '<div class="pdff-actions mt-2"><a class="btn btn-sm btn-outline-primary" href="/' + packageName + '/scan/results?run_id=' + encodeURIComponent(run.id) + '">결과 보기</a>';
+  if (active && current) html += '<button type="button" class="btn btn-sm btn-outline-warning cancel-run" data-id="' + PDFF.esc(run.id) + '">취소</button>';
+  html += '</div>';
+  return html;
+}
+
+function renderCurrent(run) {
+  if (!run || ['queued', 'running', 'cancelling'].indexOf(run.status) < 0) {
+    $('#current_run').addClass('pdff-empty').text('실행 중인 스캔이 없습니다.');
+    currentRunId = null;
+    return;
+  }
+  currentRunId = run.id;
+  $('#current_run').removeClass('pdff-empty').html(runCard(run, true));
+}
+
+function loadStatus() {
+  PDFF.request(packageName, 'scan', 'status', currentRunId ? {run_id: currentRunId} : {}, 'GET', function (ret) {
+    if (ret.ret !== 'success') return;
+    renderCurrent(ret.data);
+    if (!ret.data || ['queued', 'running', 'cancelling'].indexOf(ret.data.status) < 0) loadRuns();
+  });
+}
+
+function loadRuns() {
+  PDFF.request(packageName, 'scan', 'runs', {limit: 30}, 'GET', function (ret) {
+    if (ret.ret !== 'success') return;
+    var items = ret.data || [];
+    if (!items.length) { $('#run_list').addClass('pdff-empty').text('스캔 이력이 없습니다.'); return; }
+    var html = '';
+    items.forEach(function (run) { html += '<article class="pdff-row">' + runCard(run, false) + '</article>'; });
+    $('#run_list').removeClass('pdff-empty').html(html);
+    var active = items.find(function (run) { return ['queued', 'running', 'cancelling'].indexOf(run.status) >= 0; });
+    if (active) renderCurrent(active);
+  });
+}
+
+$('#load_libraries_btn').on('click', loadLibraries);
+$(document).on('change', '.pdff-section', function () { $('#start_scan_btn').prop('disabled', selectedIds().length === 0); });
+$('#start_scan_btn').on('click', function () {
+  var ids = selectedIds();
+  if (!ids.length) return;
+  $(this).prop('disabled', true);
+  PDFF.request(packageName, 'scan', 'start', {section_ids: JSON.stringify(ids), csrf_token: csrfToken}, 'POST', function (ret) {
+    $('#start_scan_btn').prop('disabled', false);
+    if (ret.ret === 'success') { savedSectionIds = ids; renderCurrent(ret.data); loadRuns(); }
+  });
+});
+$(document).on('click', '.cancel-run', function () {
+  if (!window.confirm('현재 중복 스캔을 취소하시겠습니까?')) return;
+  PDFF.request(packageName, 'scan', 'cancel', {run_id: $(this).data('id'), csrf_token: csrfToken}, 'POST', function (ret) { if (ret.ret === 'success') renderCurrent(ret.data); });
+});
+$('#refresh_runs_btn').on('click', function () { loadRuns(); loadStatus(); });
+$(document).ready(function () { loadLibraries(); loadRuns(); loadStatus(); pollHandle = window.setInterval(loadStatus, 2500); });
+$(window).on('beforeunload', function () { if (pollHandle) window.clearInterval(pollHandle); });
+</script>
+{% endblock %}

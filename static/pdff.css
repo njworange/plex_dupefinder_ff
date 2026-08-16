@@ -1,0 +1,27 @@
+.pdff-toolbar { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; margin-bottom:1rem; }
+.pdff-panel { border:1px solid #d9dee3; border-radius:.45rem; padding:1rem; margin-bottom:1rem; }
+.pdff-title { font-size:1.05rem; font-weight:600; margin:0 0 .8rem; }
+.pdff-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:.75rem; }
+.pdff-kv-label { color:#6c757d; display:block; font-size:.78rem; }
+.pdff-muted { color:#6c757d; font-size:.85rem; }
+.pdff-empty { color:#6c757d; padding:1.5rem; text-align:center; }
+.pdff-row { border-bottom:1px solid #e9ecef; padding:.8rem 0; }
+.pdff-row:last-child { border-bottom:0; }
+.pdff-code { background:rgba(127,127,127,.08); border-radius:.25rem; font-family:monospace; font-size:.8rem; padding:.35rem .5rem; overflow-wrap:anywhere; }
+.pdff-paths { background:rgba(127,127,127,.08); border-radius:.25rem; font-family:monospace; font-size:.76rem; margin-top:.5rem; max-height:9rem; overflow:auto; padding:.5rem; white-space:pre-wrap; word-break:break-all; }
+.pdff-danger { background:#fff5f5; border:1px solid #f1aeb5; border-radius:.4rem; color:#842029; padding:.8rem; }
+.pdff-warning { background:#fff8e1; border:1px solid #ffe08a; border-radius:.4rem; padding:.8rem; }
+.pdff-candidate { border:1px solid #d9dee3; border-radius:.4rem; margin:.7rem 0; padding:.8rem; }
+.pdff-candidate-recommended { border-color:#198754; box-shadow:inset 3px 0 0 #198754; }
+.pdff-badge { border-radius:999px; color:#fff; display:inline-block; font-size:.75rem; padding:.2rem .5rem; }
+.pdff-success { background:#198754; }
+.pdff-primary { background:#0d6efd; }
+.pdff-warning-badge { background:#d98b00; }
+.pdff-danger-badge { background:#dc3545; }
+.pdff-secondary { background:#6c757d; }
+.pdff-library { align-items:center; display:flex; gap:.5rem; padding:.35rem 0; }
+.pdff-progress { background:#e9ecef; border-radius:999px; height:.8rem; overflow:hidden; }
+.pdff-progress > div { background:#0d6efd; height:100%; min-width:0; transition:width .2s; }
+.pdff-actions { display:flex; flex-wrap:wrap; gap:.35rem; }
+.pdff-breakdown { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:.35rem; margin-top:.5rem; }
+@media (max-width:767px) { .pdff-grid { grid-template-columns:1fr; } }
