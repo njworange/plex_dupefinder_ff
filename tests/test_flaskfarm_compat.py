@@ -379,7 +379,8 @@ class FlaskFarmStaticContractTest(unittest.TestCase):
             )
 
     def test_background_db_helpers_use_flask_app_context(self) -> None:
-        tree = ast.parse((PROJECT_ROOT / "scan_manager.py").read_text(encoding="utf-8"))
+        source_text = (PROJECT_ROOT / "scan_manager.py").read_text(encoding="utf-8")
+        tree = ast.parse(source_text)
         manager = next(
             node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ScanManager"
         )
@@ -396,10 +397,10 @@ class FlaskFarmStaticContractTest(unittest.TestCase):
             "_set_run",
             "_persist_group",
         ):
-            source = ast.unparse(methods[name])
+            source = ast.get_source_segment(source_text, methods[name]) or ""
             self.assertIn("F.app.app_context()", source, name)
 
-        worker_source = ast.unparse(methods["_worker"])
+        worker_source = ast.get_source_segment(source_text, methods["_worker"]) or ""
         self.assertIn("F.db.session.remove()", worker_source)
 
 
