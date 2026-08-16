@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0
+
+- Removed the per-scan deletion-attempt cap while retaining the atomic database attempt counter, scan-status guard, global deletion lease and audit history.
+- Removed the legacy attempt-limit setting from the UI; an already-persisted `setting_max_delete_per_run` value is ignored and not migrated or rewritten.
+- Added an explicitly selected direct-filesystem backend that permanently deletes one validated video and only external subtitles proven exclusive to it, without requiring a quarantine root.
+- Kept ambiguous, shared, linked and survivor-owned subtitle files out of the direct-delete plan and exposed every excluded path and reason for review.
+- Required an exact digest-bound confirmation plus Binary/Web partial scan and retained-version verification for direct deletion.
+
 ## 1.3.1
 
 - Added a visible per-scan deletion-attempt budget with used, maximum and remaining counts in scan and result views.

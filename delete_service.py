@@ -8,15 +8,15 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 from framework import F
 
+from .direct_delete_manager import DirectDeleteManager
 from .delete_budget import (
-    current_delete_attempt_limit,
     delete_attempt_budget,
-    delete_attempt_limit_message,
     require_delete_attempt_available,
 )
 from .deletion_lease import DeletionLeaseLost, DeletionLeaseService
 from .models import (
     ModelActionLog,
+    ModelDirectDeleteJournal,
     ModelDuplicateGroup,
     ModelMediaCandidate,
     ModelQuarantineJournal,
@@ -44,10 +44,6 @@ def _delete_enabled() -> bool:
     return P.ModelSetting.get("setting_delete_enabled") == "True"
 
 
-def _max_delete_per_run() -> int:
-    return current_delete_attempt_limit()
-
-
 def _timeout() -> int:
     try:
         return max(5, min(120, int(P.ModelSetting.get("setting_request_timeout") or "20")))
@@ -61,11 +57,12 @@ class DeleteService:
         self.lease_service = DeletionLeaseService()
         self.post_delete_scan_manager = post_delete_scan_manager
         self.quarantine_manager = QuarantineManager()
+        self.direct_delete_manager = DirectDeleteManager()
 
     @staticmethod
     def _delete_backend() -> str:
         value = str(P.ModelSetting.get("setting_delete_backend") or "plex").strip().lower()
-        if value not in ("plex", "quarantine"):
+        if value not in ("plex", "quarantine", "direct"):
             raise RuntimeError("파일 처리 방식 설정이 올바르지 않습니다.")
         return value
 
@@ -108,6 +105,7 @@ class DeleteService:
                 "running",
                 "scan_pending",
                 "quarantined_pending_scan",
+                "deleted_pending_scan",
             )
             for item in items
         )
@@ -117,7 +115,7 @@ class DeleteService:
         batch.processed_items = succeeded + failed
         if active:
             batch.status = "scan_pending"
-            batch.current_message = "격리 완료 · Plex 부분 스캔/재검증 대기"
+            batch.current_message = "파일 처리 완료 · Plex 부분 스캔/재검증 대기"
             batch.finished_at = None
         else:
             batch.status = (
@@ -128,13 +126,13 @@ class DeleteService:
             batch.current_message = (
                 "일부 항목은 수동 확인이 필요합니다."
                 if failed
-                else "격리 및 Plex 재검증 완료"
+                else "파일 처리 및 Plex 재검증 완료"
             )
             batch.finished_at = datetime.now()
 
     @staticmethod
     def _batch_item_for_journal(
-        journal: ModelQuarantineJournal,
+        journal: Any,
     ) -> Optional[Any]:
         from .models import ModelBatchItem
 
@@ -211,6 +209,213 @@ class DeleteService:
                 raise RuntimeError("유지 Media snapshot이 격리 당시와 달라졌습니다.")
         return state
 
+    @staticmethod
+    def _post_scan_action_ids(job: Any) -> list:
+        try:
+            action_ids = json.loads(job.action_ids_json or "[]")
+        except (TypeError, ValueError):
+            action_ids = []
+        parsed = []
+        for raw in action_ids if isinstance(action_ids, list) else []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value not in parsed:
+                parsed.append(value)
+        try:
+            primary = int(job.action_log_id or 0)
+        except (TypeError, ValueError):
+            primary = 0
+        if primary and primary not in parsed:
+            parsed.insert(0, primary)
+        return parsed
+
+    def finalize_direct_scan(self, job: Any) -> None:
+        """Finalize direct unlinks only after filesystem and Plex proofs agree."""
+
+        from .post_delete_scan import (
+            PostDeleteScanBlocked,
+            PostDeleteScanRetryable,
+        )
+
+        heartbeat = getattr(job, "_pdff_heartbeat", None)
+        if callable(heartbeat):
+            heartbeat()
+        action_ids = self._post_scan_action_ids(job)
+        if not action_ids:
+            raise PostDeleteScanBlocked(
+                "직접 삭제 사후검증 작업에 연결된 작업 이력이 없습니다."
+            )
+
+        connection = PlexMateProvider().resolve(require_machine_id=True)
+        gateway = PlexGateway(connection, timeout=(5, _timeout()))
+        identity = gateway.validate_identity(connection.machine_id, require_match=True)
+        if identity.machine_id != str(job.server_machine_id):
+            raise PostDeleteScanBlocked("직접 삭제 당시 Plex 서버와 현재 서버가 다릅니다.")
+        if callable(heartbeat):
+            heartbeat()
+
+        retry_needed = False
+        critical_found = False
+        for action_id in action_ids:
+            if callable(heartbeat):
+                heartbeat()
+            action = ModelActionLog.get(action_id)
+            journal = ModelDirectDeleteJournal.for_action(action_id)
+            if action is None or journal is None:
+                message = "직접 삭제 사후검증에 필요한 작업 이력 또는 journal을 찾을 수 없습니다."
+                if journal is not None:
+                    journal.status = "critical"
+                    journal.last_error = message
+                    journal.updated_at = datetime.now()
+                    group = ModelDuplicateGroup.get(journal.group_id)
+                    if group is not None:
+                        group.safe_to_delete = False
+                        group.resolution_status = "manual_check_required"
+                        group.safety_flags_json = _json(
+                            ["direct_delete_postscan_record_missing"]
+                        )
+                    batch_item = self._batch_item_for_journal(journal)
+                    if batch_item is not None:
+                        batch_item.status = "failed"
+                        batch_item.message = message
+                        batch_item.finished_at = datetime.now()
+                    self._sync_batch_after_scan(journal.batch_run_id)
+                if action is not None:
+                    action.status = "critical"
+                    action.message = message
+                    group = ModelDuplicateGroup.get(job.group_id)
+                    if group is not None:
+                        group.safe_to_delete = False
+                        group.resolution_status = "manual_check_required"
+                        group.safety_flags_json = _json(
+                            ["direct_delete_postscan_record_missing"]
+                        )
+                F.db.session.commit()
+                critical_found = True
+                continue
+            if journal.status in ("verified", "trash_pending"):
+                continue
+            if journal.status in ("critical", "recovery_required"):
+                critical_found = True
+                continue
+
+            group = ModelDuplicateGroup.get(journal.group_id)
+            candidate = ModelMediaCandidate.get(journal.candidate_id)
+            run = ModelScanRun.get(journal.run_id)
+            if group is None or candidate is None or run is None:
+                journal.status = "critical"
+                journal.last_error = "직접 삭제 사후검증에 필요한 DB 항목을 찾을 수 없습니다."
+                journal.updated_at = datetime.now()
+                if group is not None:
+                    group.safe_to_delete = False
+                    group.resolution_status = "manual_check_required"
+                    group.safety_flags_json = _json(
+                        ["direct_delete_postscan_record_missing"]
+                    )
+                F.db.session.commit()
+                critical_found = True
+                continue
+
+            journal.status = "scan_running"
+            journal.updated_at = datetime.now()
+            action.status = "scan_running"
+            action.message = "Plex 부분 스캔 후 직접 삭제 결과 재검증 중"
+            F.db.session.commit()
+            try:
+                current = gateway.get_metadata(group.rating_key)
+                if callable(heartbeat):
+                    heartbeat()
+                try:
+                    before = json.loads(action.before_json or "{}")
+                except (TypeError, ValueError):
+                    raise RuntimeError("직접 삭제 당시 Plex snapshot을 읽을 수 없습니다.") from None
+                self.direct_delete_manager.verify_deleted(
+                    journal, heartbeat=heartbeat if callable(heartbeat) else None
+                )
+                state = self._quarantine_snapshot_state(
+                    before, current, str(candidate.media_id)
+                )
+                if not candidate.deleted:
+                    candidate.deleted = True
+                    candidate.deleted_at = datetime.now()
+                    run.successful_deletions = (run.successful_deletions or 0) + 1
+                group.safe_to_delete = False
+                group.resolution_status = "rescan_required"
+                group.safety_flags_json = _json(
+                    [
+                        "plex_trash_pending_after_direct_delete"
+                        if state == "trash_pending"
+                        else "rescan_required_after_direct_delete"
+                    ]
+                )
+                journal.status = state
+                journal.finished_at = datetime.now()
+                journal.updated_at = datetime.now()
+                journal.last_error = ""
+                action.status = "success"
+                action.message = (
+                    "영구 삭제 완료 · Plex 휴지통에 누락 Media 기록이 남아 있습니다."
+                    if state == "trash_pending"
+                    else "파일 영구 삭제 및 Plex 재검증 완료"
+                )
+                action.after_json = _json(current.as_dict())
+                batch_item = self._batch_item_for_journal(journal)
+                if batch_item is not None:
+                    batch_item.status = "success"
+                    batch_item.message = action.message
+                    batch_item.action_log_id = action.id
+                    batch_item.finished_at = datetime.now()
+                self._sync_batch_after_scan(journal.batch_run_id)
+                F.db.session.commit()
+            except PostDeleteScanRetryable:
+                F.db.session.rollback()
+                retry_needed = True
+            except DeletionLeaseLost:
+                F.db.session.rollback()
+                raise
+            except Exception as exc:
+                if isinstance(exc, PlexGatewayError):
+                    F.db.session.rollback()
+                    retry_needed = True
+                    continue
+                F.db.session.rollback()
+                journal = ModelDirectDeleteJournal.for_action(action_id)
+                action = ModelActionLog.get(action_id)
+                group = ModelDuplicateGroup.get(journal.group_id) if journal else None
+                message = (str(exc) or "직접 삭제 사후검증에 실패했습니다.")[:2000]
+                if journal is not None:
+                    journal.status = "critical"
+                    journal.last_error = message
+                    journal.updated_at = datetime.now()
+                if action is not None:
+                    action.status = "critical"
+                    action.message = message
+                if group is not None:
+                    group.safe_to_delete = False
+                    group.resolution_status = "manual_check_required"
+                    group.safety_flags_json = _json(
+                        ["direct_delete_postscan_critical"]
+                    )
+                if journal is not None:
+                    batch_item = self._batch_item_for_journal(journal)
+                    if batch_item is not None:
+                        batch_item.status = "failed"
+                        batch_item.message = message
+                        batch_item.finished_at = datetime.now()
+                    self._sync_batch_after_scan(journal.batch_run_id)
+                F.db.session.commit()
+                critical_found = True
+        if critical_found:
+            raise PostDeleteScanBlocked(
+                "일부 직접 삭제 항목은 수동 확인이 필요합니다."
+            )
+        if retry_needed:
+            raise PostDeleteScanRetryable(
+                "Plex 직접 삭제 반영을 제한적으로 재확인합니다."
+            )
+
     def finalize_quarantine_scan(self, job: Any) -> None:
         """Finalize every quarantined action coalesced into a scan job."""
 
@@ -223,6 +428,32 @@ class DeleteService:
         heartbeat = getattr(job, "_pdff_heartbeat", None)
         if callable(heartbeat):
             heartbeat()
+
+        action_ids_for_backend = self._post_scan_action_ids(job)
+        if any(
+            ModelDirectDeleteJournal.for_action(action_id) is not None
+            for action_id in action_ids_for_backend
+        ):
+            if any(
+                ModelQuarantineJournal.for_action(action_id) is not None
+                for action_id in action_ids_for_backend
+            ):
+                raise PostDeleteScanBlocked(
+                    "서로 다른 파일 처리 방식의 사후검증 작업이 섞여 수동 확인이 필요합니다."
+                )
+            return self.finalize_direct_scan(job)
+        if not any(
+            ModelQuarantineJournal.for_action(action_id) is not None
+            for action_id in action_ids_for_backend
+        ):
+            # Legacy Plex API DELETE jobs only need the scan command itself;
+            # they do not own a filesystem journal finalizer.
+            actions = [ModelActionLog.get(action_id) for action_id in action_ids_for_backend]
+            if actions and all(
+                action is not None and str(action.status or "") == "success"
+                for action in actions
+            ):
+                return
 
         try:
             action_ids = json.loads(job.action_ids_json or "[]")
@@ -426,12 +657,60 @@ class DeleteService:
         if retry_needed:
             raise PostDeleteScanRetryable("Plex 격리 반영을 제한적으로 재확인합니다.")
 
+    def fail_direct_scan(self, job: Any, status: str, message: str) -> None:
+        """Persist terminal scan failure for permanently removed files."""
+
+        heartbeat = getattr(job, "_pdff_heartbeat", None)
+        if callable(heartbeat):
+            heartbeat()
+        for action_id in self._post_scan_action_ids(job):
+            if callable(heartbeat):
+                heartbeat()
+            journal = ModelDirectDeleteJournal.for_action(action_id)
+            if journal is None or journal.status in (
+                "verified",
+                "trash_pending",
+                "critical",
+                "recovery_required",
+            ):
+                continue
+            journal.status = "recovery_required"
+            journal.last_error = str(message)[:2000]
+            journal.updated_at = datetime.now()
+            action = ModelActionLog.get(action_id)
+            if action is not None:
+                action.status = "unknown"
+                action.message = journal.last_error
+            group = ModelDuplicateGroup.get(journal.group_id)
+            if group is not None:
+                group.safe_to_delete = False
+                group.resolution_status = "manual_check_required"
+                group.safety_flags_json = _json(["direct_delete_scan_failed"])
+            batch_item = self._batch_item_for_journal(journal)
+            if batch_item is not None:
+                batch_item.status = "failed"
+                batch_item.message = journal.last_error
+                batch_item.finished_at = datetime.now()
+            self._sync_batch_after_scan(journal.batch_run_id)
+        F.db.session.commit()
+        if callable(heartbeat):
+            heartbeat()
+
     def fail_quarantine_scan(self, job: Any, status: str, message: str) -> None:
         """Turn terminal scan failure into an explicit manual-check state."""
 
         heartbeat = getattr(job, "_pdff_heartbeat", None)
         if callable(heartbeat):
             heartbeat()
+        action_ids_for_backend = self._post_scan_action_ids(job)
+        if any(
+            ModelDirectDeleteJournal.for_action(action_id) is not None
+            for action_id in action_ids_for_backend
+        ):
+            # A correctly-created scan job owns one backend, but corrupted or
+            # legacy coalescing must still fail every journal closed. Process
+            # direct rows first, then continue through quarantine rows below.
+            self.fail_direct_scan(job, status, message)
         try:
             action_ids = json.loads(job.action_ids_json or "[]")
         except (TypeError, ValueError):
@@ -539,7 +818,7 @@ class DeleteService:
             backend = self._delete_backend()
             plan_digest = ""
             cleanup: Dict[str, Any]
-            if backend == "quarantine":
+            if backend in ("quarantine", "direct"):
                 sections = gateway.list_sections()
                 expected_type = "show" if group.media_type == "episode" else "movie"
                 section = next(
@@ -553,22 +832,37 @@ class DeleteService:
                 )
                 if section is None or not section.locations:
                     raise RuntimeError("삭제 대상의 Plex library section을 확인할 수 없습니다.")
-                all_locations = tuple(
-                    location for item in sections for location in item.locations
-                )
-                plan = self.quarantine_manager.preview(
-                    current,
-                    candidate.media_id,
-                    safety_policy.allowed_roots,
-                    all_locations,
-                )
+                if backend == "quarantine":
+                    all_locations = tuple(
+                        location for item in sections for location in item.locations
+                    )
+                    plan = self.quarantine_manager.preview(
+                        current,
+                        candidate.media_id,
+                        safety_policy.allowed_roots,
+                        all_locations,
+                    )
+                else:
+                    plan = self.direct_delete_manager.preview(
+                        current,
+                        candidate.media_id,
+                        safety_policy.allowed_roots,
+                        tuple(section.locations),
+                    )
                 cleanup = plan.public_dict()
                 plan_digest = plan.plan_digest
-                confirmation = "QUARANTINE %s SUBTITLES %s %s" % (
-                    candidate.media_id,
-                    len(plan.eligible),
-                    plan.plan_digest[:12],
-                )
+                if backend == "quarantine":
+                    confirmation = "QUARANTINE %s SUBTITLES %s %s" % (
+                        candidate.media_id,
+                        len(plan.eligible),
+                        plan.plan_digest[:12],
+                    )
+                else:
+                    confirmation = "DELETE FILES %s SUBTITLES %s %s" % (
+                        candidate.media_id,
+                        len(plan.eligible),
+                        plan.plan_digest[:12],
+                    )
             else:
                 cleanup = {
                     "enabled": False,
@@ -630,17 +924,11 @@ class DeleteService:
         message: str = "Plex에 Media 삭제 요청 전송",
     ) -> None:
         try:
-            limit = _max_delete_per_run()
-            if not ModelScanRun.claim_deletion_slot(run.id, limit):
+            if not ModelScanRun.claim_deletion_slot(run.id):
                 F.db.session.rollback()
-                fresh_run = ModelScanRun.get(run.id)
-                budget = delete_attempt_budget(fresh_run or run)
-                if budget["exhausted"]:
-                    raise RuntimeError(delete_attempt_limit_message(budget))
                 raise RuntimeError(
-                    "삭제 시도 한도를 안전하게 예약할 수 없습니다. "
-                    "(사용 %(attempted)s/%(limit)s, 남음 %(remaining)s) "
-                    "스캔 상태와 설정을 다시 확인하세요." % budget
+                    "삭제 시도를 안전하게 기록할 수 없습니다. "
+                    "스캔 상태를 다시 확인하세요."
                 )
             log.before_json = before_json
             log.status = status
@@ -679,6 +967,11 @@ class DeleteService:
             )
             if callable(quarantine_recover):
                 quarantine_recover()
+            direct_recover = getattr(
+                self.direct_delete_manager, "recover_interrupted", None
+            )
+            if callable(direct_recover):
+                direct_recover()
             logs = ModelActionLog.interrupted()
             for log in logs:
                 key = (
@@ -802,7 +1095,7 @@ class DeleteService:
                 if str(confirmation) != expected_confirmation:
                     raise ValueError("확인 문구가 일치하지 않습니다: %s" % expected_confirmation)
             elif len(str(expected_plan_digest)) != 64:
-                raise ValueError("안전 격리 사전확인 정보가 없거나 올바르지 않습니다.")
+                raise ValueError("파일 처리 사전확인 정보가 없거나 올바르지 않습니다.")
             if not group.safe_to_delete or group.resolution_status != "open":
                 raise RuntimeError("이 그룹은 안전 삭제 조건을 충족하지 않습니다. 다시 스캔하세요.")
             if run.status not in ("completed", "completed_with_warnings"):
@@ -997,6 +1290,125 @@ class DeleteService:
                         "kept_media_id": keep.media_id,
                         "response_status": None,
                         "verification": "quarantined_pending_scan",
+                        "subtitle_cleanup": journal.cleanup_api(True),
+                        "post_delete_scan": {
+                            "mode": post_scan_mode,
+                            "status": "queued",
+                            "job_ids": [
+                                job.id for job in post_scan_jobs if job.id is not None
+                            ],
+                        },
+                    }
+
+                if delete_backend == "direct":
+                    if post_scan_mode not in ("binary", "web"):
+                        raise RuntimeError(
+                            "직접 삭제는 Binary 또는 Web 부분 스캔이 필수입니다."
+                        )
+                    plan = self.direct_delete_manager.preview(
+                        current,
+                        candidate.media_id,
+                        safety_policy.allowed_roots,
+                        post_scan_locations,
+                    )
+                    expected_confirmation = "DELETE FILES %s SUBTITLES %s %s" % (
+                        candidate.media_id,
+                        len(plan.eligible),
+                        plan.plan_digest[:12],
+                    )
+                    if not secrets.compare_digest(
+                        str(expected_plan_digest), str(plan.plan_digest)
+                    ) or not secrets.compare_digest(
+                        str(confirmation), expected_confirmation
+                    ):
+                        raise ValueError(
+                            "직접 삭제 계획이 사전확인과 일치하지 않습니다. 다시 확인하세요."
+                        )
+                    self.lease_service.renew(
+                        lease_owner_token, lease_owner_kind, lease_owner_ref
+                    )
+                    self._reserve_attempt_and_mark_deleting(
+                        run,
+                        log,
+                        _json(current.as_dict()),
+                        status="direct_deleting",
+                        message="영상과 전용 외부 자막 직접 삭제 시작",
+                    )
+                    batch_run_id = None
+                    if lease_owner_kind == "batch":
+                        try:
+                            batch_run_id = int(lease_owner_ref)
+                        except (TypeError, ValueError):
+                            raise RuntimeError(
+                                "일괄 처리의 작업 식별자를 확인할 수 없습니다."
+                            )
+                    journal = self.direct_delete_manager.execute(
+                        plan=plan,
+                        expected_digest=expected_plan_digest,
+                        run=run,
+                        group=group,
+                        candidate=candidate,
+                        keep=keep,
+                        action_log=log,
+                        batch_run_id=batch_run_id,
+                        heartbeat=lambda: self.lease_service.renew(
+                            lease_owner_token,
+                            lease_owner_kind,
+                            lease_owner_ref,
+                        ),
+                    )
+                    self.lease_service.renew(
+                        lease_owner_token, lease_owner_kind, lease_owner_ref
+                    )
+                    try:
+                        post_scan_jobs = self.post_delete_scan_manager.enqueue_confirmed(
+                            run=run,
+                            group=group,
+                            candidate=candidate,
+                            action_log=log,
+                            current_item=current,
+                            section_locations=post_scan_locations,
+                            mode=post_scan_mode,
+                            batch_run_id=batch_run_id,
+                        )
+                        if not post_scan_jobs:
+                            raise RuntimeError(
+                                "직접 삭제 후 Plex 부분 스캔 작업이 생성되지 않았습니다."
+                            )
+                        F.db.session.commit()
+                    except Exception:
+                        F.db.session.rollback()
+                        journal = ModelDirectDeleteJournal.get(journal.id)
+                        if journal is not None:
+                            journal.status = "recovery_required"
+                            journal.last_error = (
+                                "영구 삭제 후 Plex 부분 스캔 작업을 저장하지 못했습니다."
+                            )
+                            journal.updated_at = datetime.now()
+                        current_log = ModelActionLog.get(log.id)
+                        if current_log is not None:
+                            current_log.status = "unknown"
+                            current_log.message = (
+                                "파일은 영구 삭제되었지만 Plex 부분 스캔 작업을 저장하지 못했습니다."
+                            )
+                        current_group = ModelDuplicateGroup.get(group.id)
+                        if current_group is not None:
+                            current_group.safe_to_delete = False
+                            current_group.resolution_status = "manual_check_required"
+                            current_group.safety_flags_json = _json(
+                                ["direct_delete_scan_enqueue_failed"]
+                            )
+                        F.db.session.commit()
+                        raise RuntimeError(
+                            "파일은 영구 삭제되었지만 Plex 부분 스캔 작업을 저장하지 못했습니다. "
+                            "작업 이력을 확인하세요."
+                        ) from None
+                    return {
+                        "action_id": log.id,
+                        "deleted_media_id": candidate.media_id,
+                        "kept_media_id": keep.media_id,
+                        "response_status": None,
+                        "verification": "deleted_pending_scan",
                         "subtitle_cleanup": journal.cleanup_api(True),
                         "post_delete_scan": {
                             "mode": post_scan_mode,

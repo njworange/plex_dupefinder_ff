@@ -33,7 +33,7 @@ class ModuleHistory(PluginModuleBase):
                 run_id = int(run_value) if str(run_value).strip() else None
                 status = str(req.values.get("status", "")).strip()
                 subtitle_filter = str(req.values.get("subtitle_filter", "")).strip()
-                if subtitle_filter not in ("", "excluded", "quarantined"):
+                if subtitle_filter not in ("", "excluded", "quarantined", "deleted"):
                     raise ValueError("외부 자막 필터가 올바르지 않습니다.")
                 result = ModelActionLog.search(
                     page=page,

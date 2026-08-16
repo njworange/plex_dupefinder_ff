@@ -48,8 +48,8 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("scan.binary_helper_exported === true", self.setting)
         self.assertIn("scan.binary_scanner_configured === true", self.setting)
         self.assertIn("scan.web_connection_validated === true", self.setting)
-        self.assertIn("DELETE 전에 필수 검증", self.setting)
-        self.assertIn("파일 이동 전에 필수 검증", self.setting)
+        self.assertIn("파일 처리 전에 필수 검증", self.setting)
+        self.assertIn("안전 격리와 직접 영구삭제", self.setting)
 
     def test_capability_diagnostics_do_not_execute_a_scan(self) -> None:
         setting_module = (ROOT / "mod_setting.py").read_text(encoding="utf-8")
@@ -112,49 +112,46 @@ class BatchUiContractTests(unittest.TestCase):
 
     def test_run_and_group_rows_show_delete_diagnostics(self) -> None:
         self.assertIn("PDFF.deleteBudget(run)", self.scan_list)
-        for field in ("budget.attempted", "budget.limit", "budget.remaining"):
-            self.assertIn("PDFF.esc(%s)" % field, self.scan_list)
+        self.assertIn("PDFF.esc(budget.attempted)", self.scan_list)
+        self.assertIn("한도 없음", self.scan_list)
         self.assertIn("run.successful_deletions", self.scan_list)
         self.assertIn("PDFF.badge(group.resolution_status || 'open')", self.results)
 
-    def test_delete_budget_is_visible_and_exhaustion_disables_mutations(self) -> None:
+    def test_delete_attempt_counter_is_visible_but_never_disables_mutations(self) -> None:
         static = (ROOT / "static" / "pdff.js").read_text(encoding="utf-8")
-        for element_id in ("delete_budget_status", "delete_budget_warning"):
-            self.assertIn('id="%s"' % element_id, self.results)
+        self.assertIn('id="delete_budget_status"', self.results)
+        self.assertNotIn('id="delete_budget_warning"', self.results)
         self.assertIn("function deleteBudget(value)", static)
         self.assertIn("value.deletion_attempts", static)
-        self.assertIn("limit = 1", static)
-        self.assertIn("attempted = limit", static)
+        self.assertIn("unlimited: true", static)
+        self.assertIn("limit: null", static)
+        self.assertIn("remaining: null", static)
+        self.assertIn("exhausted: false", static)
         self.assertIn("function selectedDeleteBudget()", self.results)
-        self.assertIn("budget.exhausted", self.results)
-        self.assertIn("selectedDeleteBudget().exhausted", self.results)
-        self.assertIn("disabled aria-disabled=", self.results)
-        self.assertIn("$('.group-delete')", self.results)
-        self.assertIn(".prop('disabled', budget.exhausted)", self.results)
-        self.assertIn("|| budgetExhausted", self.results)
+        self.assertNotIn("budget.exhausted", self.results)
+        self.assertNotIn("selectedDeleteBudget().exhausted", self.results)
+        self.assertNotIn("삭제 시도 한도 소진", self.results)
         self.assertIn("refreshSelectedRunBudget", self.results)
         render_batch = self.results.split("function renderBatchPlan(data)", 1)[1].split(
             "\nfunction ", 1
         )[0]
         self.assertIn("data.delete_budget", render_batch)
         self.assertIn("applyDeleteBudget(data.delete_budget)", render_batch)
-        self.assertIn("설정 &gt; 삭제 안전장치", self.results)
-        self.assertIn("설정 > 삭제 안전장치", self.results)
+        self.assertIn("한도</strong> 없음", self.results)
 
-    def test_delete_limit_setting_stays_fail_closed_and_validates_explicit_raise(self) -> None:
-        setting_line = next(
-            line for line in self.setting.splitlines() if "setting_max_delete_per_run" in line
-        )
-        self.assertIn("arg.get('setting_max_delete_per_run', '1')", setting_line)
-        self.assertIn("min=1, max=100", setting_line)
-        self.assertIn("Number.isInteger(maxDeletePerRun)", self.setting)
-        self.assertIn("maxDeletePerRun < 1", self.setting)
-        self.assertIn("maxDeletePerRun > 100", self.setting)
-        self.assertIn(
-            "$('#setting_max_delete_per_run').val(String(maxDeletePerRun))",
-            self.setting,
-        )
-        self.assertIn("새로 스캔하지 않고 현재", self.setting)
+    def test_per_scan_limit_setting_is_removed_and_batch_size_remains_bounded(self) -> None:
+        self.assertNotIn("setting_max_delete_per_run", self.setting)
+        self.assertIn("setting_batch_max_items", self.setting)
+        self.assertIn("한 배치 계획에 포함할 항목 수만 제한", self.setting)
+
+    def test_direct_backend_requires_exact_review_and_hides_quarantine_root(self) -> None:
+        self.assertIn("['direct', '직접 영구삭제 (영상 + 전용 외부 자막)']", self.setting)
+        self.assertIn("deleteBackends = ['plex', 'quarantine', 'direct']", self.setting)
+        self.assertIn("$('#quarantine_root_setting').toggle(backend === 'quarantine')", self.setting)
+        self.assertIn("deleteBackend === 'direct'", self.setting)
+        self.assertIn("격리·휴지통 없이", self.setting)
+        self.assertIn("confirmation !== expected", self.results)
+        self.assertIn("cleanup.backend === 'direct'", self.results)
 
     def test_latest_plan_is_restored_by_run_id(self) -> None:
         self.assertIn("function restoreBatchForRun()", self.results)

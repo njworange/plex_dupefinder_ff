@@ -46,7 +46,13 @@ class ModelApiContractTest(unittest.TestCase):
             self.assertEqual(payload["section_ids"], ["1"])
             self.assertEqual(
                 payload["delete_budget"],
-                {"limit": 2, "attempted": 0, "remaining": 2, "exhausted": False},
+                {
+                    "unlimited": True,
+                    "attempted": 0,
+                    "limit": None,
+                    "remaining": None,
+                    "exhausted": False,
+                },
             )
 
     def test_group_detail_api_returns_the_same_live_delete_budget(self) -> None:
@@ -94,7 +100,13 @@ class ModelApiContractTest(unittest.TestCase):
             self.assertEqual(response["ret"], "success")
             self.assertEqual(
                 response["data"]["delete_budget"],
-                {"limit": 2, "attempted": 1, "remaining": 1, "exhausted": False},
+                {
+                    "unlimited": True,
+                    "attempted": 1,
+                    "limit": None,
+                    "remaining": None,
+                    "exhausted": False,
+                },
             )
 
     def test_action_log_serializer_honors_summary_and_detail_contract(self) -> None:

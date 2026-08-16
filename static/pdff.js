@@ -58,8 +58,8 @@
   function badge(status) {
     var key = String(status || 'unknown').toLowerCase();
     var kind = 'pdff-secondary';
-    if (['completed', 'success', 'succeeded', 'safe', 'quarantined'].indexOf(key) >= 0) kind = 'pdff-success';
-    else if (['running', 'executing', 'approved', 'queued'].indexOf(key) >= 0) kind = 'pdff-primary';
+    if (['completed', 'success', 'succeeded', 'safe', 'quarantined', 'deleted'].indexOf(key) >= 0) kind = 'pdff-success';
+    else if (['running', 'executing', 'approved', 'queued', 'deleted_pending_scan'].indexOf(key) >= 0) kind = 'pdff-primary';
     else if (['planned', 'preview', 'ready', 'draft', 'pending', 'skipped'].indexOf(key) >= 0) kind = 'pdff-secondary';
     else if (['cancelled', 'cancelling', 'completed_with_warnings', 'completed_with_errors', 'unknown', 'stopped', 'interrupted', 'expired', 'retry_wait', 'unverified'].indexOf(key) >= 0) kind = 'pdff-warning-badge';
     else if (['failed', 'blocked', 'critical', 'verification_failed', 'recovery_required'].indexOf(key) >= 0) kind = 'pdff-danger-badge';
@@ -70,24 +70,18 @@
     value = value && typeof value === 'object' ? value : {};
     var nested = value.delete_budget;
     var budget = nested && typeof nested === 'object' ? nested : value;
-    var limitRaw = budget.limit;
-    var limit = Number(limitRaw);
-    // A malformed/missing runtime payload must never make the UI less strict.
-    if ((typeof limitRaw !== 'number' && typeof limitRaw !== 'string') ||
-        String(limitRaw).trim() === '' || !Number.isInteger(limit) ||
-        limit < 1 || limit > 100) limit = 1;
     var attemptedRaw = budget.attempted !== undefined
       ? budget.attempted : value.deletion_attempts;
     var attempted = Number(attemptedRaw);
     if ((typeof attemptedRaw !== 'number' && typeof attemptedRaw !== 'string') ||
         String(attemptedRaw).trim() === '' || !Number.isInteger(attempted) ||
-        attempted < 0) attempted = limit;
-    var remaining = Math.max(0, limit - attempted);
+        attempted < 0) attempted = 0;
     return {
-      limit: limit,
+      unlimited: true,
       attempted: attempted,
-      remaining: remaining,
-      exhausted: remaining === 0
+      limit: null,
+      remaining: null,
+      exhausted: false
     };
   }
 
@@ -104,7 +98,8 @@
       delete_postcheck_critical: '유지 버전 재확인 실패', delete_postcheck_media_set_changed: '삭제 후 Media 집합 변경',
       delete_postcheck_snapshot_changed: '삭제 후 남은 Media 정보 변경',
       delete_precheck_blocked: '삭제 전 재검증 차단', restart_delete_validation_interrupted: '재시작으로 삭제 검증 중단',
-      restart_delete_outcome_unknown: '재시작 후 삭제 결과 확인 필요'
+      restart_delete_outcome_unknown: '재시작 후 삭제 결과 확인 필요',
+      direct_delete_recovery_required: '직접 영구삭제 결과 수동 확인 필요'
     };
     return labels[flag] || flag;
   }
@@ -139,16 +134,17 @@
     return {
       present: Boolean(value.subtitle_cleanup || cleanup.included_subtitles || cleanup.excluded_subtitles || cleanup.eligible || cleanup.excluded || backend),
       detailsPresent: detailsPresent,
-      enabled: cleanup.enabled === true || backend === 'quarantine',
+      enabled: cleanup.enabled === true || backend === 'quarantine' || backend === 'direct',
       backend: backend || 'plex',
-      status: String(cleanup.status || (backend === 'quarantine' ? 'planned' : 'disabled')),
+      status: String(cleanup.status || ((backend === 'quarantine' || backend === 'direct') ? 'planned' : 'disabled')),
       planDigest: String(cleanup.plan_digest || value.plan_digest || ''),
       quarantineDir: String(cleanup.quarantine_dir || cleanup.quarantine_root || ''),
       eligible: eligible,
       excluded: excluded,
       eligibleCount: Number(counts.eligible !== undefined ? counts.eligible : eligible.length) || 0,
       excludedCount: Number(counts.excluded !== undefined ? counts.excluded : excluded.length) || 0,
-      quarantinedCount: Number(counts.quarantined || 0) || 0
+      quarantinedCount: Number(counts.quarantined || 0) || 0,
+      deletedCount: Number(counts.deleted || 0) || 0
     };
   }
 
@@ -186,22 +182,30 @@
 
   function subtitleCleanupHtml(value, phase) {
     var cleanup = subtitleCleanup(value);
-    var isResult = phase === 'result' || cleanup.status === 'quarantined' || cleanup.status === 'recovery_required';
+    var direct = cleanup.backend === 'direct';
+    var quarantine = cleanup.backend === 'quarantine';
+    var isResult = phase === 'result' || cleanup.status === 'quarantined' || cleanup.status === 'deleted' || cleanup.status === 'deleted_pending_scan' || cleanup.status === 'recovery_required';
+    var handledCount = isResult
+      ? (direct ? cleanup.deletedCount : cleanup.quarantinedCount)
+      : cleanup.eligibleCount;
+    var handledLabel = direct ? '함께 영구삭제 ' : '함께 격리 ';
     var html = '<div class="pdff-subtitle-summary"><strong>외부 자막 안전 처리</strong> ' +
       badge(cleanup.status) + '<span class="pdff-muted ml-2">방식 ' + esc(cleanup.backend) +
-      ' · 함께 격리 ' + esc(isResult ? cleanup.quarantinedCount : cleanup.eligibleCount) +
+      ' · ' + handledLabel + esc(handledCount) +
       ' · 위험 예외 ' + esc(cleanup.excludedCount) + '</span></div>';
-    if (cleanup.backend !== 'quarantine' || !cleanup.enabled) {
+    if ((!quarantine && !direct) || !cleanup.enabled) {
       return html + '<div class="pdff-danger mt-2">Plex Media DELETE 방식에서는 자막을 직접 선별·격리하지 않으며, PMS가 외부 자막을 어떻게 처리할지 이 플러그인이 보장할 수 없습니다.</div>';
     }
-    html += '<div class="pdff-muted mt-2">영구삭제가 아니라 격리 이동입니다. 승인한 목록과 파일 상태를 실행 직전에 정확히 재검증하며, 달라지면 아무 파일도 이동하지 않고 새 사전확인을 요구합니다. 모호한 자막은 이동하지 않습니다.</div>';
-    if (cleanup.quarantineDir) {
+    html += direct
+      ? '<div class="pdff-danger mt-2"><strong>복구 불가:</strong> 승인한 영상과 전용 외부 자막을 격리·휴지통 없이 직접 영구삭제합니다. 실행 직전 목록과 파일 상태가 달라지면 삭제하지 않으며, 모호한 자막은 보존합니다.</div>'
+      : '<div class="pdff-muted mt-2">영구삭제가 아니라 격리 이동입니다. 승인한 목록과 파일 상태를 실행 직전에 정확히 재검증하며, 달라지면 아무 파일도 이동하지 않고 새 사전확인을 요구합니다. 모호한 자막은 이동하지 않습니다.</div>';
+    if (quarantine && cleanup.quarantineDir) {
       html += '<div class="mt-2"><span class="pdff-kv-label">격리 위치</span><div class="pdff-code">' + esc(cleanup.quarantineDir) + '</div></div>';
     }
     if (cleanup.eligible.length) {
-      html += '<details class="pdff-subtitle-details mt-2" open><summary>함께 격리 ' + esc(cleanup.eligible.length) + '개</summary>';
+      html += '<details class="pdff-subtitle-details mt-2" open><summary>' + handledLabel + esc(cleanup.eligible.length) + '개</summary>';
       cleanup.eligible.forEach(function (entry) {
-        var destination = entry && typeof entry === 'object'
+        var destination = quarantine && entry && typeof entry === 'object'
           ? String(entry.quarantine_path || entry.destination_path || '') : '';
         html += '<div class="pdff-subtitle-entry pdff-subtitle-eligible"><div class="pdff-code">' + esc(subtitlePath(entry, true)) + '</div>' +
           (destination ? '<div class="pdff-muted">→ ' + esc(destination) + '</div>' : '') +
@@ -209,7 +213,7 @@
       });
       html += '</details>';
     } else {
-      html += '<div class="pdff-muted mt-2">함께 격리할 전용 외부 자막이 없습니다.</div>';
+      html += '<div class="pdff-muted mt-2">함께 ' + (direct ? '영구삭제할' : '격리할') + ' 전용 외부 자막이 없습니다.</div>';
     }
     if (cleanup.excluded.length) {
       html += '<details class="pdff-subtitle-details pdff-subtitle-exceptions mt-2" open><summary>위험·모호하여 제외 ' + esc(cleanup.excluded.length) + '개</summary>';
@@ -219,8 +223,8 @@
       });
       html += '</details>';
     }
-    if (cleanup.status === 'recovery_required') {
-      html += '<div class="pdff-danger mt-2"><strong>복구 확인 필요:</strong> 격리 이동 결과가 완결되지 않았습니다. 감사 상세와 실제 파일을 확인하세요.</div>';
+    if (cleanup.status === 'recovery_required' || cleanup.status === 'manual_check_required') {
+      html += '<div class="pdff-danger mt-2"><strong>수동 확인 필요:</strong> 파일 처리 결과가 완결되지 않았습니다. 감사 상세와 실제 파일을 확인하세요.</div>';
     }
     return html;
   }

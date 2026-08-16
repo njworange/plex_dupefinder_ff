@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import or_
+
 from framework import F
 from plugin import ModelBase
 
@@ -98,14 +100,18 @@ class ModelScanRun(ModelBase):
         return db.session.query(cls).order_by(cls.id.desc()).limit(max(1, min(limit, 100))).all()
 
     @classmethod
-    def claim_deletion_slot(cls, run_id: Any, limit: int) -> bool:
-        """Atomically reserve one DELETE attempt across SQLite/MySQL workers."""
+    def claim_deletion_slot(cls, run_id: Any, limit: Any = None) -> bool:
+        """Atomically record one attempt while guarding the scan-run status.
+
+        ``limit`` is accepted only so an older worker can finish during a
+        rolling reload.  Per-scan attempt caps were removed in v1.4.0.
+        """
+        del limit
         updated = (
             db.session.query(cls)
             .filter(
                 cls.id == int(run_id),
                 cls.status.in_(["completed", "completed_with_warnings"]),
-                cls.deletion_attempts < max(1, int(limit)),
             )
             .update(
                 {cls.deletion_attempts: cls.deletion_attempts + 1},
@@ -372,6 +378,8 @@ class ModelActionLog(ModelBase):
                 if self.id is not None
                 else None
             )
+            if journal is None and self.id is not None:
+                journal = ModelDirectDeleteJournal.for_action(self.id)
         except Exception:
             # Stub/unit-test DBs and a pre-create_all startup window must not
             # break legacy audit serialization.
@@ -394,7 +402,11 @@ class ModelActionLog(ModelBase):
     def interrupted(cls) -> List["ModelActionLog"]:
         return (
             db.session.query(cls)
-            .filter(cls.status.in_(["validating", "deleting", "quarantining"]))
+            .filter(
+                cls.status.in_(
+                    ["validating", "deleting", "quarantining", "direct_deleting"]
+                )
+            )
             .order_by(cls.id.asc())
             .all()
         )
@@ -405,7 +417,9 @@ class ModelActionLog(ModelBase):
             db.session.query(cls)
             .filter(
                 cls.action == "delete_media",
-                cls.status.in_(["validating", "deleting", "quarantining"]),
+                cls.status.in_(
+                    ["validating", "deleting", "quarantining", "direct_deleting"]
+                ),
             )
             .order_by(cls.id.asc())
             .first()
@@ -442,15 +456,29 @@ class ModelActionLog(ModelBase):
         if status:
             query = query.filter_by(status=status)
         if subtitle_filter == "excluded":
-            query = query.join(
-                ModelQuarantineJournal,
+            quarantine_has_excluded = db.session.query(
+                ModelQuarantineJournal.id
+            ).filter(
                 ModelQuarantineJournal.action_log_id == cls.id,
-            ).filter(ModelQuarantineJournal.excluded_count > 0)
+                ModelQuarantineJournal.excluded_count > 0,
+            ).exists()
+            direct_has_excluded = db.session.query(
+                ModelDirectDeleteJournal.id
+            ).filter(
+                ModelDirectDeleteJournal.action_log_id == cls.id,
+                ModelDirectDeleteJournal.excluded_count > 0,
+            ).exists()
+            query = query.filter(or_(quarantine_has_excluded, direct_has_excluded))
         elif subtitle_filter == "quarantined":
             query = query.join(
                 ModelQuarantineJournal,
                 ModelQuarantineJournal.action_log_id == cls.id,
             ).filter(ModelQuarantineJournal.quarantined_count > 0)
+        elif subtitle_filter == "deleted":
+            query = query.join(
+                ModelDirectDeleteJournal,
+                ModelDirectDeleteJournal.action_log_id == cls.id,
+            ).filter(ModelDirectDeleteJournal.deleted_count > 0)
         total = query.count()
         items = (
             query.order_by(cls.id.desc())
@@ -759,7 +787,7 @@ class ModelQuarantineJournal(ModelBase):
             "group_id": self.group_id,
             "candidate_id": self.candidate_id,
             "keep_candidate_id": self.keep_candidate_id,
-            "plan_digest": self.plan_digest,
+            "plan_digest": str(self.plan_digest or ""),
             "subtitle_cleanup": self.cleanup_api(True),
         }
 
@@ -814,6 +842,150 @@ class ModelQuarantineJournal(ModelBase):
                         "backing_up",
                         "quarantining",
                         "quarantined_pending_scan",
+                        "scan_running",
+                    ]
+                )
+            )
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+
+class ModelDirectDeleteJournal(ModelBase):
+    """Durable, append-style evidence for the opt-in direct filesystem backend.
+
+    This is intentionally a new table: FlaskFarm's create_all upgrade path does
+    not ALTER existing plugin tables.
+    """
+
+    P = P
+    __tablename__ = "direct_delete_journal"
+    __table_args__ = {"mysql_collate": "utf8_general_ci"}
+    __bind_key__ = P.package_name
+
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    finished_at = db.Column(db.DateTime)
+    action_log_id = db.Column(db.Integer, index=True)
+    batch_run_id = db.Column(db.Integer, index=True)
+    run_id = db.Column(db.Integer, nullable=False, index=True)
+    group_id = db.Column(db.Integer, nullable=False, index=True)
+    candidate_id = db.Column(db.Integer, nullable=False)
+    keep_candidate_id = db.Column(db.Integer, nullable=False)
+    operation_key = db.Column(db.String(64), nullable=False, unique=True)
+    status = db.Column(db.String(32), nullable=False, index=True)
+    plan_digest = db.Column(db.String(64), nullable=False, index=True)
+    manifest_json = db.Column(db.Text, default="{}", nullable=False)
+    unlink_json = db.Column(db.Text, default="[]", nullable=False)
+    operation_paths_json = db.Column(db.Text, default="[]", nullable=False)
+    eligible_count = db.Column(db.Integer, default=0, nullable=False)
+    excluded_count = db.Column(db.Integer, default=0, nullable=False, index=True)
+    protected_count = db.Column(db.Integer, default=0, nullable=False)
+    deleted_count = db.Column(db.Integer, default=0, nullable=False, index=True)
+    last_error = db.Column(db.Text, default="")
+
+    def cleanup_api(self, include_paths: bool = True) -> Dict[str, Any]:
+        manifest = _json_load(self.manifest_json, {})
+        operations = _json_load(self.unlink_json, [])
+        eligible = manifest.get("eligible", []) if isinstance(manifest, dict) else []
+        excluded = manifest.get("excluded", []) if isinstance(manifest, dict) else []
+        deleted_paths = {
+            str(raw.get("source_path") or "")
+            for raw in operations
+            if isinstance(raw, dict)
+            and raw.get("kind") == "subtitle"
+            and raw.get("state") == "deleted"
+        } if isinstance(operations, list) else set()
+
+        def public_entries(values: Any, included: bool) -> List[Dict[str, Any]]:
+            result: List[Dict[str, Any]] = []
+            if not isinstance(values, list):
+                return result
+            for raw in values:
+                if not isinstance(raw, dict):
+                    continue
+                path = str(raw.get("path") or raw.get("source_path") or "")
+                entry = {
+                    "path": path,
+                    "source_path": path,
+                    "reason": str(raw.get("reason") or ""),
+                }
+                if included:
+                    entry["deleted"] = path in deleted_paths
+                result.append(entry)
+            return result
+
+        value: Dict[str, Any] = {
+            "enabled": True,
+            "backend": "direct",
+            "status": self.status or "",
+            "operation_id": self.operation_key,
+            "plan_digest": str(self.plan_digest or ""),
+            "eligible": public_entries(eligible, True) if include_paths else [],
+            "excluded": public_entries(excluded, False) if include_paths else [],
+            "counts": {
+                "eligible": self.eligible_count or 0,
+                "excluded": self.excluded_count or 0,
+                "protected": self.protected_count or 0,
+                "deleted": self.deleted_count or 0,
+            },
+        }
+        if self.last_error:
+            value["message"] = self.last_error
+        return value
+
+    def as_api(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "created_at": _iso(self.created_at),
+            "updated_at": _iso(self.updated_at),
+            "finished_at": _iso(self.finished_at),
+            "action_id": self.action_log_id,
+            "batch_id": self.batch_run_id,
+            "run_id": self.run_id,
+            "group_id": self.group_id,
+            "candidate_id": self.candidate_id,
+            "keep_candidate_id": self.keep_candidate_id,
+            "plan_digest": self.plan_digest,
+            "subtitle_cleanup": self.cleanup_api(True),
+        }
+
+    @classmethod
+    def get(cls, journal_id: Any) -> Optional["ModelDirectDeleteJournal"]:
+        return db.session.query(cls).filter_by(id=int(journal_id)).first()
+
+    @classmethod
+    def for_action(cls, action_id: Any) -> Optional["ModelDirectDeleteJournal"]:
+        return (
+            db.session.query(cls)
+            .filter_by(action_log_id=int(action_id))
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    @classmethod
+    def for_batch_candidate(
+        cls, batch_id: Any, candidate_id: Any, status: str = ""
+    ) -> Optional["ModelDirectDeleteJournal"]:
+        query = db.session.query(cls).filter_by(
+            batch_run_id=int(batch_id), candidate_id=int(candidate_id)
+        )
+        if status:
+            query = query.filter_by(status=str(status))
+        return query.order_by(cls.id.desc()).first()
+
+    @classmethod
+    def unfinished(cls) -> List["ModelDirectDeleteJournal"]:
+        return (
+            db.session.query(cls)
+            .filter(
+                cls.status.in_(
+                    [
+                        "planned",
+                        "preparing",
+                        "deleting",
+                        "deleted_pending_scan",
                         "scan_running",
                     ]
                 )
@@ -1012,6 +1184,10 @@ class ModelBatchItem(ModelBase):
             journal = ModelQuarantineJournal.for_batch_candidate(
                 self.batch_run_id, self.delete_candidate_id
             )
+            if journal is None:
+                journal = ModelDirectDeleteJournal.for_batch_candidate(
+                    self.batch_run_id, self.delete_candidate_id
+                )
         except Exception:
             # Serialization of a legacy v1.2 row must remain available even if
             # the new journal table has not yet been created in this process.

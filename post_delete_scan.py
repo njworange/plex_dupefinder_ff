@@ -19,6 +19,7 @@ from .deletion_lease import (
 )
 from .models import (
     ModelDeletionLease,
+    ModelDirectDeleteJournal,
     ModelPostDeleteScanJob,
     ModelQuarantineJournal,
 )
@@ -401,9 +402,10 @@ class PostDeleteScanManager:
     def _has_pending_quarantine_journal(job: ModelPostDeleteScanJob) -> bool:
         terminal = {"verified", "trash_pending", "critical", "recovery_required"}
         for action_id in _action_ids(job):
-            journal = ModelQuarantineJournal.for_action(action_id)
-            if journal is not None and str(journal.status or "") not in terminal:
-                return True
+            for model in (ModelQuarantineJournal, ModelDirectDeleteJournal):
+                journal = model.for_action(action_id)
+                if journal is not None and str(journal.status or "") not in terminal:
+                    return True
         return False
 
     def _reconcile_terminal_job(

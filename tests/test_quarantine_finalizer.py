@@ -118,6 +118,9 @@ class QuarantineFinalizerTest(unittest.TestCase):
         module.ModelQuarantineJournal = types.SimpleNamespace(
             for_action=lambda action_id: journal if int(action_id) == 41 else None
         )
+        module.ModelDirectDeleteJournal = types.SimpleNamespace(
+            for_action=lambda action_id: None
+        )
         module.ModelDuplicateGroup = types.SimpleNamespace(
             get=lambda group_id: group if int(group_id) == 44 else None
         )

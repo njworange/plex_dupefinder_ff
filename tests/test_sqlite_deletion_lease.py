@@ -168,7 +168,7 @@ class SQLiteDeletionLeaseIntegrationTest(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertEqual(sorted(value for _, value in results), ["acquired", "busy"])
 
-    def test_scan_attempt_limit_two_atomically_accepts_two_and_rejects_third(self) -> None:
+    def test_scan_attempt_counter_ignores_legacy_limit_and_never_exhausts(self) -> None:
         with self.app.app_context():
             run = self.models.ModelScanRun(
                 status="completed",
@@ -179,16 +179,89 @@ class SQLiteDeletionLeaseIntegrationTest(unittest.TestCase):
             self.db.session.commit()
             run_id = run.id
 
-            self.assertTrue(self.models.ModelScanRun.claim_deletion_slot(run_id, 2))
-            self.db.session.commit()
-            self.assertTrue(self.models.ModelScanRun.claim_deletion_slot(run_id, 2))
-            self.db.session.commit()
-            self.assertFalse(self.models.ModelScanRun.claim_deletion_slot(run_id, 2))
-            self.db.session.rollback()
+            # A stale v1.3 worker can still pass its old limit argument.  It is
+            # compatibility-only and must not resurrect the per-scan cap.
+            for _value in range(125):
+                self.assertTrue(
+                    self.models.ModelScanRun.claim_deletion_slot(run_id, 1)
+                )
+                self.db.session.commit()
 
             self.db.session.expire_all()
             stored = self.models.ModelScanRun.get(run_id)
-            self.assertEqual(stored.deletion_attempts, 2)
+            self.assertEqual(stored.deletion_attempts, 125)
+
+    def test_scan_attempt_counter_is_atomic_across_concurrent_workers(self) -> None:
+        workers = 8
+        start = threading.Barrier(workers + 1)
+        outcomes = []
+        outcome_lock = threading.Lock()
+        with self.app.app_context():
+            run = self.models.ModelScanRun(
+                status="completed",
+                deletion_attempts=0,
+                server_machine_id="machine-1",
+            )
+            self.db.session.add(run)
+            self.db.session.commit()
+            run_id = int(run.id)
+
+        def claim_once() -> None:
+            with self.app.app_context():
+                start.wait(timeout=10)
+                try:
+                    claimed = self.models.ModelScanRun.claim_deletion_slot(run_id, 1)
+                    self.db.session.commit()
+                except Exception as exc:  # pragma: no cover - failure evidence
+                    self.db.session.rollback()
+                    claimed = exc
+                finally:
+                    self.db.session.remove()
+            with outcome_lock:
+                outcomes.append(claimed)
+
+        threads = [threading.Thread(target=claim_once) for _value in range(workers)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=10)
+        for thread in threads:
+            thread.join(timeout=15)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(outcomes, [True] * workers)
+        with self.app.app_context():
+            self.db.session.expire_all()
+            stored = self.models.ModelScanRun.get(run_id)
+            self.assertEqual(stored.deletion_attempts, workers)
+
+    def test_direct_delete_prejournal_crash_remains_visible_to_recovery(self) -> None:
+        """The durable-attempt commit precedes the direct journal commit.
+
+        A process can die in that narrow gap, so the action log itself must be
+        discoverable by both startup recovery and the active-delete guard.
+        """
+
+        with self.app.app_context():
+            action = self.models.ModelActionLog(
+                run_id=1,
+                group_id=2,
+                candidate_id=3,
+                keep_candidate_id=4,
+                action="delete_media",
+                status="direct_deleting",
+                message="journal not committed yet",
+            )
+            self.db.session.add(action)
+            self.db.session.commit()
+            action_id = int(action.id)
+
+            self.assertIn(
+                action_id,
+                {int(value.id) for value in self.models.ModelActionLog.interrupted()},
+            )
+            active = self.models.ModelActionLog.active_delete()
+            self.assertIsNotNone(active)
+            self.assertEqual(int(active.id), action_id)
 
     def test_batch_approval_cas_persists_internal_token_without_serializing_it(self) -> None:
         now = datetime.now()

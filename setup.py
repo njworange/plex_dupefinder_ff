@@ -51,6 +51,7 @@ try:
         ModelBatchItem,
         ModelBatchRun,
         ModelDeletionLease,
+        ModelDirectDeleteJournal,
         ModelDuplicateGroup,
         ModelMediaCandidate,
         ModelPostDeleteScanJob,
@@ -68,6 +69,7 @@ try:
     P.ModelBatchRun = ModelBatchRun
     P.ModelBatchItem = ModelBatchItem
     P.ModelDeletionLease = ModelDeletionLease
+    P.ModelDirectDeleteJournal = ModelDirectDeleteJournal
     P.ModelPostDeleteScanJob = ModelPostDeleteScanJob
     P.ModelQuarantineJournal = ModelQuarantineJournal
     P.set_module_list([ModuleSetting, ModuleScan, ModuleHistory])

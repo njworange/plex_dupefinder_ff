@@ -12,29 +12,19 @@ class DeleteBudgetContractTest(unittest.TestCase):
     def _module(self):
         return sys.modules[PACKAGE_NAME + ".delete_budget"]
 
-    def test_missing_empty_invalid_and_persisted_one_fail_closed_to_one(self) -> None:
+    def test_legacy_limit_setting_is_not_registered_or_read(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module()
             setting_module = harness.setup_module.P.module_list[0]
-            self.assertEqual(
-                setting_module.db_default["setting_max_delete_per_run"], "1"
-            )
+            self.assertNotIn("setting_max_delete_per_run", setting_module.db_default)
             settings = harness.setup_module.P.ModelSetting._data
-            cases = (
-                ({}, 1),
-                ({"setting_max_delete_per_run": ""}, 1),
-                ({"setting_max_delete_per_run": "not-an-integer"}, 1),
-                ({"setting_max_delete_per_run": "1"}, 1),
-                ({"setting_max_delete_per_run": "0"}, 1),
-                ({"setting_max_delete_per_run": "101"}, 100),
-            )
-            for values, expected in cases:
-                with self.subTest(values=values), mock.patch.dict(
-                    settings, values, clear=True
-                ):
-                    self.assertEqual(module.current_delete_attempt_limit(), expected)
+            with mock.patch.dict(
+                settings, {"setting_max_delete_per_run": "1"}, clear=True
+            ):
+                self.assertIsNone(module.current_delete_attempt_limit())
+                self.assertEqual(settings["setting_max_delete_per_run"], "1")
 
-    def test_budget_is_live_and_never_rewrites_a_persisted_setting(self) -> None:
+    def test_budget_is_unlimited_and_never_rewrites_a_legacy_setting(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module()
             settings = harness.setup_module.P.ModelSetting._data
@@ -46,19 +36,32 @@ class DeleteBudgetContractTest(unittest.TestCase):
                 first = module.delete_attempt_budget(run)
                 self.assertEqual(
                     first,
-                    {"limit": 1, "attempted": 1, "remaining": 0, "exhausted": True},
+                    {
+                        "unlimited": True,
+                        "attempted": 1,
+                        "limit": None,
+                        "remaining": None,
+                        "exhausted": False,
+                    },
                 )
                 self.assertEqual(settings["setting_max_delete_per_run"], "1")
 
-                settings["setting_max_delete_per_run"] = "2"
+                settings["setting_max_delete_per_run"] = "0"
+                run.deletion_attempts = 500
                 second = module.delete_attempt_budget(run)
                 self.assertEqual(
                     second,
-                    {"limit": 2, "attempted": 1, "remaining": 1, "exhausted": False},
+                    {
+                        "unlimited": True,
+                        "attempted": 500,
+                        "limit": None,
+                        "remaining": None,
+                        "exhausted": False,
+                    },
                 )
-                self.assertEqual(settings["setting_max_delete_per_run"], "2")
+                self.assertEqual(settings["setting_max_delete_per_run"], "0")
 
-    def test_corrupt_attempt_counter_fails_closed_and_message_is_actionable(self) -> None:
+    def test_corrupt_attempt_counter_is_sanitized_without_creating_a_cap(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module()
             with mock.patch.dict(
@@ -71,14 +74,21 @@ class DeleteBudgetContractTest(unittest.TestCase):
                         budget = module.delete_attempt_budget(
                             types.SimpleNamespace(deletion_attempts=corrupt)
                         )
-                        self.assertEqual(budget["attempted"], 2)
-                        self.assertEqual(budget["remaining"], 0)
-                        self.assertTrue(budget["exhausted"])
+                        self.assertEqual(budget["attempted"], 0)
+                        self.assertIsNone(budget["limit"])
+                        self.assertIsNone(budget["remaining"])
+                        self.assertFalse(budget["exhausted"])
+                        self.assertTrue(budget["unlimited"])
                 message = module.delete_attempt_limit_message(budget)
-                self.assertIn("사용 2/2", message)
-                self.assertIn("남음 0", message)
-                self.assertIn("설정 > 삭제 안전장치", message)
-                self.assertIn("새 중복 검사", message)
+                self.assertIn("무제한", message)
+                self.assertIn("현재 시도 0회", message)
+                self.assertEqual(module.require_delete_attempt_available(object()), {
+                    "unlimited": True,
+                    "attempted": 0,
+                    "limit": None,
+                    "remaining": None,
+                    "exhausted": False,
+                })
 
 
 if __name__ == "__main__":

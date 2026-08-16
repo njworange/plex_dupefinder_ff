@@ -110,7 +110,7 @@ class BatchBackendTest(unittest.TestCase):
             self.assertEqual(item_payload["keep"]["candidate_id"], 5)
             self.assertEqual(item_payload["delete"]["paths"], ["/media/delete.mkv"])
 
-    def test_batch_status_uses_the_same_live_remaining_attempt_budget(self) -> None:
+    def test_batch_status_reports_unlimited_attempt_counter(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
             run = _Record(id=3, deletion_attempts=1)
@@ -148,17 +148,23 @@ class BatchBackendTest(unittest.TestCase):
             ):
                 payload = module.BatchDeleteManager()._status_locked(batch.id)
                 expected = module.delete_attempt_budget(run)
-                self.assertEqual(module._max_delete_per_run(), 3)
                 self.assertEqual(
                     expected,
-                    {"limit": 3, "attempted": 1, "remaining": 2, "exhausted": False},
+                    {
+                        "unlimited": True,
+                        "attempted": 1,
+                        "limit": None,
+                        "remaining": None,
+                        "exhausted": False,
+                    },
                 )
                 self.assertEqual(payload["delete_budget"], expected)
 
-    def test_exhausted_batch_preview_stops_before_group_planning_with_budget_details(self) -> None:
+    def test_legacy_limit_never_stops_batch_group_planning(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
-            run = _Record(id=9, status="completed", deletion_attempts=1)
+            run = _Record(id=9, status="completed", deletion_attempts=999)
+            calls = []
 
             class Runs:
                 @classmethod
@@ -168,12 +174,14 @@ class BatchBackendTest(unittest.TestCase):
             class Groups:
                 @classmethod
                 def safe_open_by_run(cls, run_id):
-                    raise AssertionError("exhausted budget must stop before group planning")
+                    calls.append(int(run_id))
+                    return []
 
             module.ModelScanRun = Runs
             module.ModelDuplicateGroup = Groups
             manager = module.BatchDeleteManager()
             manager._assert_settings_snapshot = lambda value: None
+            manager._cross_group_path_conflicts = lambda run_id: {}
             with mock.patch.dict(
                 harness.setup_module.P.ModelSetting._data,
                 {
@@ -183,13 +191,9 @@ class BatchBackendTest(unittest.TestCase):
                 },
                 clear=True,
             ):
-                with self.assertRaises(RuntimeError) as exhausted:
+                with self.assertRaisesRegex(RuntimeError, "일괄 처리 가능한 그룹"):
                     manager.preview(run.id)
-
-            message = str(exhausted.exception)
-            self.assertIn("사용 1/1", message)
-            self.assertIn("남음 0", message)
-            self.assertIn("설정 > 삭제 안전장치", message)
+            self.assertEqual(calls, [run.id])
 
     def test_db_lease_driver_errors_are_sanitized_and_renew_is_lost(self) -> None:
         with FlaskFarmImportHarness() as harness:
@@ -931,6 +935,11 @@ class BatchBackendTest(unittest.TestCase):
                 def interrupted(cls):
                     return []
 
+            class EmptyJournals:
+                @classmethod
+                def unfinished(cls):
+                    return []
+
             class Lease:
                 @staticmethod
                 def recovery_state():
@@ -942,9 +951,85 @@ class BatchBackendTest(unittest.TestCase):
 
             module.ModelBatchRun = Batches
             module.ModelActionLog = Actions
+            module.ModelQuarantineJournal = EmptyJournals
+            module.ModelDirectDeleteJournal = EmptyJournals
             manager = module.BatchDeleteManager()
             manager.lease_service = Lease()
             self.assertEqual(manager.recover_interrupted(), 0)
+
+    def test_pending_filesystem_journal_bypasses_clean_recovery_fast_path(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+
+            class Batches:
+                @classmethod
+                def unfinished(cls):
+                    return []
+
+            class Actions:
+                @classmethod
+                def interrupted(cls):
+                    return []
+
+            class EmptyJournals:
+                @classmethod
+                def unfinished(cls):
+                    return []
+
+            class PendingJournals:
+                @classmethod
+                def unfinished(cls):
+                    return [_Record(status="deleted_pending_scan")]
+
+            for pending_backend in ("quarantine", "direct"):
+                with self.subTest(backend=pending_backend):
+                    recover_calls = []
+                    lease_events = []
+
+                    class Lease:
+                        @staticmethod
+                        def recovery_state():
+                            return "free"
+
+                        @staticmethod
+                        def acquire_for_recovery():
+                            lease_events.append("acquire")
+                            return _Record(token="recovery-token")
+
+                        @staticmethod
+                        def release(token):
+                            lease_events.append(("release", token))
+                            return True
+
+                    module.ModelBatchRun = Batches
+                    module.ModelActionLog = Actions
+                    module.ModelQuarantineJournal = (
+                        PendingJournals
+                        if pending_backend == "quarantine"
+                        else EmptyJournals
+                    )
+                    module.ModelDirectDeleteJournal = (
+                        PendingJournals
+                        if pending_backend == "direct"
+                        else EmptyJournals
+                    )
+                    module.F.db.session = _Session()
+                    manager = module.BatchDeleteManager()
+                    manager.delete_service = types.SimpleNamespace(
+                        recover_interrupted=lambda: (
+                            recover_calls.append(True)
+                            or {"blocked": 0, "unknown": 1}
+                        )
+                    )
+                    manager.lease_service = Lease()
+                    manager._wake_post_delete_scans = lambda: None
+
+                    self.assertEqual(manager.recover_interrupted(), 0)
+                    self.assertEqual(recover_calls, [True])
+                    self.assertEqual(
+                        lease_events,
+                        ["acquire", ("release", "recovery-token")],
+                    )
 
 
 if __name__ == "__main__":

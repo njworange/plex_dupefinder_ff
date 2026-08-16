@@ -388,11 +388,13 @@ class ModuleScan(PluginModuleBase):
                     confirmation=req.form.get("confirmation", ""),
                     plan_digest=supplied_digest,
                 )
-                message = (
-                    "안전 격리를 완료했고 Plex 부분 스캔 검증을 예약했습니다."
-                    if result.get("verification") == "quarantined_pending_scan"
-                    else "삭제와 사후 검증을 완료했습니다."
-                )
+                verification = result.get("verification")
+                if verification == "quarantined_pending_scan":
+                    message = "안전 격리를 완료했고 Plex 부분 스캔 검증을 예약했습니다."
+                elif verification == "deleted_pending_scan":
+                    message = "영상과 전용 외부 자막의 영구삭제를 완료했고 Plex 부분 스캔 검증을 예약했습니다."
+                else:
+                    message = "삭제와 사후 검증을 완료했습니다."
                 return jsonify({"ret": "success", "msg": message, "data": result})
 
             return jsonify({"ret": "danger", "msg": "지원하지 않는 요청입니다."}), 400

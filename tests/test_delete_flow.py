@@ -144,6 +144,10 @@ class DeleteServiceHarness:
         self.quarantine_preview_calls = []
         self.quarantine_stage_calls = []
         self.quarantine_journal = None
+        self.direct_plan = None
+        self.direct_preview_calls = []
+        self.direct_execute_calls = []
+        self.direct_journal = None
         self.lose_lease_after_stage = False
         self.run = _Record(
             id=1,
@@ -183,12 +187,11 @@ class DeleteServiceHarness:
                 return harness.run if int(run_id) == harness.run.id else None
 
             @classmethod
-            def claim_deletion_slot(cls, run_id, limit):
+            def claim_deletion_slot(cls, run_id, limit=None):
                 run = cls.get(run_id)
                 if (
                     run is None
                     or run.status not in ("completed", "completed_with_warnings")
-                    or run.deletion_attempts >= int(limit)
                 ):
                     return False
                 run.deletion_attempts += 1
@@ -245,6 +248,18 @@ class DeleteServiceHarness:
                     return journal
                 return None
 
+        class ModelDirectDeleteJournal:
+            @classmethod
+            def get(cls, journal_id):
+                journal = harness.direct_journal
+                if journal is not None and int(journal_id) == int(journal.id):
+                    return journal
+                return None
+
+            @classmethod
+            def for_action(cls, action_id):
+                return None
+
         self.session = _Session(ModelActionLog)
         fake_f = types.SimpleNamespace(
             app=_App(),
@@ -276,6 +291,7 @@ class DeleteServiceHarness:
         models.ModelMediaCandidate = ModelMediaCandidate
         models.ModelActionLog = ModelActionLog
         models.ModelQuarantineJournal = ModelQuarantineJournal
+        models.ModelDirectDeleteJournal = ModelDirectDeleteJournal
         scan_manager = types.ModuleType("delete_review.scan_manager")
         scan_manager.current_safety_policy = lambda: SafetyPolicy(
             allowed_roots=("/media/movies",),
@@ -359,6 +375,53 @@ class DeleteServiceHarness:
                 return journal
 
         quarantine_manager.QuarantineManager = QuarantineManager
+        direct_delete_manager = types.ModuleType("delete_review.direct_delete_manager")
+
+        class DirectDeleteManager:
+            def preview(self, *args, **kwargs):
+                harness.direct_preview_calls.append((args, kwargs))
+                if harness.direct_plan is None:
+                    raise AssertionError("non-direct harness must not create a direct plan")
+                return harness.direct_plan
+
+            def execute(self, *args, **kwargs):
+                harness.direct_execute_calls.append((args, kwargs))
+                if harness.direct_plan is None:
+                    raise AssertionError("non-direct harness must not unlink files")
+                journal = _Record(
+                    id=902,
+                    status="deleted_pending_scan",
+                    last_error=None,
+                    updated_at=None,
+                )
+
+                def cleanup_api(include_paths=True):
+                    return {
+                        "enabled": True,
+                        "backend": "direct",
+                        "status": journal.status,
+                        "eligible": (
+                            [{"source_path": "/media/movies/Delete Review/10.ko.srt"}]
+                            if include_paths
+                            else []
+                        ),
+                        "excluded": [],
+                        "counts": {
+                            "eligible": 1,
+                            "excluded": 0,
+                            "protected": 1,
+                            "deleted": 1,
+                        },
+                    }
+
+                journal.cleanup_api = cleanup_api
+                harness.direct_journal = journal
+                return journal
+
+            def recover_interrupted(self):
+                return 0
+
+        direct_delete_manager.DirectDeleteManager = DirectDeleteManager
 
         replacements = {
             "framework": framework,
@@ -369,6 +432,7 @@ class DeleteServiceHarness:
             "delete_review.deletion_lease": deletion_lease,
             "delete_review.path_conflicts": path_conflicts,
             "delete_review.quarantine_manager": quarantine_manager,
+            "delete_review.direct_delete_manager": direct_delete_manager,
             "delete_review.services": services_package,
             "delete_review.services.plex_gateway": gateway_module,
             "delete_review.services.plex_mate_provider": provider_module,
@@ -482,6 +546,129 @@ class DeleteFlowTest(unittest.TestCase):
 
         plan.public_dict = public_dict
         return plan
+
+    @staticmethod
+    def direct_plan(digest="d" * 64, subtitle_count=1):
+        plan = _Record(
+            plan_digest=digest,
+            eligible=tuple(object() for _ in range(subtitle_count)),
+        )
+
+        def public_dict():
+            return {
+                "enabled": True,
+                "backend": "direct",
+                "status": "planned",
+                "video": {"path": "/media/movies/Delete Review/10.mkv"},
+                "eligible": [
+                    {
+                        "source_path": "/media/movies/Delete Review/10.ko.srt",
+                        "reason": "exclusive_to_deleted_video",
+                    }
+                ][:subtitle_count],
+                "excluded": [],
+                "counts": {
+                    "eligible": subtitle_count,
+                    "excluded": 0,
+                    "protected": 1,
+                    "deleted": 0,
+                },
+                "plan_digest": digest,
+            }
+
+        plan.public_dict = public_dict
+        return plan
+
+    def test_direct_preview_binds_exact_confirmation_without_mutation(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_delete_backend"] = "direct"
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.direct_plan = self.direct_plan()
+        gateway = _Gateway([before])
+
+        result = harness.service_for(gateway).preview(10, 1, 2)
+
+        self.assertEqual(result["backend"], "direct")
+        self.assertEqual(result["plan_digest"], "d" * 64)
+        self.assertEqual(
+            result["confirmation"],
+            "DELETE FILES 10 SUBTITLES 1 %s" % ("d" * 12),
+        )
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.direct_execute_calls, [])
+        self.assertEqual(harness.run.deletion_attempts, 0)
+
+    def test_direct_execution_never_calls_pms_delete_and_requires_scan(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_delete_backend"] = "direct"
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.direct_plan = self.direct_plan()
+        gateway = _Gateway([before])
+
+        class ScanManager:
+            def __init__(self):
+                self.calls = []
+                self.wake_count = 0
+
+            def enqueue_confirmed(self, **kwargs):
+                self.calls.append(kwargs)
+                return [types.SimpleNamespace(id=702)]
+
+            def wake(self):
+                self.wake_count += 1
+
+        manager = ScanManager()
+        result = harness.service_for(gateway, manager).delete(
+            10,
+            1,
+            2,
+            "DELETE FILES 10 SUBTITLES 1 %s" % ("d" * 12),
+            plan_digest="d" * 64,
+        )
+
+        self.assertEqual(result["verification"], "deleted_pending_scan")
+        self.assertEqual(result["post_delete_scan"]["job_ids"], [702])
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(len(harness.direct_execute_calls), 1)
+        self.assertEqual(
+            harness.direct_execute_calls[0][1]["expected_digest"], "d" * 64
+        )
+        self.assertEqual(len(manager.calls), 1)
+        self.assertEqual(manager.wake_count, 1)
+        self.assertEqual(harness.run.deletion_attempts, 1)
+        self.assertFalse(harness.candidates[1].deleted)
+
+    def test_direct_digest_drift_blocks_before_unlink_and_pms_delete(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_delete_backend"] = "direct"
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.direct_plan = self.direct_plan(digest="e" * 64)
+        gateway = _Gateway([before])
+
+        with self.assertRaisesRegex(ValueError, "사전확인"):
+            harness.service_for(gateway, object()).delete(
+                10,
+                1,
+                2,
+                "DELETE FILES 10 SUBTITLES 1 %s" % ("d" * 12),
+                plan_digest="d" * 64,
+            )
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.direct_execute_calls, [])
+        self.assertEqual(harness.run.deletion_attempts, 0)
 
     def test_quarantine_preview_is_read_only_and_binds_confirmation_to_digest(self) -> None:
         before = _item(
@@ -683,7 +870,7 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertEqual(harness.lease_events[0][0], "acquire")
         self.assertEqual(harness.lease_events[-1][0], "release")
 
-    def test_exhausted_preview_blocks_before_gateway_then_live_raise_allows_same_run(self) -> None:
+    def test_legacy_limit_is_ignored_and_attempt_counter_remains_auditable(self) -> None:
         before = _item(
             _version("10", path="/media/movies/Delete Review/10.mkv"),
             _version(
@@ -698,25 +885,20 @@ class DeleteFlowTest(unittest.TestCase):
         preview_gateway = _Gateway([before])
         service = harness.service_for(preview_gateway)
 
-        with self.assertRaises(RuntimeError) as exhausted:
-            service.preview(10, 1, 2)
-
-        message = str(exhausted.exception)
-        self.assertIn("사용 1/1", message)
-        self.assertIn("남음 0", message)
-        self.assertIn("설정 > 삭제 안전장치", message)
-        self.assertFalse(hasattr(harness, "require_machine_id"))
-        self.assertEqual(preview_gateway.metadata_results, [before])
+        preview = service.preview(10, 1, 2)
+        self.assertTrue(harness.require_machine_id)
+        self.assertEqual(preview_gateway.metadata_results, [])
         self.assertEqual(harness.quarantine_preview_calls, [])
         self.assertEqual(harness.session.logs, [])
-
-        # The limit is intentionally live rather than captured in the scan
-        # snapshot. An explicit setting change must unlock this same run.
-        harness.module.P.ModelSetting.values["setting_max_delete_per_run"] = "2"
-        preview = service.preview(10, 1, 2)
         self.assertEqual(
             preview["delete_budget"],
-            {"limit": 2, "attempted": 1, "remaining": 1, "exhausted": False},
+            {
+                "unlimited": True,
+                "attempted": 1,
+                "limit": None,
+                "remaining": None,
+                "exhausted": False,
+            },
         )
 
         result = harness.service_for(_Gateway([before, after])).delete(
@@ -1022,22 +1204,18 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertFalse(harness.candidates[1].deleted)
         self.assertEqual(harness.run.deletion_attempts, 0)
 
-    def test_consumed_attempt_slot_blocks_another_delete_before_group_claim(self) -> None:
+    def test_high_attempt_counter_does_not_block_another_delete(self) -> None:
         before = _item(_version("10"), _version("20"))
+        after = _item(before.media[1])
         harness = DeleteServiceHarness(before)
-        harness.module.P.ModelSetting.values["setting_max_delete_per_run"] = "2"
-        harness.run.deletion_attempts = 2
-        gateway = _Gateway([before])
+        harness.module.P.ModelSetting.values["setting_max_delete_per_run"] = "1"
+        harness.run.deletion_attempts = 999
+        gateway = _Gateway([before, after])
 
-        with self.assertRaises(RuntimeError) as exhausted:
-            harness.service_for(gateway).delete(10, 1, 2, "DELETE 10")
-
-        self.assertIn("사용 2/2", str(exhausted.exception))
-        self.assertIn("남음 0", str(exhausted.exception))
-        self.assertEqual(gateway.delete_calls, [])
-        self.assertEqual(harness.session.logs, [])
-        self.assertTrue(harness.group.safe_to_delete)
-        self.assertEqual(harness.group.resolution_status, "open")
+        result = harness.service_for(gateway).delete(10, 1, 2, "DELETE 10")
+        self.assertEqual(result["verification"], "confirmed")
+        self.assertEqual(gateway.delete_calls, [("100", "10")])
+        self.assertEqual(harness.run.deletion_attempts, 1000)
 
     def test_restart_recovery_blocks_validating_group_without_consuming_slot(self) -> None:
         before = _item(_version("10"), _version("20"))

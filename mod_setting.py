@@ -64,7 +64,7 @@ def _post_delete_scan_capabilities(web_connection_validated: bool = False) -> Di
         pass
 
     selected_supported = (
-        (mode == "none" and delete_backend != "quarantine")
+        (mode == "none" and delete_backend not in ("quarantine", "direct"))
         or (mode == "web" and web_connection_validated)
         or (mode == "binary" and binary_helper_exported and binary_scanner_configured)
     )
@@ -85,7 +85,6 @@ class ModuleSetting(PluginModuleBase):
         "setting_batch_delete_enabled": "False",
         "setting_batch_max_items": "10",
         "setting_allowed_roots": "",
-        "setting_max_delete_per_run": "1",
         "setting_delete_backend": "plex",
         "setting_quarantine_root": "",
         "setting_request_timeout": "20",
