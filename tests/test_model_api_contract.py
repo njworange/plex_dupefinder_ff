@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 import unittest
+from unittest import mock
 
-from test_flaskfarm_compat import FlaskFarmImportHarness
+from test_flaskfarm_compat import FlaskFarmImportHarness, PACKAGE_NAME
 
 
 class ModelApiContractTest(unittest.TestCase):
@@ -31,11 +34,68 @@ class ModelApiContractTest(unittest.TestCase):
             item.cancellation_requested = False
             item.error_summary = ""
 
-            payload = item.as_api()
+            with mock.patch.dict(
+                harness.setup_module.P.ModelSetting._data,
+                {"setting_max_delete_per_run": "2"},
+                clear=True,
+            ):
+                payload = item.as_api()
             self.assertIsInstance(payload, dict)
             self.assertEqual(payload["id"], 7)
             self.assertEqual(payload["status"], "completed")
             self.assertEqual(payload["section_ids"], ["1"])
+            self.assertEqual(
+                payload["delete_budget"],
+                {"limit": 2, "attempted": 0, "remaining": 2, "exhausted": False},
+            )
+
+    def test_group_detail_api_returns_the_same_live_delete_budget(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = sys.modules[PACKAGE_NAME + ".mod_scan"]
+            run = types.SimpleNamespace(id=7, deletion_attempts=1)
+            group = types.SimpleNamespace(
+                id=3,
+                run_id=7,
+                as_api=lambda: {"id": 3, "run_id": 7},
+            )
+            candidate = types.SimpleNamespace(as_api=lambda: {"id": 4})
+
+            class Groups:
+                @classmethod
+                def get(cls, group_id):
+                    return group if int(group_id) == group.id else None
+
+            class Candidates:
+                @classmethod
+                def by_group(cls, group_id, include_deleted=True):
+                    return [candidate]
+
+            class Runs:
+                @classmethod
+                def get(cls, run_id):
+                    return run if int(run_id) == run.id else None
+
+            module.ModelDuplicateGroup = Groups
+            module.ModelMediaCandidate = Candidates
+            module.ModelScanRun = Runs
+            request = types.SimpleNamespace(values={"group_id": "3"})
+            with mock.patch.dict(
+                harness.setup_module.P.ModelSetting._data,
+                {
+                    "setting_delete_enabled": "True",
+                    "setting_max_delete_per_run": "2",
+                },
+                clear=True,
+            ):
+                response = harness.setup_module.P.module_list[1].process_ajax(
+                    "group_detail", request
+                )
+
+            self.assertEqual(response["ret"], "success")
+            self.assertEqual(
+                response["data"]["delete_budget"],
+                {"limit": 2, "attempted": 1, "remaining": 1, "exhausted": False},
+            )
 
     def test_action_log_serializer_honors_summary_and_detail_contract(self) -> None:
         with FlaskFarmImportHarness() as harness:

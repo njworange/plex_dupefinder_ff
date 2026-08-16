@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1
+
+- Added a visible per-scan deletion-attempt budget with used, maximum and remaining counts in scan and result views.
+- Disabled individual preview and batch-plan controls when the budget is exhausted, while retaining authoritative server-side and atomic database guards.
+- Added actionable guidance that an explicitly raised live limit applies to the current scan without changing existing saved settings or requiring a new scan.
+- Kept the conservative default limit of one attempt and now rejects an exhausted request before Plex or filesystem preflight work begins.
+
 ## 1.3.0
 
 - Added an opt-in quarantine backend that never calls Plex Media DELETE and moves one validated video version to a configured same-filesystem quarantine root.

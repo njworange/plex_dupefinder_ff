@@ -111,9 +111,50 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("openGroup(Number($(this).data('id')), true)", self.results)
 
     def test_run_and_group_rows_show_delete_diagnostics(self) -> None:
-        self.assertIn("run.deletion_attempts", self.scan_list)
+        self.assertIn("PDFF.deleteBudget(run)", self.scan_list)
+        for field in ("budget.attempted", "budget.limit", "budget.remaining"):
+            self.assertIn("PDFF.esc(%s)" % field, self.scan_list)
         self.assertIn("run.successful_deletions", self.scan_list)
         self.assertIn("PDFF.badge(group.resolution_status || 'open')", self.results)
+
+    def test_delete_budget_is_visible_and_exhaustion_disables_mutations(self) -> None:
+        static = (ROOT / "static" / "pdff.js").read_text(encoding="utf-8")
+        for element_id in ("delete_budget_status", "delete_budget_warning"):
+            self.assertIn('id="%s"' % element_id, self.results)
+        self.assertIn("function deleteBudget(value)", static)
+        self.assertIn("value.deletion_attempts", static)
+        self.assertIn("limit = 1", static)
+        self.assertIn("attempted = limit", static)
+        self.assertIn("function selectedDeleteBudget()", self.results)
+        self.assertIn("budget.exhausted", self.results)
+        self.assertIn("selectedDeleteBudget().exhausted", self.results)
+        self.assertIn("disabled aria-disabled=", self.results)
+        self.assertIn("$('.group-delete')", self.results)
+        self.assertIn(".prop('disabled', budget.exhausted)", self.results)
+        self.assertIn("|| budgetExhausted", self.results)
+        self.assertIn("refreshSelectedRunBudget", self.results)
+        render_batch = self.results.split("function renderBatchPlan(data)", 1)[1].split(
+            "\nfunction ", 1
+        )[0]
+        self.assertIn("data.delete_budget", render_batch)
+        self.assertIn("applyDeleteBudget(data.delete_budget)", render_batch)
+        self.assertIn("설정 &gt; 삭제 안전장치", self.results)
+        self.assertIn("설정 > 삭제 안전장치", self.results)
+
+    def test_delete_limit_setting_stays_fail_closed_and_validates_explicit_raise(self) -> None:
+        setting_line = next(
+            line for line in self.setting.splitlines() if "setting_max_delete_per_run" in line
+        )
+        self.assertIn("arg.get('setting_max_delete_per_run', '1')", setting_line)
+        self.assertIn("min=1, max=100", setting_line)
+        self.assertIn("Number.isInteger(maxDeletePerRun)", self.setting)
+        self.assertIn("maxDeletePerRun < 1", self.setting)
+        self.assertIn("maxDeletePerRun > 100", self.setting)
+        self.assertIn(
+            "$('#setting_max_delete_per_run').val(String(maxDeletePerRun))",
+            self.setting,
+        )
+        self.assertIn("새로 스캔하지 않고 현재", self.setting)
 
     def test_latest_plan_is_restored_by_run_id(self) -> None:
         self.assertIn("function restoreBatchForRun()", self.results)

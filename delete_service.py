@@ -8,6 +8,12 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 from framework import F
 
+from .delete_budget import (
+    current_delete_attempt_limit,
+    delete_attempt_budget,
+    delete_attempt_limit_message,
+    require_delete_attempt_available,
+)
 from .deletion_lease import DeletionLeaseLost, DeletionLeaseService
 from .models import (
     ModelActionLog,
@@ -39,10 +45,7 @@ def _delete_enabled() -> bool:
 
 
 def _max_delete_per_run() -> int:
-    try:
-        return max(1, min(100, int(P.ModelSetting.get("setting_max_delete_per_run") or "1")))
-    except (TypeError, ValueError):
-        return 1
+    return current_delete_attempt_limit()
 
 
 def _timeout() -> int:
@@ -507,6 +510,7 @@ class DeleteService:
                 raise RuntimeError("이 그룹은 안전 삭제 조건을 충족하지 않습니다. 다시 스캔하세요.")
             if run.status not in ("completed", "completed_with_warnings"):
                 raise RuntimeError("완료된 스캔의 결과만 처리할 수 있습니다.")
+            budget = require_delete_attempt_available(run)
             if group_has_cross_path_conflict(run.id, group.id):
                 raise RuntimeError("다른 Plex metadata 그룹과 Part 파일 경로가 겹칩니다.")
 
@@ -587,6 +591,7 @@ class DeleteService:
                 "backend": backend,
                 "plan_digest": plan_digest,
                 "subtitle_cleanup": cleanup,
+                "delete_budget": budget,
             }
 
     def _claim_group_and_create_log(
@@ -625,9 +630,18 @@ class DeleteService:
         message: str = "Plex에 Media 삭제 요청 전송",
     ) -> None:
         try:
-            if not ModelScanRun.claim_deletion_slot(run.id, _max_delete_per_run()):
+            limit = _max_delete_per_run()
+            if not ModelScanRun.claim_deletion_slot(run.id, limit):
                 F.db.session.rollback()
-                raise RuntimeError("이 스캔의 삭제 시도 개수 상한에 도달했습니다.")
+                fresh_run = ModelScanRun.get(run.id)
+                budget = delete_attempt_budget(fresh_run or run)
+                if budget["exhausted"]:
+                    raise RuntimeError(delete_attempt_limit_message(budget))
+                raise RuntimeError(
+                    "삭제 시도 한도를 안전하게 예약할 수 없습니다. "
+                    "(사용 %(attempted)s/%(limit)s, 남음 %(remaining)s) "
+                    "스캔 상태와 설정을 다시 확인하세요." % budget
+                )
             log.before_json = before_json
             log.status = status
             log.message = message
@@ -793,8 +807,7 @@ class DeleteService:
                 raise RuntimeError("이 그룹은 안전 삭제 조건을 충족하지 않습니다. 다시 스캔하세요.")
             if run.status not in ("completed", "completed_with_warnings"):
                 raise RuntimeError("완료된 스캔의 결과만 삭제에 사용할 수 있습니다.")
-            if (run.deletion_attempts or 0) >= _max_delete_per_run():
-                raise RuntimeError("이 스캔의 삭제 시도 개수 상한에 도달했습니다.")
+            require_delete_attempt_available(run)
 
             log = self._claim_group_and_create_log(run, group, candidate, keep)
             try:

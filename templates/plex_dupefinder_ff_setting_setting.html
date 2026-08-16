@@ -56,7 +56,7 @@
       <div id="plex_delete_mode_notice" class="pdff-danger mb-3" style="display:none">
         <strong>Plex 방식 주의:</strong> 파일 처리를 PMS에 위임하므로 외부 자막의 실제 처리 범위를 이 플러그인이 보장할 수 없습니다. 유지본 자막 보호가 우선이면 안전 격리 방식을 사용하세요.
       </div>
-      {{ macros.setting_input_int('setting_max_delete_per_run', '스캔 1회당 전역 삭제 시도 한도', value=arg.get('setting_max_delete_per_run', '1'), min=1, max=100, desc='개별 삭제와 배치 삭제 시도를 합산합니다. 실패하거나 결과가 불명확한 시도도 한도를 소비합니다.') }}
+      {{ macros.setting_input_int('setting_max_delete_per_run', '스캔 1회당 전역 삭제 시도 한도', value=arg.get('setting_max_delete_per_run', '1'), min=1, max=100, desc=['기본값 1은 같은 중복 스캔 결과에서 첫 처리 후 추가 개별·배치 처리를 차단하는 보수적 안전장치입니다.', '개별 삭제와 배치 삭제 시도를 합산합니다. 실패하거나 결과가 불명확한 시도도 한도를 소비합니다.', '여러 건을 명시적으로 허용하려면 이 값을 올리세요. 저장하면 새로 스캔하지 않고 현재 스캔 결과를 계속 처리할 수 있으며, 기존에 저장한 값은 업데이트가 바꾸지 않습니다.']) }}
       {{ macros.setting_select('setting_post_delete_scan_mode', '삭제 성공 후 Plex 부분 스캔 방식', [['none', '사용 안 함'], ['binary', 'Plex Media Scanner (Binary)'], ['web', 'Plex Web API']], value=arg.get('setting_post_delete_scan_mode', 'none'), desc=['기본값은 사용 안 함입니다. 안전 격리 방식에서는 PMS DB 반영 및 사후 검증을 위해 Binary 또는 Web 부분 스캔이 필수입니다.', 'Binary/Web 선택 시 정확한 library section과 영화 폴더 또는 TV 쇼 루트를 Plex 방식은 DELETE 전에 필수 검증하고, 안전 격리 방식은 파일 이동 전에 필수 검증합니다. 만들 수 없으면 처리를 차단합니다.', 'Binary는 plex_mate가 Plex Media Scanner와 Plex 파일 경로를 사용할 수 있어야 합니다.', 'Web은 plex_mate 연결정보, 라이브러리 section ID 및 Plex 서버에서 보이는 경로가 필요합니다.', '이 요청은 DupeFinder 중복 재검사가 아니며 처리 그룹의 rescan_required 잠금을 해제하지 않습니다.']) }}
       {{ macros.setting_checkbox('setting_require_guid', 'GUID 필수', value=arg.get('setting_require_guid', 'True')) }}
       {{ macros.setting_checkbox('setting_block_multipart', '멀티파트 삭제 차단', value=arg.get('setting_block_multipart', 'True')) }}
@@ -83,9 +83,15 @@ function updateDeleteBackendNotice() {
 function globalSettingSaveBefore() {
   var deleteEnabled = $('#setting_delete_enabled').is(':checked');
   var batchEnabled = $('#setting_batch_delete_enabled').is(':checked');
+  var maxDeletePerRun = Number($('#setting_max_delete_per_run').val());
   var deleteBackend = String($('#setting_delete_backend').val() || '').trim().toLowerCase();
   var quarantineRoot = String($('#setting_quarantine_root').val() || '').trim();
   var scanMode = String($('#setting_post_delete_scan_mode').val() || '').trim().toLowerCase();
+  if (!Number.isInteger(maxDeletePerRun) || maxDeletePerRun < 1 || maxDeletePerRun > 100) {
+    window.alert('스캔 1회당 전역 삭제 시도 한도는 1~100 사이의 정수로 입력하세요.');
+    return false;
+  }
+  $('#setting_max_delete_per_run').val(String(maxDeletePerRun));
   if (deleteBackends.indexOf(deleteBackend) < 0) {
     window.alert('파일 처리 방식이 올바르지 않습니다. Plex 또는 안전 격리 중 하나를 선택하세요.');
     return false;

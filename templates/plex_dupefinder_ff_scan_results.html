@@ -12,6 +12,11 @@
     <div class="col-md-1 d-flex align-items-end"><button id="filter_btn" class="btn btn-sm btn-primary" type="button">검색</button></div>
   </div>
   <div id="result_summary" class="pdff-muted mt-3"></div>
+  <div id="delete_budget_status" class="pdff-muted mt-2"></div>
+  <div id="delete_budget_warning" class="pdff-warning mt-2" style="display:none">
+    이 스캔의 삭제 시도 한도를 모두 사용했습니다. <strong>설정 &gt; 삭제 안전장치</strong>에서
+    <strong>스캔 1회당 전역 삭제 시도 한도</strong>를 올리면 새로 스캔하지 않고 현재 결과를 계속 처리할 수 있습니다.
+  </div>
 </section>
 
 <section class="pdff-panel">
@@ -96,6 +101,65 @@ var batchPollHandle = null;
 var batchBusy = false;
 var pendingDeletePayload = null;
 var pendingDeletePreview = null;
+var runsById = {};
+
+function selectedRunRecord() {
+  return runsById[String($('#run_select').val() || '')] || null;
+}
+
+function selectedDeleteBudget() {
+  return PDFF.deleteBudget(selectedRunRecord() || {});
+}
+
+function applyDeleteBudget(value) {
+  var run = selectedRunRecord();
+  if (run && value && typeof value === 'object') {
+    run.delete_budget = value.delete_budget && typeof value.delete_budget === 'object'
+      ? value.delete_budget : value;
+  }
+  renderDeleteBudget();
+}
+
+function renderDeleteBudget() {
+  var run = selectedRunRecord();
+  if (!run) {
+    $('#delete_budget_status').empty();
+    $('#delete_budget_warning').hide();
+    return;
+  }
+  var budget = selectedDeleteBudget();
+  $('#delete_budget_status').html(
+    '<strong>삭제 시도</strong> ' + PDFF.esc(budget.attempted) + ' / ' + PDFF.esc(budget.limit) +
+    ' · <strong>남음</strong> ' + PDFF.esc(budget.remaining) +
+    ' · <strong>성공</strong> ' + PDFF.esc(run.successful_deletions || 0)
+  );
+  $('#delete_budget_warning').toggle(budget.exhausted);
+  $('.group-delete')
+    .prop('disabled', budget.exhausted)
+    .attr('aria-disabled', budget.exhausted ? 'true' : 'false')
+    .attr('title', budget.exhausted ? '삭제 시도 한도 소진' : '');
+  if (budget.exhausted) {
+    resetDeletePreview();
+    $('#delete_controls').hide();
+  }
+  updateBatchButtons();
+}
+
+function refreshSelectedRunBudget(callback) {
+  var runId = $('#run_select').val();
+  if (!runId) {
+    if (typeof callback === 'function') callback();
+    return;
+  }
+  PDFF.request(packageName, 'scan', 'status', {run_id: runId}, 'GET', function (ret) {
+    if (ret.ret === 'success' && ret.data && String(ret.data.id) === String(runId)) {
+      runsById[String(runId)] = ret.data;
+      renderDeleteBudget();
+      updateBatchButtons();
+    }
+    if (typeof callback === 'function') callback();
+  });
+}
 
 function resetDeletePreview() {
   pendingDeletePayload = null;
@@ -116,11 +180,15 @@ function loadRuns() {
   PDFF.request(packageName, 'scan', 'runs', {limit: 100}, 'GET', function (ret) {
     if (ret.ret !== 'success') return;
     var select = $('#run_select').empty();
+    runsById = {};
     (ret.data || []).forEach(function (run) {
-      var label = '#' + run.id + ' · ' + run.status + ' · ' + PDFF.date(run.created_at) + ' · ' + run.total_groups + ' groups';
+      var budget = PDFF.deleteBudget(run);
+      runsById[String(run.id)] = run;
+      var label = '#' + run.id + ' · ' + run.status + ' · ' + PDFF.date(run.created_at) + ' · ' + run.total_groups + ' groups · 삭제 ' + budget.attempted + '/' + budget.limit + ' (남음 ' + budget.remaining + ')';
       select.append(new Option(label, run.id));
     });
     if (requestedRunId) select.val(String(requestedRunId));
+    renderDeleteBudget();
     updateBatchButtons();
     if (select.val()) {
       loadGroups(true);
@@ -166,12 +234,13 @@ function renderGroups(items, total) {
   $('#prev_page').prop('disabled', currentPage <= 1);
   $('#next_page').prop('disabled', currentPage >= totalPages);
   if (!items.length) { $('#group_list').addClass('pdff-empty').text('조건에 맞는 중복 그룹이 없습니다.'); return; }
+  var budget = selectedDeleteBudget();
   var html = '';
   items.forEach(function (group) {
     var flags = (group.safety_flags || []).map(PDFF.flagLabel);
     var canOpenDelete = group.safe_to_delete && group.resolution_status === 'open';
     var actions = '<button class="btn btn-sm btn-outline-primary group-detail" data-id="' + PDFF.esc(group.id) + '">상세 비교</button>';
-    if (canOpenDelete) actions += '<button class="btn btn-sm btn-outline-danger group-delete" data-id="' + PDFF.esc(group.id) + '">개별 삭제</button>';
+    if (canOpenDelete) actions += '<button class="btn btn-sm btn-outline-danger group-delete" data-id="' + PDFF.esc(group.id) + '"' + (budget.exhausted ? ' disabled aria-disabled="true" title="삭제 시도 한도 소진"' : '') + '>개별 삭제</button>';
     html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-6"><strong>' + PDFF.esc(group.title || '-') + '</strong>' + episodeLabel(group) + '<div class="pdff-muted">' + PDFF.esc(group.section_title) + ' · ratingKey ' + PDFF.esc(group.rating_key) + '</div>' + (flags.length ? '<div class="small text-danger">' + PDFF.esc(flags.join(' · ')) + '</div>' : '') + '</div><div class="col-md-3">' + PDFF.badge(group.safe_to_delete ? 'safe' : 'blocked') + ' ' + PDFF.badge(group.resolution_status || 'open') + ' <span class="pdff-muted">' + PDFF.esc(group.candidate_count) + ' versions</span></div><div class="col-md-3"><div class="pdff-actions justify-content-md-end">' + actions + '</div></div></div></article>';
   });
   $('#group_list').removeClass('pdff-empty').html(html);
@@ -187,12 +256,15 @@ function openGroup(groupId, focusDelete) {
   PDFF.request(packageName, 'scan', 'group_detail', {group_id: groupId}, 'GET', function (ret) {
     if (ret.ret !== 'success') return;
     currentDetail = ret.data;
+    if (ret.data.delete_budget) applyDeleteBudget(ret.data.delete_budget);
     var group = ret.data.group;
     var candidates = ret.data.candidates || [];
     $('#detail_title').text((group.title || '-') + ' · Group #' + group.id);
     var flags = (group.safety_flags || []).map(PDFF.flagLabel);
     var warningHtml = group.safe_to_delete ? '<div class="alert alert-success">현재 스냅샷은 삭제 전 재검증 대상입니다. 실제 삭제 권한을 의미하지 않습니다.</div>' : '<div class="pdff-warning mb-3"><strong>삭제 차단:</strong> ' + PDFF.esc(flags.join(' · ') || '안전 조건 불충족') + '</div>';
     if (group.safe_to_delete && !ret.data.delete_enabled) warningHtml += '<div class="pdff-warning mb-3">설정에서 그룹별 수동 삭제를 활성화해야 개별 삭제를 진행할 수 있습니다.</div>';
+    var budget = selectedDeleteBudget();
+    if (group.safe_to_delete && budget.exhausted) warningHtml += '<div class="pdff-warning mb-3"><strong>삭제 시도 ' + PDFF.esc(budget.attempted) + ' / ' + PDFF.esc(budget.limit) + ':</strong> 한도를 모두 사용했습니다. 설정 &gt; 삭제 안전장치에서 한도를 올리면 현재 스캔을 계속할 수 있습니다.</div>';
     $('#detail_warning').html(warningHtml);
     var html = '';
     candidates.forEach(function (candidate) {
@@ -203,7 +275,7 @@ function openGroup(groupId, focusDelete) {
       html += '<article class="pdff-candidate' + (recommended ? ' pdff-candidate-recommended' : '') + '"><div class="d-flex justify-content-between"><strong>' + PDFF.esc(candidateLabel(candidate)) + '</strong>' + (recommended ? '<span class="pdff-badge pdff-success">유지 추천</span>' : '') + '</div><div class="pdff-grid mt-2"><div><span class="pdff-kv-label">영상</span>' + PDFF.esc(candidate.width + '×' + candidate.height + ' / ' + candidate.video_codec) + '</div><div><span class="pdff-kv-label">오디오</span>' + PDFF.esc(candidate.audio_codec + ' / ' + candidate.audio_channels + 'ch') + '</div><div><span class="pdff-kv-label">Bitrate</span>' + PDFF.esc(candidate.bitrate) + ' kbps</div><div><span class="pdff-kv-label">크기</span>' + PDFF.esc(PDFF.bytes(candidate.total_size)) + '</div><div><span class="pdff-kv-label">재생시간</span>' + PDFF.esc(PDFF.duration(candidate.duration)) + '</div><div><span class="pdff-kv-label">상태</span>' + PDFF.esc(candidate.deleted ? '삭제됨' : '현재') + '</div></div><div class="pdff-paths">' + PDFF.esc(paths.join('\n') || '경로 정보 없음') + '</div><details class="mt-2"><summary class="small">점수 근거</summary><div class="pdff-breakdown">' + breakdown + '</div></details></article>';
     });
     $('#candidate_list').html(html);
-    var allowed = ret.data.delete_enabled && group.safe_to_delete && group.resolution_status === 'open';
+    var allowed = ret.data.delete_enabled && group.safe_to_delete && group.resolution_status === 'open' && !budget.exhausted;
     $('#delete_controls').toggle(allowed);
     if (allowed) {
       var keep = $('#keep_candidate').empty();
@@ -221,6 +293,10 @@ function openGroup(groupId, focusDelete) {
 
 function previewDelete() {
   if (!currentDetail) return;
+  if (selectedDeleteBudget().exhausted) {
+    PDFF.notify('삭제 시도 한도를 모두 사용했습니다. 설정 > 삭제 안전장치에서 한도를 올리면 현재 스캔을 계속할 수 있습니다.', 'warning');
+    return;
+  }
   var group = currentDetail.group;
   var keepId = Number($('#keep_candidate').val());
   var deleteId = Number($('#delete_candidate').val());
@@ -236,6 +312,7 @@ function previewDelete() {
       return;
     }
     var preview = ret.data;
+    if (preview.delete_budget) applyDeleteBudget(preview.delete_budget);
     pendingDeletePayload = payload;
     pendingDeletePreview = preview;
     var cleanup = PDFF.subtitleCleanup(preview);
@@ -278,6 +355,7 @@ function executeDelete() {
     if (deleteRet.ret !== 'success') {
       resetDeletePreview();
       PDFF.notify('실행 요청은 자동 재시도하지 않습니다. 작업 이력과 실제 파일 상태를 확인한 뒤 새 사전확인을 만드세요.', 'warning');
+      refreshSelectedRunBudget();
       return;
     }
     var result = deleteRet.data || {};
@@ -286,7 +364,7 @@ function executeDelete() {
     $('#delete_controls').hide();
     resetDeletePreview();
     PDFF.notify(deleteRet.msg, 'success');
-    loadGroups(false, true);
+    refreshSelectedRunBudget(function () { loadGroups(false, true); });
   });
 }
 
@@ -369,7 +447,8 @@ function renderBatchItems(items, quarantinePlan) {
 
 function updateBatchButtons() {
   var active = batchPlan && batchIsActive(batchPlan);
-  $('#batch_preview_btn').prop('disabled', batchBusy || active || !$('#run_select').val());
+  var budgetExhausted = Boolean($('#run_select').val()) && selectedDeleteBudget().exhausted;
+  $('#batch_preview_btn').prop('disabled', batchBusy || active || !$('#run_select').val() || budgetExhausted);
   $('#run_select').prop('disabled', Boolean(active || batchBusy));
 }
 
@@ -380,6 +459,7 @@ function stopBatchPolling() {
 
 function renderBatchPlan(data) {
   data = normalizedBatch(data);
+  if (data.delete_budget) applyDeleteBudget(data.delete_budget);
   var previousStatus = batchPlan ? batchStatus(batchPlan) : '';
   batchPlan = data;
   var rawItems = batchValue(data, ['items', 'entries'], []);
@@ -473,6 +553,10 @@ function pollBatchStatus() {
 function previewBatch() {
   var runId = $('#run_select').val();
   if (!runId || batchBusy) return;
+  if (selectedDeleteBudget().exhausted) {
+    PDFF.notify('삭제 시도 한도를 모두 사용했습니다. 설정 > 삭제 안전장치에서 한도를 올리면 현재 스캔을 계속할 수 있습니다.', 'warning');
+    return;
+  }
   stopBatchPolling();
   batchBusy = true;
   updateBatchButtons();
@@ -532,7 +616,7 @@ function cancelBatch() {
   });
 }
 
-$('#run_select').on('change', function () { resetBatchPlan(); loadGroups(true); restoreBatchForRun(); });
+$('#run_select').on('change', function () { renderDeleteBudget(); resetBatchPlan(); loadGroups(true); restoreBatchForRun(); });
 $('#filter_btn').on('click', applyFilter);
 $('#keyword_filter').on('keydown', function (e) { if (e.key === 'Enter') applyFilter(); });
 $('#prev_page').on('click', function () { if (currentPage > 1) { currentPage -= 1; loadGroups(false); } });

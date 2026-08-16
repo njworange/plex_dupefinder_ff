@@ -376,6 +376,11 @@ class DeleteServiceHarness:
         }
         sentinel = object()
         saved = {name: sys.modules.get(name, sentinel) for name in replacements}
+        # delete_service imports this helper lazily through the synthetic
+        # package. Never let a helper bound to one harness's Settings double
+        # leak into the next test case.
+        budget_module_name = "delete_review.delete_budget"
+        saved_budget_module = sys.modules.pop(budget_module_name, sentinel)
         sys.modules.update(replacements)
         module_name = "delete_review.delete_service"
         try:
@@ -390,6 +395,9 @@ class DeleteServiceHarness:
             self.module = module
         finally:
             sys.modules.pop(module_name, None)
+            sys.modules.pop(budget_module_name, None)
+            if saved_budget_module is not sentinel:
+                sys.modules[budget_module_name] = saved_budget_module
             for name, previous in saved.items():
                 if previous is sentinel:
                     sys.modules.pop(name, None)
@@ -674,6 +682,49 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertEqual(harness.group.resolution_status, "open")
         self.assertEqual(harness.lease_events[0][0], "acquire")
         self.assertEqual(harness.lease_events[-1][0], "release")
+
+    def test_exhausted_preview_blocks_before_gateway_then_live_raise_allows_same_run(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version(
+                "20",
+                bitrate=2_000,
+                path="/media/movies/Delete Review/20.mkv",
+            ),
+        )
+        after = _item(before.media[1])
+        harness = DeleteServiceHarness(before)
+        harness.run.deletion_attempts = 1
+        preview_gateway = _Gateway([before])
+        service = harness.service_for(preview_gateway)
+
+        with self.assertRaises(RuntimeError) as exhausted:
+            service.preview(10, 1, 2)
+
+        message = str(exhausted.exception)
+        self.assertIn("사용 1/1", message)
+        self.assertIn("남음 0", message)
+        self.assertIn("설정 > 삭제 안전장치", message)
+        self.assertFalse(hasattr(harness, "require_machine_id"))
+        self.assertEqual(preview_gateway.metadata_results, [before])
+        self.assertEqual(harness.quarantine_preview_calls, [])
+        self.assertEqual(harness.session.logs, [])
+
+        # The limit is intentionally live rather than captured in the scan
+        # snapshot. An explicit setting change must unlock this same run.
+        harness.module.P.ModelSetting.values["setting_max_delete_per_run"] = "2"
+        preview = service.preview(10, 1, 2)
+        self.assertEqual(
+            preview["delete_budget"],
+            {"limit": 2, "attempted": 1, "remaining": 1, "exhausted": False},
+        )
+
+        result = harness.service_for(_Gateway([before, after])).delete(
+            10, 1, 2, "DELETE 10"
+        )
+        self.assertEqual(result["verification"], "confirmed")
+        self.assertEqual(harness.run.deletion_attempts, 2)
+        self.assertEqual(harness.run.successful_deletions, 1)
 
     def test_confirmed_delete_updates_audit_and_requires_rescan(self) -> None:
         before = _item(
@@ -974,12 +1025,15 @@ class DeleteFlowTest(unittest.TestCase):
     def test_consumed_attempt_slot_blocks_another_delete_before_group_claim(self) -> None:
         before = _item(_version("10"), _version("20"))
         harness = DeleteServiceHarness(before)
-        harness.run.deletion_attempts = 1
+        harness.module.P.ModelSetting.values["setting_max_delete_per_run"] = "2"
+        harness.run.deletion_attempts = 2
         gateway = _Gateway([before])
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as exhausted:
             harness.service_for(gateway).delete(10, 1, 2, "DELETE 10")
 
+        self.assertIn("사용 2/2", str(exhausted.exception))
+        self.assertIn("남음 0", str(exhausted.exception))
         self.assertEqual(gateway.delete_calls, [])
         self.assertEqual(harness.session.logs, [])
         self.assertTrue(harness.group.safe_to_delete)

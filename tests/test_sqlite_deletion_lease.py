@@ -168,6 +168,28 @@ class SQLiteDeletionLeaseIntegrationTest(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertEqual(sorted(value for _, value in results), ["acquired", "busy"])
 
+    def test_scan_attempt_limit_two_atomically_accepts_two_and_rejects_third(self) -> None:
+        with self.app.app_context():
+            run = self.models.ModelScanRun(
+                status="completed",
+                deletion_attempts=0,
+                server_machine_id="machine-1",
+            )
+            self.db.session.add(run)
+            self.db.session.commit()
+            run_id = run.id
+
+            self.assertTrue(self.models.ModelScanRun.claim_deletion_slot(run_id, 2))
+            self.db.session.commit()
+            self.assertTrue(self.models.ModelScanRun.claim_deletion_slot(run_id, 2))
+            self.db.session.commit()
+            self.assertFalse(self.models.ModelScanRun.claim_deletion_slot(run_id, 2))
+            self.db.session.rollback()
+
+            self.db.session.expire_all()
+            stored = self.models.ModelScanRun.get(run_id)
+            self.assertEqual(stored.deletion_attempts, 2)
+
     def test_batch_approval_cas_persists_internal_token_without_serializing_it(self) -> None:
         now = datetime.now()
         with self.app.app_context():

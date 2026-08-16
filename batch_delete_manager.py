@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from framework import F
 
+from .delete_budget import (
+    current_delete_attempt_limit,
+    delete_attempt_budget,
+    delete_attempt_limit_message,
+)
 from .delete_service import DeleteService
 from .deletion_lease import DeletionLeaseLost, DeletionLeaseService
 from .models import (
@@ -73,7 +78,7 @@ def _batch_enabled() -> bool:
 
 
 def _max_delete_per_run() -> int:
-    return _setting_int("setting_max_delete_per_run", 1, 1, 100)
+    return current_delete_attempt_limit()
 
 
 def _batch_max_items() -> int:
@@ -260,10 +265,10 @@ class BatchDeleteManager:
                 raise RuntimeError("완료된 스캔 결과만 일괄 계획에 사용할 수 있습니다.")
             self._assert_settings_snapshot(run)
 
-            remaining = max(0, _max_delete_per_run() - int(run.deletion_attempts or 0))
-            plan_limit = min(_batch_max_items(), remaining)
+            budget = delete_attempt_budget(run)
+            plan_limit = min(_batch_max_items(), int(budget["remaining"]))
             if plan_limit <= 0:
-                raise RuntimeError("이 스캔의 삭제 시도 개수 상한에 도달했습니다.")
+                raise RuntimeError(delete_attempt_limit_message(budget))
 
             conflicts = self._cross_group_path_conflicts(run.id)
             pairs: List[Tuple[ModelDuplicateGroup, ModelMediaCandidate, ModelMediaCandidate]] = []
@@ -403,11 +408,11 @@ class BatchDeleteManager:
         self._assert_settings_snapshot(run)
         items = ModelBatchItem.by_batch(batch.id)
         conflicts = self._cross_group_path_conflicts(run.id)
-        current_limit = min(
-            _batch_max_items(),
-            max(0, _max_delete_per_run() - int(run.deletion_attempts or 0)),
-        )
+        budget = delete_attempt_budget(run)
+        current_limit = min(_batch_max_items(), int(budget["remaining"]))
         if not items or len(items) != int(batch.total_items or 0) or len(items) > current_limit:
+            if budget["exhausted"]:
+                raise RuntimeError(delete_attempt_limit_message(budget))
             raise RuntimeError("삭제 가능 수가 계획 이후 변경되었습니다. 다시 사전확인하세요.")
         for item in items:
             group = ModelDuplicateGroup.get(item.group_id)
@@ -778,6 +783,9 @@ class BatchDeleteManager:
         payload = batch.as_api()
         payload["backend"] = self._planned_backend(batch)
         payload["items"] = [item.as_api() for item in ModelBatchItem.by_batch(batch.id)]
+        run = ModelScanRun.get(batch.scan_run_id)
+        if run is not None:
+            payload["delete_budget"] = delete_attempt_budget(run)
         return payload
 
     def status(

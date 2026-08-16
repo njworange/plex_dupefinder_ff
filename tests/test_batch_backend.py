@@ -6,6 +6,7 @@ import traceback
 import types
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 from test_flaskfarm_compat import FlaskFarmImportHarness, PACKAGE_NAME
 
@@ -108,6 +109,87 @@ class BatchBackendTest(unittest.TestCase):
             item_payload = item.as_api()
             self.assertEqual(item_payload["keep"]["candidate_id"], 5)
             self.assertEqual(item_payload["delete"]["paths"], ["/media/delete.mkv"])
+
+    def test_batch_status_uses_the_same_live_remaining_attempt_budget(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            run = _Record(id=3, deletion_attempts=1)
+            batch = _Record(
+                id=8,
+                scan_run_id=3,
+                confirmation="BATCH DELETE 8 ITEMS 1",
+            )
+            batch.as_api = lambda: {"plan_id": 8, "status": "preview"}
+            item = _Record(id=11)
+            item.as_api = lambda: {"id": 11, "status": "planned"}
+
+            class Batches:
+                @classmethod
+                def get(cls, batch_id):
+                    return batch if int(batch_id) == batch.id else None
+
+            class Items:
+                @classmethod
+                def by_batch(cls, batch_id):
+                    return [item]
+
+            class Runs:
+                @classmethod
+                def get(cls, run_id):
+                    return run if int(run_id) == run.id else None
+
+            module.ModelBatchRun = Batches
+            module.ModelBatchItem = Items
+            module.ModelScanRun = Runs
+            with mock.patch.dict(
+                harness.setup_module.P.ModelSetting._data,
+                {"setting_max_delete_per_run": "3"},
+                clear=True,
+            ):
+                payload = module.BatchDeleteManager()._status_locked(batch.id)
+                expected = module.delete_attempt_budget(run)
+                self.assertEqual(module._max_delete_per_run(), 3)
+                self.assertEqual(
+                    expected,
+                    {"limit": 3, "attempted": 1, "remaining": 2, "exhausted": False},
+                )
+                self.assertEqual(payload["delete_budget"], expected)
+
+    def test_exhausted_batch_preview_stops_before_group_planning_with_budget_details(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            run = _Record(id=9, status="completed", deletion_attempts=1)
+
+            class Runs:
+                @classmethod
+                def get(cls, run_id):
+                    return run if int(run_id) == run.id else None
+
+            class Groups:
+                @classmethod
+                def safe_open_by_run(cls, run_id):
+                    raise AssertionError("exhausted budget must stop before group planning")
+
+            module.ModelScanRun = Runs
+            module.ModelDuplicateGroup = Groups
+            manager = module.BatchDeleteManager()
+            manager._assert_settings_snapshot = lambda value: None
+            with mock.patch.dict(
+                harness.setup_module.P.ModelSetting._data,
+                {
+                    "setting_delete_enabled": "True",
+                    "setting_batch_delete_enabled": "True",
+                    "setting_max_delete_per_run": "1",
+                },
+                clear=True,
+            ):
+                with self.assertRaises(RuntimeError) as exhausted:
+                    manager.preview(run.id)
+
+            message = str(exhausted.exception)
+            self.assertIn("사용 1/1", message)
+            self.assertIn("남음 0", message)
+            self.assertIn("설정 > 삭제 안전장치", message)
 
     def test_db_lease_driver_errors_are_sanitized_and_renew_is_lost(self) -> None:
         with FlaskFarmImportHarness() as harness:

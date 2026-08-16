@@ -66,6 +66,31 @@
     return '<span class="pdff-badge ' + kind + '">' + esc(status || '-') + '</span>';
   }
 
+  function deleteBudget(value) {
+    value = value && typeof value === 'object' ? value : {};
+    var nested = value.delete_budget;
+    var budget = nested && typeof nested === 'object' ? nested : value;
+    var limitRaw = budget.limit;
+    var limit = Number(limitRaw);
+    // A malformed/missing runtime payload must never make the UI less strict.
+    if ((typeof limitRaw !== 'number' && typeof limitRaw !== 'string') ||
+        String(limitRaw).trim() === '' || !Number.isInteger(limit) ||
+        limit < 1 || limit > 100) limit = 1;
+    var attemptedRaw = budget.attempted !== undefined
+      ? budget.attempted : value.deletion_attempts;
+    var attempted = Number(attemptedRaw);
+    if ((typeof attemptedRaw !== 'number' && typeof attemptedRaw !== 'string') ||
+        String(attemptedRaw).trim() === '' || !Number.isInteger(attempted) ||
+        attempted < 0) attempted = limit;
+    var remaining = Math.max(0, limit - attempted);
+    return {
+      limit: limit,
+      attempted: attempted,
+      remaining: remaining,
+      exhausted: remaining === 0
+    };
+  }
+
   function flagLabel(flag) {
     var labels = {
       unsupported_media_type: '지원하지 않는 미디어 타입', less_than_two_versions: '버전 2개 미만',
@@ -200,5 +225,5 @@
     return html;
   }
 
-  window.PDFF = {request: request, esc: esc, notify: notify, bytes: bytes, duration: duration, date: date, badge: badge, flagLabel: flagLabel, redact: redact, subtitleCleanup: subtitleCleanup, subtitleCleanupHtml: subtitleCleanupHtml};
+  window.PDFF = {request: request, esc: esc, notify: notify, bytes: bytes, duration: duration, date: date, badge: badge, deleteBudget: deleteBudget, flagLabel: flagLabel, redact: redact, subtitleCleanup: subtitleCleanup, subtitleCleanupHtml: subtitleCleanupHtml};
 })(window, window.jQuery);

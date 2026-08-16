@@ -11,6 +11,7 @@ from framework import F
 from plugin import PluginModuleBase
 
 from .batch_delete_manager import BatchDeleteManager
+from .delete_budget import delete_attempt_budget
 from .delete_service import DeleteService
 from .models import ModelDuplicateGroup, ModelMediaCandidate, ModelScanRun
 from .post_delete_scan import PostDeleteScanManager
@@ -297,6 +298,9 @@ class ModuleScan(PluginModuleBase):
                 if group is None:
                     raise ValueError("중복 그룹을 찾을 수 없습니다.")
                 candidates = ModelMediaCandidate.by_group(group.id, include_deleted=True)
+                run = ModelScanRun.get(group.run_id)
+                if run is None:
+                    raise ValueError("원본 스캔 이력을 찾을 수 없습니다.")
                 return jsonify(
                     {
                         "ret": "success",
@@ -304,6 +308,7 @@ class ModuleScan(PluginModuleBase):
                             "group": group.as_api(),
                             "candidates": [candidate.as_api() for candidate in candidates],
                             "delete_enabled": P.ModelSetting.get("setting_delete_enabled") == "True",
+                            "delete_budget": delete_attempt_budget(run),
                         },
                     }
                 )

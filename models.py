@@ -53,7 +53,7 @@ class ModelScanRun(ModelBase):
     error_summary = db.Column(db.Text, default="")
 
     def as_api(self) -> Dict[str, Any]:
-        return {
+        value = {
             "id": self.id,
             "created_at": _iso(self.created_at),
             "started_at": _iso(self.started_at),
@@ -74,6 +74,11 @@ class ModelScanRun(ModelBase):
             "cancellation_requested": bool(self.cancellation_requested),
             "error_summary": self.error_summary or "",
         }
+        # Local import avoids setup -> models -> budget -> setup import cycles.
+        from .delete_budget import delete_attempt_budget
+
+        value["delete_budget"] = delete_attempt_budget(self)
+        return value
 
     @classmethod
     def get(cls, run_id: Any) -> Optional["ModelScanRun"]:
