@@ -4,8 +4,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -163,6 +165,7 @@ class QuarantineManagerFilesystemTest(unittest.TestCase):
 
     def test_recreated_quarantine_root_after_preview_moves_nothing(self) -> None:
         plan = self.make_plan()
+        Path(plan.quarantine_marker.path).unlink()
         self.quarantine.rmdir()
         self.quarantine.mkdir()
         harness, _module, session, manager = self.manager_context()
@@ -175,6 +178,143 @@ class QuarantineManagerFilesystemTest(unittest.TestCase):
         self.assertTrue(self.delete_video.exists())
         self.assertTrue(self.delete_subtitle.exists())
         self.assertEqual(session.added, [])
+
+    def test_recreated_watched_subtitle_directory_moves_nothing(self) -> None:
+        subtitles = self.folder / "Subs"
+        subtitles.mkdir()
+        plan = self.make_plan()
+        watched = next(
+            value
+            for value in plan.watched_directories
+            if Path(value.path) == subtitles
+        )
+        subtitles.rmdir()
+        subtitles.mkdir()
+        # Make the timestamp distinction deterministic even on filesystems
+        # that immediately reuse the same directory inode.
+        os.utime(
+            str(subtitles),
+            ns=(watched.mtime_ns + 2_000_000_000, watched.mtime_ns + 2_000_000_000),
+        )
+        harness, _module, session, manager = self.manager_context()
+        try:
+            with self.assertRaisesRegex(Exception, "폴더 내용"):
+                manager.stage(plan, plan.plan_digest, **self.records())
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertTrue(self.delete_video.exists())
+        self.assertTrue(self.delete_subtitle.exists())
+        self.assertEqual(session.added, [])
+
+    def test_plan_manifest_binds_marker_and_watched_directory_times(self) -> None:
+        plan = self.make_plan()
+        manifest = plan.manifest_dict()
+        self.assertNotIn("quarantine_mtime_ns", manifest)
+        self.assertNotIn("quarantine_ctime_ns", manifest)
+        self.assertEqual(
+            manifest["quarantine_marker"], plan.quarantine_marker.as_dict()
+        )
+        self.assertTrue(manifest["quarantine_marker"]["sha256"])
+        self.assertTrue(manifest["watched_directories"])
+        self.assertTrue(
+            all(
+                "mtime_ns" in value and "ctime_ns" in value
+                for value in manifest["watched_directories"]
+            )
+        )
+
+    def test_marker_tamper_before_stage_moves_nothing(self) -> None:
+        plan = self.make_plan()
+        Path(plan.quarantine_marker.path).write_bytes(b"x" * 32)
+        harness, _module, session, manager = self.manager_context()
+        try:
+            with self.assertRaisesRegex(Exception, "격리 루트"):
+                manager.stage(plan, plan.plan_digest, **self.records())
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertTrue(self.delete_video.exists())
+        self.assertTrue(self.delete_subtitle.exists())
+        self.assertEqual(session.added, [])
+
+    def test_symlink_marker_is_rejected_by_preview(self) -> None:
+        target = _write(self.root / "marker-target", b"x" * 32)
+        marker = self.quarantine / ".plex_dupefinder_ff-root-id"
+        try:
+            os.symlink(str(target), str(marker))
+        except (NotImplementedError, OSError):
+            self.skipTest("symlinks are unavailable")
+        with self.assertRaisesRegex(Exception, "identity marker"):
+            self.make_plan()
+
+    def test_marker_hardlink_before_stage_moves_nothing(self) -> None:
+        plan = self.make_plan()
+        try:
+            os.link(plan.quarantine_marker.path, str(self.quarantine / "marker-copy"))
+        except (NotImplementedError, OSError):
+            self.skipTest("hard links are unavailable")
+        with self.assertRaisesRegex(Exception, "identity marker"):
+            self.make_plan()
+        harness, _module, session, manager = self.manager_context()
+        try:
+            with self.assertRaisesRegex(Exception, "격리 루트"):
+                manager.stage(plan, plan.plan_digest, **self.records())
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertTrue(self.delete_video.exists())
+        self.assertTrue(self.delete_subtitle.exists())
+        self.assertEqual(session.added, [])
+
+    def test_concurrent_first_plans_share_one_complete_marker(self) -> None:
+        workers = 8
+        barrier = threading.Barrier(workers)
+
+        def build():
+            barrier.wait(timeout=5)
+            return self.make_plan()
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            plans = list(executor.map(lambda _value: build(), range(workers)))
+
+        marker_paths = {plan.quarantine_marker.path for plan in plans}
+        marker_hashes = {plan.quarantine_marker.sha256 for plan in plans}
+        marker_inodes = {plan.quarantine_marker.inode for plan in plans}
+        plan_digests = {plan.plan_digest for plan in plans}
+        self.assertEqual(len(marker_paths), 1)
+        self.assertEqual(len(marker_hashes), 1)
+        self.assertEqual(len(marker_inodes), 1)
+        self.assertEqual(len(plan_digests), 1)
+        self.assertEqual(Path(next(iter(marker_paths))).stat().st_size, 32)
+
+    def test_first_operation_does_not_change_second_plan_digest(self) -> None:
+        second_folder = self.media / "Movie2"
+        second_delete = _write(second_folder / "Other.1080p.mkv", b"delete-two")
+        second_keep = _write(second_folder / "Other.2160p.mkv", b"keep-two")
+        _write(second_folder / "Other.1080p.ko.srt", b"subtitle-two")
+        first_plan = self.make_plan()
+        second_plan = build_quarantine_plan(
+            (str(second_delete),),
+            (str(second_keep),),
+            (str(self.media),),
+            (str(self.media),),
+            str(self.quarantine),
+        )
+        harness, _module, _session, manager = self.manager_context()
+        try:
+            manager.stage(first_plan, first_plan.plan_digest, **self.records())
+        finally:
+            harness.__exit__(None, None, None)
+
+        fresh_second = build_quarantine_plan(
+            (str(second_delete),),
+            (str(second_keep),),
+            (str(self.media),),
+            (str(self.media),),
+            str(self.quarantine),
+        )
+        self.assertEqual(second_plan.plan_digest, fresh_second.plan_digest)
 
     def test_heartbeat_loss_before_stage_moves_nothing(self) -> None:
         plan = self.make_plan()

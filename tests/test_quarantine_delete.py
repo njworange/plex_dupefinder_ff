@@ -439,21 +439,30 @@ class QuarantinePlannerTest(unittest.TestCase):
         keep_video = _write(folder / "Keep.mkv", b"keep-video")
         _write(folder / "Delete.ko.srt")
 
-        payload = self.plan(_item((delete_video,), (keep_video,))).public_dict()
-        serialized = repr(payload).lower()
+        plan = self.plan(_item((delete_video,), (keep_video,)))
+        for payload in (plan.as_api(), plan.public_dict()):
+            serialized = repr(payload).lower()
 
-        self.assertEqual(payload.get("backend"), "quarantine")
-        self.assertTrue(payload.get("plan_digest"))
-        for forbidden in (
-            "lease_token",
-            "owner_token",
-            "plex_token",
-            "authorization",
-            "cookie",
-            "st_ino",
-            "st_dev",
-        ):
-            self.assertNotIn(forbidden, serialized)
+            self.assertEqual(payload.get("backend"), "quarantine")
+            self.assertTrue(payload.get("plan_digest"))
+            for forbidden in (
+                "lease_token",
+                "owner_token",
+                "plex_token",
+                "authorization",
+                "cookie",
+                "st_ino",
+                "st_dev",
+                "quarantine_marker",
+                "quarantine_root",
+                ".plex_dupefinder_ff-root-id",
+                "sha256",
+                "mtime_ns",
+                "ctime_ns",
+                "inode",
+                "device",
+            ):
+                self.assertNotIn(forbidden, serialized)
 
 
 if __name__ == "__main__":

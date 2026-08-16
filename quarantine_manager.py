@@ -131,13 +131,29 @@ def _verify_quarantine_root(plan: QuarantinePlan) -> None:
         value = os.lstat(root)
     except OSError as exc:
         raise QuarantinePlanError("격리 루트 상태를 확인할 수 없습니다.") from exc
+    expected_marker = os.path.normcase(
+        os.path.realpath(
+            os.path.join(root, ".plex_dupefinder_ff-root-id")
+        )
+    )
     if (
         not stat.S_ISDIR(value.st_mode)
         or stat.S_ISLNK(value.st_mode)
         or bool(getattr(value, "st_file_attributes", 0) & 0x0400)
         or int(value.st_dev) != int(plan.quarantine_device)
         or int(value.st_ino) != int(plan.quarantine_inode)
+        or int(
+            getattr(value, "st_mtime_ns", int(value.st_mtime * 1e9))
+        )
+        != int(plan.quarantine_mtime_ns)
+        or int(
+            getattr(value, "st_ctime_ns", int(value.st_ctime * 1e9))
+        )
+        != int(plan.quarantine_ctime_ns)
         or os.path.normcase(os.path.realpath(root)) != os.path.normcase(root)
+        or os.path.normcase(os.path.realpath(plan.quarantine_marker.path))
+        != expected_marker
+        or not snapshot_matches(plan.quarantine_marker, verify_hash=True)
     ):
         raise QuarantinePlanError("격리 루트가 사전확인 이후 변경되었습니다.")
 

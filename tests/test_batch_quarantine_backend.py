@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
+from services.quarantine_delete import build_quarantine_plan
 from test_batch_backend import _Record, _Session
 from test_flaskfarm_compat import FlaskFarmImportHarness, PACKAGE_NAME
 
@@ -69,6 +72,75 @@ class BatchQuarantineBackendTest(unittest.TestCase):
             harness.setup_module.P.ModelSetting._data["setting_post_delete_scan_mode"] = "binary"
             with self.assertRaisesRegex(RuntimeError, "설정"):
                 manager._fresh_quarantine_preview(item, journal)
+
+    def test_second_fresh_preview_survives_first_operation_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, FlaskFarmImportHarness() as harness:
+            root = Path(temporary)
+            media = root / "media"
+            quarantine = root / "quarantine"
+            folder = media / "Second"
+            folder.mkdir(parents=True)
+            quarantine.mkdir()
+            delete_video = folder / "Second.1080p.mkv"
+            keep_video = folder / "Second.2160p.mkv"
+            subtitle = folder / "Second.1080p.ko.srt"
+            delete_video.write_bytes(b"delete")
+            keep_video.write_bytes(b"keep")
+            subtitle.write_bytes(b"subtitle")
+            stored = build_quarantine_plan(
+                (str(delete_video),),
+                (str(keep_video),),
+                (str(media),),
+                (str(media),),
+                str(quarantine),
+            )
+
+            # The first batch item's stage creates its operation subtree and
+            # legitimately changes qroot mtime/ctime without changing marker.
+            first_operation = quarantine / "pdff-first-operation"
+            first_operation.mkdir()
+            (first_operation / "protected").mkdir()
+            (first_operation / "quarantined").mkdir()
+
+            module = self._module(harness)
+            harness.setup_module.P.ModelSetting._data.update(
+                {
+                    "setting_delete_backend": "quarantine",
+                    "setting_post_delete_scan_mode": "web",
+                    "setting_quarantine_root": str(quarantine),
+                }
+            )
+            binding = {
+                "backend": "quarantine",
+                "post_delete_scan_mode": "web",
+                "quarantine_root": str(quarantine),
+            }
+            item = _Record(group_id=1, delete_candidate_id=2, keep_candidate_id=3)
+            journal = _Record(
+                plan_digest=stored.plan_digest,
+                manifest_json=json.dumps({"batch_binding": binding}),
+            )
+
+            def preview(**_kwargs):
+                fresh = build_quarantine_plan(
+                    (str(delete_video),),
+                    (str(keep_video),),
+                    (str(media),),
+                    (str(media),),
+                    str(quarantine),
+                )
+                return {
+                    "backend": "quarantine",
+                    "plan_digest": fresh.plan_digest,
+                    "confirmation": "approved",
+                    "subtitle_cleanup": fresh.as_api(),
+                }
+
+            manager = module.BatchDeleteManager(
+                types.SimpleNamespace(preview=preview)
+            )
+            result = manager._fresh_quarantine_preview(item, journal)
+            self.assertEqual(result["plan_digest"], stored.plan_digest)
 
     def test_cross_item_source_collision_is_blocked_before_mutation(self) -> None:
         with FlaskFarmImportHarness() as harness:

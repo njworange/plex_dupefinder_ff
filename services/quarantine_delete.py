@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -39,6 +41,8 @@ _LANGUAGE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2})?$")
 _FLAGS = frozenset(("forced", "sdh", "cc"))
 _MAX_SUBTITLE_BYTES = 64 * 1024 * 1024
 _WINDOWS_REPARSE_POINT = 0x0400
+_ROOT_MARKER_NAME = ".plex_dupefinder_ff-root-id"
+_ROOT_MARKER_BYTES = 32
 
 
 class QuarantinePlanError(RuntimeError):
@@ -72,6 +76,8 @@ class DirectorySnapshot:
     path: str
     device: int
     inode: int
+    mtime_ns: int
+    ctime_ns: int
     entries: Tuple[str, ...]
 
     def as_dict(self) -> Dict[str, Any]:
@@ -79,6 +85,8 @@ class DirectorySnapshot:
             "path": self.path,
             "device": self.device,
             "inode": self.inode,
+            "mtime_ns": self.mtime_ns,
+            "ctime_ns": self.ctime_ns,
             "entries": list(self.entries),
         }
 
@@ -107,6 +115,9 @@ class QuarantinePlan:
     quarantine_root: str
     quarantine_device: int
     quarantine_inode: int
+    quarantine_mtime_ns: int
+    quarantine_ctime_ns: int
+    quarantine_marker: FileSnapshot
     watched_directories: Tuple[DirectorySnapshot, ...]
     plan_digest: str
 
@@ -164,6 +175,7 @@ class QuarantinePlan:
             "quarantine_root": self.quarantine_root,
             "quarantine_device": self.quarantine_device,
             "quarantine_inode": self.quarantine_inode,
+            "quarantine_marker": self.quarantine_marker.as_dict(),
             "watched_directories": [
                 value.as_dict() for value in self.watched_directories
             ],
@@ -195,6 +207,14 @@ def _within(path: str, root: str) -> bool:
 
 def _is_reparse(snapshot: os.stat_result) -> bool:
     return bool(getattr(snapshot, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT)
+
+
+def _mtime_ns(snapshot: os.stat_result) -> int:
+    return int(getattr(snapshot, "st_mtime_ns", int(snapshot.st_mtime * 1e9)))
+
+
+def _ctime_ns(snapshot: os.stat_result) -> int:
+    return int(getattr(snapshot, "st_ctime_ns", int(snapshot.st_ctime * 1e9)))
 
 
 def _has_reparse_component(path: str) -> bool:
@@ -299,6 +319,119 @@ def capture_file_snapshot(path: str, content_hash: bool = False) -> FileSnapshot
     return _stat_file(path, content_hash)
 
 
+def _fsync_directory(path: str) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_quarantine_marker(
+    quarantine_root: str, root_before: os.stat_result
+) -> FileSnapshot:
+    """Create-once stable qroot identity; never overwrite an existing entry."""
+
+    marker_path = _absolute(os.path.join(quarantine_root, _ROOT_MARKER_NAME))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: Optional[int] = None
+    created_identity: Optional[Tuple[int, int]] = None
+    try:
+        try:
+            descriptor = os.open(marker_path, flags, 0o600)
+        except FileExistsError:
+            descriptor = None
+        if descriptor is not None:
+            opened = os.fstat(descriptor)
+            created_identity = (int(opened.st_dev), int(opened.st_ino))
+            value = secrets.token_bytes(_ROOT_MARKER_BYTES)
+            offset = 0
+            while offset < len(value):
+                written = os.write(descriptor, value[offset:])
+                if written <= 0:
+                    raise OSError("격리 루트 marker 쓰기 실패")
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            _fsync_directory(quarantine_root)
+    except Exception as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        # Remove only the exact partial regular file created by this call.
+        if created_identity is not None:
+            try:
+                current = os.lstat(marker_path)
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and not stat.S_ISLNK(current.st_mode)
+                    and int(current.st_dev) == created_identity[0]
+                    and int(current.st_ino) == created_identity[1]
+                    and int(getattr(current, "st_nlink", 1) or 1) == 1
+                ):
+                    os.unlink(marker_path)
+                    _fsync_directory(quarantine_root)
+            except OSError:
+                pass
+        raise QuarantinePlanError(
+            "격리 루트 identity marker를 안전하게 초기화할 수 없습니다."
+        ) from exc
+
+    # A concurrent planner can observe the O_EXCL entry before its creator
+    # finishes the 32-byte write. Retry only this short initialization race;
+    # symlink/hardlink/nonregular/tampered entries still fail closed.
+    last_error: Optional[Exception] = None
+    marker: Optional[FileSnapshot] = None
+    for attempt in range(5):
+        try:
+            candidate = _stat_file(marker_path, True)
+            if candidate.size == _ROOT_MARKER_BYTES:
+                marker = candidate
+                break
+            last_error = QuarantinePlanError(
+                "격리 루트 identity marker 크기가 올바르지 않습니다."
+            )
+        except QuarantinePlanError as exc:
+            last_error = exc
+        if attempt < 4:
+            time.sleep(0.01)
+    if marker is None:
+        raise QuarantinePlanError(
+            "격리 루트 identity marker가 누락·변경되었거나 안전하지 않습니다."
+        ) from last_error
+
+    try:
+        root_after = os.lstat(quarantine_root)
+    except OSError as exc:
+        raise QuarantinePlanError("격리 루트 상태를 확인할 수 없습니다.") from exc
+    if (
+        int(root_after.st_dev) != int(root_before.st_dev)
+        or int(root_after.st_ino) != int(root_before.st_ino)
+        or marker.device != int(root_after.st_dev)
+        or stat.S_ISLNK(root_after.st_mode)
+        or _is_reparse(root_after)
+        or _has_reparse_component(quarantine_root)
+    ):
+        raise QuarantinePlanError(
+            "identity marker 초기화 중 격리 루트가 변경되었습니다."
+        )
+    return marker
+
+
 def _tag_matches(subtitle_stem: str, video_stem: str) -> bool:
     if os.path.normcase(subtitle_stem) == os.path.normcase(video_stem):
         return True
@@ -389,6 +522,8 @@ def _directory_snapshot(path: str) -> DirectorySnapshot:
         path=_canonical(lexical),
         device=int(value.st_dev),
         inode=int(value.st_ino),
+        mtime_ns=_mtime_ns(value),
+        ctime_ns=_ctime_ns(value),
         entries=names,
     )
 
@@ -410,6 +545,18 @@ def directory_snapshot_matches(
     return (
         current.device == snapshot.device
         and current.inode == snapshot.inode
+        # Before this transaction mutates a watched directory, timestamps
+        # are an additional non-reusable identity proof. Once an approved
+        # source entry has been moved, that directory's own mtime/ctime is
+        # expected to change; identity + the exact remaining inventory then
+        # remain authoritative.
+        and (
+            bool(removed)
+            or (
+                current.mtime_ns == snapshot.mtime_ns
+                and current.ctime_ns == snapshot.ctime_ns
+            )
+        )
         and current.entries == expected
     )
 
@@ -457,9 +604,22 @@ def build_quarantine_plan(
         raise QuarantinePlanError("격리 루트는 Plex library Location 밖이어야 합니다.")
     if any(_within(quarantine, root) or _within(root, quarantine) for root in roots):
         raise QuarantinePlanError("격리 루트는 삭제 허용 미디어 루트 밖이어야 합니다.")
-    quarantine_stat = os.stat(quarantine)
-    if int(quarantine_stat.st_dev) != video.device:
+    try:
+        quarantine_before = os.lstat(quarantine)
+    except OSError as exc:
+        raise QuarantinePlanError("격리 루트 상태를 확인할 수 없습니다.") from exc
+    if int(quarantine_before.st_dev) != video.device:
         raise QuarantinePlanError("영상과 격리 루트가 같은 파일시스템이 아닙니다.")
+    quarantine_marker = _ensure_quarantine_marker(
+        quarantine, quarantine_before
+    )
+    try:
+        # Capture mutable root times only after one-time marker creation.
+        # They close fresh-plan -> stage TOCTOU but are deliberately excluded
+        # from the approval digest because each pdff-* operation changes them.
+        quarantine_stat = os.lstat(quarantine)
+    except OSError as exc:
+        raise QuarantinePlanError("격리 루트 상태를 확인할 수 없습니다.") from exc
 
     survivor_snapshots = [_stat_file(path, False) for path in survivor_paths]
     if any(
@@ -587,6 +747,7 @@ def build_quarantine_plan(
         "quarantine_root": quarantine,
         "quarantine_device": int(quarantine_stat.st_dev),
         "quarantine_inode": int(quarantine_stat.st_ino),
+        "quarantine_marker": quarantine_marker.as_dict(),
         "watched_directories": [value.as_dict() for value in inventory_after],
     }
     digest = _digest_payload(manifest)
@@ -600,6 +761,9 @@ def build_quarantine_plan(
         quarantine_root=quarantine,
         quarantine_device=int(quarantine_stat.st_dev),
         quarantine_inode=int(quarantine_stat.st_ino),
+        quarantine_mtime_ns=_mtime_ns(quarantine_stat),
+        quarantine_ctime_ns=_ctime_ns(quarantine_stat),
+        quarantine_marker=quarantine_marker,
         watched_directories=inventory_after,
         plan_digest=digest,
     )
