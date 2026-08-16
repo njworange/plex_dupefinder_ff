@@ -264,6 +264,7 @@ class FlaskFarmSetupCompatibilityTest(unittest.TestCase):
                 "ModelMediaCandidate": "media_candidate",
                 "ModelActionLog": "action_log",
                 "ModelPostDeleteScanJob": "post_delete_scan_job",
+                "ModelQuarantineJournal": "quarantine_journal",
                 "ModelBatchRun": "batch_run",
                 "ModelBatchItem": "batch_item",
                 "ModelDeletionLease": "deletion_lease",
@@ -420,7 +421,7 @@ class FlaskFarmStaticContractTest(unittest.TestCase):
         self.assertIsNotNone(gateway)
         self.assertEqual(
             {manifest.group(1), package.group(1), readme.group(1), gateway.group(1)},
-            {"1.2.0"},
+            {"1.3.0"},
         )
 
     def test_post_delete_scan_mode_normalization_is_fail_closed(self) -> None:

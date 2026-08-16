@@ -6,8 +6,10 @@ import sys
 import threading
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List
+from unittest import mock
 
 try:
     from ._requests_compat import requests as requests
@@ -138,6 +140,11 @@ class DeleteServiceHarness:
 
     def __init__(self, before: MetadataItem) -> None:
         self.before = before
+        self.quarantine_plan = None
+        self.quarantine_preview_calls = []
+        self.quarantine_stage_calls = []
+        self.quarantine_journal = None
+        self.lose_lease_after_stage = False
         self.run = _Record(
             id=1,
             status="completed",
@@ -229,6 +236,15 @@ class DeleteServiceHarness:
                 ]
 
         self.ModelActionLog = ModelActionLog
+
+        class ModelQuarantineJournal:
+            @classmethod
+            def get(cls, journal_id):
+                journal = harness.quarantine_journal
+                if journal is not None and int(journal_id) == int(journal.id):
+                    return journal
+                return None
+
         self.session = _Session(ModelActionLog)
         fake_f = types.SimpleNamespace(
             app=_App(),
@@ -240,6 +256,8 @@ class DeleteServiceHarness:
                 "setting_delete_enabled": "True",
                 "setting_max_delete_per_run": "1",
                 "setting_request_timeout": "20",
+                "setting_delete_backend": "plex",
+                "setting_post_delete_scan_mode": "none",
             }
 
             @classmethod
@@ -257,6 +275,7 @@ class DeleteServiceHarness:
         models.ModelDuplicateGroup = ModelDuplicateGroup
         models.ModelMediaCandidate = ModelMediaCandidate
         models.ModelActionLog = ModelActionLog
+        models.ModelQuarantineJournal = ModelQuarantineJournal
         scan_manager = types.ModuleType("delete_review.scan_manager")
         scan_manager.current_safety_policy = lambda: SafetyPolicy(
             allowed_roots=("/media/movies",),
@@ -294,6 +313,52 @@ class DeleteServiceHarness:
         path_conflicts.group_has_cross_path_conflict = (
             lambda run_id, group_id: harness.path_conflict
         )
+        quarantine_manager = types.ModuleType("delete_review.quarantine_manager")
+
+        class QuarantineManager:
+            def preview(self, *args, **kwargs):
+                harness.quarantine_preview_calls.append((args, kwargs))
+                if harness.quarantine_plan is None:
+                    raise AssertionError("plex backend must not create a quarantine plan")
+                return harness.quarantine_plan
+
+            def stage(self, *args, **kwargs):
+                harness.quarantine_stage_calls.append((args, kwargs))
+                if harness.quarantine_plan is None:
+                    raise AssertionError("plex backend must not stage filesystem files")
+                journal = _Record(
+                    id=901,
+                    status="quarantined_pending_scan",
+                    last_error=None,
+                    updated_at=None,
+                )
+
+                def cleanup_api(include_paths=True):
+                    return {
+                        "enabled": True,
+                        "backend": "quarantine",
+                        "status": journal.status,
+                        "eligible": (
+                            [{"source_path": "/media/movies/Delete Review/10.ko.srt"}]
+                            if include_paths
+                            else []
+                        ),
+                        "excluded": [],
+                        "counts": {
+                            "eligible": 1,
+                            "excluded": 0,
+                            "protected": 1,
+                            "quarantined": 1,
+                        },
+                    }
+
+                journal.cleanup_api = cleanup_api
+                harness.quarantine_journal = journal
+                if harness.lose_lease_after_stage:
+                    harness.lose_lease_on_renew = True
+                return journal
+
+        quarantine_manager.QuarantineManager = QuarantineManager
 
         replacements = {
             "framework": framework,
@@ -303,6 +368,7 @@ class DeleteServiceHarness:
             "delete_review.setup": setup,
             "delete_review.deletion_lease": deletion_lease,
             "delete_review.path_conflicts": path_conflicts,
+            "delete_review.quarantine_manager": quarantine_manager,
             "delete_review.services": services_package,
             "delete_review.services.plex_gateway": gateway_module,
             "delete_review.services.plex_mate_provider": provider_module,
@@ -378,6 +444,221 @@ class _Gateway:
 
 
 class DeleteFlowTest(unittest.TestCase):
+    @staticmethod
+    def quarantine_plan(digest="a" * 64, subtitle_count=1):
+        plan = _Record(
+            plan_digest=digest,
+            eligible=tuple(object() for _ in range(subtitle_count)),
+        )
+
+        def public_dict():
+            return {
+                "enabled": True,
+                "backend": "quarantine",
+                "status": "planned",
+                "eligible": [
+                    {
+                        "source_path": "/media/movies/Delete Review/10.ko.srt",
+                        "reason": "exclusive_to_deleted_video",
+                    }
+                ][:subtitle_count],
+                "excluded": [],
+                "counts": {
+                    "eligible": subtitle_count,
+                    "excluded": 0,
+                    "protected": 1,
+                    "quarantined": 0,
+                },
+                "plan_digest": digest,
+            }
+
+        plan.public_dict = public_dict
+        return plan
+
+    def test_quarantine_preview_is_read_only_and_binds_confirmation_to_digest(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_delete_backend"] = "quarantine"
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.quarantine_plan = self.quarantine_plan()
+        gateway = _Gateway([before])
+
+        result = harness.service_for(gateway).preview(10, 1, 2)
+
+        self.assertEqual(result["backend"], "quarantine")
+        self.assertEqual(result["plan_digest"], "a" * 64)
+        self.assertEqual(
+            result["confirmation"],
+            "QUARANTINE 10 SUBTITLES 1 %s" % ("a" * 12),
+        )
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.quarantine_stage_calls, [])
+        self.assertEqual(harness.session.logs, [])
+        self.assertEqual(harness.run.deletion_attempts, 0)
+
+    def test_quarantine_execution_never_calls_plex_delete_and_queues_partial_scan(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_delete_backend"] = "quarantine"
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.quarantine_plan = self.quarantine_plan()
+        gateway = _Gateway([before])
+
+        class ScanManager:
+            def __init__(self):
+                self.calls = []
+                self.wake_count = 0
+
+            def enqueue_confirmed(self, **kwargs):
+                self.calls.append(kwargs)
+                return [types.SimpleNamespace(id=701)]
+
+            def wake(self):
+                self.wake_count += 1
+
+        manager = ScanManager()
+        result = harness.service_for(gateway, manager).delete(
+            10,
+            1,
+            2,
+            "QUARANTINE 10 SUBTITLES 1 %s" % ("a" * 12),
+            plan_digest="a" * 64,
+        )
+
+        self.assertEqual(result["verification"], "quarantined_pending_scan")
+        self.assertEqual(result["post_delete_scan"], {
+            "mode": "web",
+            "status": "queued",
+            "job_ids": [701],
+        })
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(len(harness.quarantine_stage_calls), 1)
+        self.assertEqual(
+            harness.quarantine_stage_calls[0][1]["expected_digest"],
+            "a" * 64,
+        )
+        self.assertEqual(len(manager.calls), 1)
+        self.assertEqual(manager.wake_count, 1)
+        self.assertEqual(harness.run.deletion_attempts, 1)
+        self.assertFalse(harness.candidates[1].deleted)
+        self.assertEqual(harness.group.resolution_status, "delete_in_progress")
+
+    def test_quarantine_digest_drift_blocks_before_stage_and_never_calls_plex_delete(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_delete_backend"] = "quarantine"
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.quarantine_plan = self.quarantine_plan(digest="b" * 64)
+        gateway = _Gateway([before])
+
+        with self.assertRaisesRegex(ValueError, "사전확인"):
+            harness.service_for(gateway, object()).delete(
+                10,
+                1,
+                2,
+                "QUARANTINE 10 SUBTITLES 1 %s" % ("a" * 12),
+                plan_digest="a" * 64,
+            )
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.quarantine_stage_calls, [])
+        self.assertEqual(harness.run.deletion_attempts, 0)
+
+    def test_lease_loss_after_quarantine_stage_never_enqueues_or_calls_plex_delete(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_delete_backend"] = "quarantine"
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.quarantine_plan = self.quarantine_plan()
+        harness.lose_lease_after_stage = True
+        gateway = _Gateway([before])
+
+        class ScanManager:
+            def __init__(self):
+                self.calls = []
+
+            def enqueue_confirmed(self, **kwargs):
+                self.calls.append(kwargs)
+                return [types.SimpleNamespace(id=701)]
+
+            def wake(self):
+                pass
+
+        manager = ScanManager()
+        with self.assertRaises(Exception):
+            harness.service_for(gateway, manager).delete(
+                10,
+                1,
+                2,
+                "QUARANTINE 10 SUBTITLES 1 %s" % ("a" * 12),
+                plan_digest="a" * 64,
+            )
+
+        self.assertEqual(len(harness.quarantine_stage_calls), 1)
+        self.assertEqual(manager.calls, [])
+        self.assertEqual(gateway.delete_calls, [])
+
+    def test_quarantine_postscan_classifies_verified_trash_pending_and_unsafe_drift(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        retry_module = types.ModuleType("delete_review.post_delete_scan")
+
+        class Retryable(RuntimeError):
+            pass
+
+        retry_module.PostDeleteScanRetryable = Retryable
+        missing_target = replace(
+            before.media[0],
+            parts=tuple(replace(part, exists=False) for part in before.media[0].parts),
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {"delete_review.post_delete_scan": retry_module},
+        ):
+            self.assertEqual(
+                harness.module.DeleteService._quarantine_snapshot_state(
+                    before.as_dict(), _item(before.media[1]), "10"
+                ),
+                "verified",
+            )
+            self.assertEqual(
+                harness.module.DeleteService._quarantine_snapshot_state(
+                    before.as_dict(), _item(missing_target, before.media[1]), "10"
+                ),
+                "trash_pending",
+            )
+            with self.assertRaises(Retryable):
+                harness.module.DeleteService._quarantine_snapshot_state(
+                    before.as_dict(), before, "10"
+                )
+            with self.assertRaisesRegex(RuntimeError, "유지 Media"):
+                harness.module.DeleteService._quarantine_snapshot_state(
+                    before.as_dict(),
+                    _item(_version("20", bitrate=2_001)),
+                    "10",
+                )
+            with self.assertRaisesRegex(RuntimeError, "Media 집합"):
+                harness.module.DeleteService._quarantine_snapshot_state(
+                    before.as_dict(),
+                    _item(before.media[1], _version("30")),
+                    "10",
+                )
+
     def test_confirmation_is_byte_exact_and_rejects_surrounding_space(self) -> None:
         before = _item(_version("10"), _version("20"))
         harness = DeleteServiceHarness(before)

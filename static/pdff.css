@@ -26,4 +26,12 @@
 .pdff-breakdown { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:.35rem; margin-top:.5rem; }
 .pdff-batch-item { border:1px solid #d9dee3; border-radius:.4rem; margin:.65rem 0; padding:.8rem; }
 .pdff-confirm-input { flex:1 1 22rem; max-width:42rem; }
+.pdff-subtitle-summary { align-items:center; display:flex; flex-wrap:wrap; gap:.35rem; }
+.pdff-subtitle-details { border:1px solid #d9dee3; border-radius:.35rem; padding:.5rem .65rem; }
+.pdff-subtitle-details > summary { cursor:pointer; font-size:.88rem; font-weight:600; }
+.pdff-subtitle-entry { border-top:1px solid #e9ecef; margin-top:.5rem; padding-top:.5rem; }
+.pdff-subtitle-entry:first-of-type { margin-top:.6rem; }
+.pdff-subtitle-eligible { border-left:3px solid #198754; padding-left:.55rem; }
+.pdff-subtitle-excluded { border-left:3px solid #d98b00; padding-left:.55rem; }
+.pdff-subtitle-exceptions { background:#fff8e1; border-color:#ffe08a; }
 @media (max-width:767px) { .pdff-grid { grid-template-columns:1fr; } }

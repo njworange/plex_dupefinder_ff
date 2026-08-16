@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from framework import F
 
@@ -18,6 +19,7 @@ from .models import (
     ModelBatchRun,
     ModelDuplicateGroup,
     ModelMediaCandidate,
+    ModelQuarantineJournal,
     ModelScanRun,
 )
 from .path_conflicts import candidate_paths, cross_group_path_conflicts
@@ -32,6 +34,7 @@ _TERMINAL_STATUSES = {
     "stopped",
     "interrupted",
     "expired",
+    "scan_pending",
 }
 _FAILURE_ITEM_STATUSES = {
     "failed",
@@ -75,6 +78,17 @@ def _max_delete_per_run() -> int:
 
 def _batch_max_items() -> int:
     return _setting_int("setting_batch_max_items", 10, 1, 100)
+
+
+def _delete_backend() -> str:
+    value = str(P.ModelSetting.get("setting_delete_backend") or "plex").strip().lower()
+    if value not in ("plex", "quarantine"):
+        raise RuntimeError("파일 처리 방식 설정이 올바르지 않습니다.")
+    return value
+
+
+def _post_delete_scan_mode() -> str:
+    return str(P.ModelSetting.get("setting_post_delete_scan_mode") or "none").strip().lower()
 
 
 def _nonce_hash(nonce: str) -> str:
@@ -153,6 +167,89 @@ class BatchDeleteManager:
     def _cross_group_path_conflicts(run_id: int) -> set:
         return cross_group_path_conflicts(run_id)
 
+    @staticmethod
+    def _batch_binding() -> Dict[str, str]:
+        return {
+            "backend": _delete_backend(),
+            "post_delete_scan_mode": _post_delete_scan_mode(),
+            "quarantine_root": str(
+                P.ModelSetting.get("setting_quarantine_root") or ""
+            ).strip(),
+        }
+
+    @staticmethod
+    def _planned_backend(batch: ModelBatchRun) -> str:
+        confirmation = str(getattr(batch, "confirmation", "") or "")
+        if confirmation.startswith("BATCH QUARANTINE "):
+            return "quarantine"
+        # v1.2 previews and every legacy/test row are Plex DELETE plans.
+        return "plex"
+
+    @staticmethod
+    def _preview_manifest(cleanup: Dict[str, Any], binding: Dict[str, str]) -> Dict[str, Any]:
+        """Persist only the approved public paths plus the exact runtime binding.
+
+        Filesystem identity remains represented by ``plan_digest``.  The full
+        private snapshots are recalculated by DeleteService immediately before
+        mutation and never copied into an existing batch table.
+        """
+
+        return {
+            "eligible": list(cleanup.get("eligible") or []),
+            "excluded": list(cleanup.get("excluded") or []),
+            "protected": [],
+            "batch_binding": dict(binding),
+        }
+
+    @staticmethod
+    def _assert_source_sets_disjoint(previews: Sequence[Dict[str, Any]]) -> None:
+        owners: Dict[str, int] = {}
+        for index, preview in enumerate(previews):
+            cleanup = preview.get("subtitle_cleanup") or {}
+            paths: List[str] = []
+            video = cleanup.get("video") or {}
+            if video.get("path"):
+                paths.append(str(video["path"]))
+            for entry in cleanup.get("eligible") or []:
+                if isinstance(entry, dict) and (entry.get("path") or entry.get("source_path")):
+                    paths.append(str(entry.get("path") or entry.get("source_path")))
+            for path in paths:
+                key = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+                previous = owners.get(key)
+                if previous is not None and previous != index:
+                    raise RuntimeError(
+                        "일괄 격리 항목들이 같은 영상 또는 자막 파일을 공유합니다. "
+                        "개별 사전확인으로 처리하세요."
+                    )
+                owners[key] = index
+
+    @staticmethod
+    def _preview_journal(batch_id: int, candidate_id: int) -> ModelQuarantineJournal:
+        journal = ModelQuarantineJournal.for_batch_candidate(
+            batch_id, candidate_id, status="batch_preview"
+        )
+        if journal is None or len(str(journal.plan_digest or "")) != 64:
+            raise RuntimeError("승인된 안전 격리 계획을 찾을 수 없습니다. 다시 사전확인하세요.")
+        return journal
+
+    def _fresh_quarantine_preview(
+        self, item: ModelBatchItem, journal: ModelQuarantineJournal
+    ) -> Dict[str, Any]:
+        manifest = _json_load(journal.manifest_json, {})
+        stored_binding = manifest.get("batch_binding") if isinstance(manifest, dict) else None
+        if stored_binding != self._batch_binding():
+            raise RuntimeError("격리 또는 부분 스캔 설정이 승인 이후 변경되었습니다. 다시 사전확인하세요.")
+        preview = self.delete_service.preview(
+            group_id=item.group_id,
+            candidate_id=item.delete_candidate_id,
+            keep_candidate_id=item.keep_candidate_id,
+        )
+        if preview.get("backend") != "quarantine" or not secrets.compare_digest(
+            str(preview.get("plan_digest") or ""), str(journal.plan_digest or "")
+        ):
+            raise RuntimeError("자막·파일 계획이 승인 이후 변경되었습니다. 다시 사전확인하세요.")
+        return preview
+
     def preview(self, run_id: int) -> Dict[str, Any]:
         self._require_enabled()
         with F.app.app_context():
@@ -184,6 +281,18 @@ class BatchDeleteManager:
                     "일괄 처리 가능한 그룹이 없습니다. 안전·미처리·2개 버전·단독 유지 추천 조건을 확인하세요."
                 )
 
+            backend = _delete_backend()
+            binding = self._batch_binding()
+            previews: List[Dict[str, Any]] = []
+            if backend == "quarantine":
+                if binding["post_delete_scan_mode"] not in ("binary", "web"):
+                    raise RuntimeError("안전 격리는 Binary 또는 Web 부분 스캔이 필수입니다.")
+                for group, keep, target in pairs:
+                    previews.append(
+                        self.delete_service.preview(group.id, target.id, keep.id)
+                    )
+                self._assert_source_sets_disjoint(previews)
+
             nonce = secrets.token_urlsafe(32)
             now = datetime.now()
             expires = now + timedelta(seconds=_PREVIEW_SECONDS)
@@ -199,8 +308,30 @@ class BatchDeleteManager:
             try:
                 F.db.session.add(batch)
                 F.db.session.flush()
-                batch.confirmation = "BATCH DELETE %s ITEMS %s" % (batch.id, len(pairs))
-                for group, keep, target in pairs:
+                if backend == "quarantine":
+                    aggregate_payload = [
+                        {
+                            "group_id": group.id,
+                            "candidate_id": target.id,
+                            "keep_candidate_id": keep.id,
+                            "plan_digest": preview["plan_digest"],
+                            "eligible": int(
+                                (preview.get("subtitle_cleanup") or {})
+                                .get("counts", {})
+                                .get("eligible", 0)
+                            ),
+                        }
+                        for (group, keep, target), preview in zip(pairs, previews)
+                    ]
+                    aggregate = hashlib.sha256(_json(aggregate_payload).encode("utf-8")).hexdigest()
+                    total_subtitles = sum(item["eligible"] for item in aggregate_payload)
+                    batch.confirmation = (
+                        "BATCH QUARANTINE %s ITEMS %s SUBTITLES %s %s"
+                        % (batch.id, len(pairs), total_subtitles, aggregate[:12])
+                    )
+                else:
+                    batch.confirmation = "BATCH DELETE %s ITEMS %s" % (batch.id, len(pairs))
+                for index, (group, keep, target) in enumerate(pairs):
                     F.db.session.add(
                         ModelBatchItem(
                             batch_run_id=batch.id,
@@ -221,6 +352,35 @@ class BatchDeleteManager:
                             delete_paths_json=_json(candidate_paths(target)),
                         )
                     )
+                    if backend == "quarantine":
+                        preview = previews[index]
+                        cleanup = preview.get("subtitle_cleanup") or {}
+                        counts = cleanup.get("counts") or {}
+                        F.db.session.add(
+                            ModelQuarantineJournal(
+                                created_at=now,
+                                updated_at=now,
+                                action_log_id=None,
+                                batch_run_id=batch.id,
+                                run_id=run.id,
+                                group_id=group.id,
+                                candidate_id=target.id,
+                                keep_candidate_id=keep.id,
+                                operation_key="batch-preview-%s" % secrets.token_hex(20),
+                                status="batch_preview",
+                                plan_digest=str(preview["plan_digest"]),
+                                manifest_json=_json(
+                                    self._preview_manifest(cleanup, binding)
+                                ),
+                                moved_json="[]",
+                                backups_json="[]",
+                                operation_path="",
+                                eligible_count=int(counts.get("eligible", 0)),
+                                excluded_count=int(counts.get("excluded", 0)),
+                                protected_count=int(counts.get("protected", 0)),
+                                quarantined_count=0,
+                            )
+                        )
                 F.db.session.commit()
             except Exception:
                 F.db.session.rollback()
@@ -262,6 +422,33 @@ class BatchDeleteManager:
                 or pair[1].media_id != item.delete_media_id
             ):
                 raise RuntimeError("계획 항목이 변경되었습니다. 다시 스캔하고 사전확인하세요.")
+        planned_backend = self._planned_backend(batch)
+        if not str(getattr(batch, "confirmation", "") or ""):
+            # Compatibility for an already-persisted preview created while a
+            # rolling plugin reload was replacing the batch serializer.  The
+            # new-table journal is authoritative and forbids Plex fallback.
+            if any(
+                ModelQuarantineJournal.for_batch_candidate(
+                    batch.id, item.delete_candidate_id, status="batch_preview"
+                )
+                is not None
+                for item in items
+            ):
+                planned_backend = "quarantine"
+        if planned_backend == "quarantine":
+            if _delete_backend() != "quarantine":
+                raise RuntimeError(
+                    "사전확인 이후 파일 처리 방식이 변경되었습니다. Plex 삭제로 전환하지 않습니다."
+                )
+            fresh_previews: List[Dict[str, Any]] = []
+            for item in items:
+                journal = self._preview_journal(batch.id, item.delete_candidate_id)
+                fresh_previews.append(self._fresh_quarantine_preview(item, journal))
+            self._assert_source_sets_disjoint(fresh_previews)
+        elif _delete_backend() != planned_backend:
+            raise RuntimeError(
+                "사전확인 이후 파일 처리 방식이 변경되었습니다. 다시 사전확인하세요."
+            )
         return run
 
     def approve(
@@ -468,11 +655,28 @@ class BatchDeleteManager:
                     F.db.session.commit()
 
                     try:
+                        backend = self._planned_backend(batch)
+                        if _delete_backend() != backend:
+                            raise RuntimeError(
+                                "사전확인 이후 파일 처리 방식이 변경되어 실행을 차단했습니다."
+                            )
+                        plan_digest = ""
+                        confirmation = "DELETE %s" % item.delete_media_id
+                        if backend == "quarantine":
+                            preview_journal = self._preview_journal(
+                                batch.id, item.delete_candidate_id
+                            )
+                            fresh_preview = self._fresh_quarantine_preview(
+                                item, preview_journal
+                            )
+                            plan_digest = str(preview_journal.plan_digest)
+                            confirmation = str(fresh_preview.get("confirmation") or "")
                         result = self.delete_service.delete(
                             group_id=item.group_id,
                             candidate_id=item.delete_candidate_id,
                             keep_candidate_id=item.keep_candidate_id,
-                            confirmation="DELETE %s" % item.delete_media_id,
+                            confirmation=confirmation,
+                            plan_digest=plan_digest,
                             lease_owner_token=batch.deletion_lease_token,
                             lease_owner_kind="batch",
                             lease_owner_ref=str(batch.id),
@@ -521,16 +725,29 @@ class BatchDeleteManager:
                     batch = ModelBatchRun.get(batch_id)
                     if item is None or batch is None:
                         raise RuntimeError("삭제 후 작업 정보를 다시 읽을 수 없습니다.")
-                    item.status = "success"
-                    item.message = "삭제 후 Plex 재검증 완료"
+                    pending_scan = result.get("verification") == "quarantined_pending_scan"
+                    item.status = "scan_pending" if pending_scan else "success"
+                    item.message = (
+                        "파일 격리 완료 · Plex 부분 스캔 검증 대기"
+                        if pending_scan
+                        else "삭제 후 Plex 재검증 완료"
+                    )
                     item.action_log_id = result.get("action_id")
-                    item.finished_at = datetime.now()
+                    item.finished_at = None if pending_scan else datetime.now()
                     items = ModelBatchItem.by_batch(batch_id)
                     self._refresh_counts(batch, items)
                     batch.current_message = "Group #%s 완료" % item.group_id
                     F.db.session.commit()
 
-                self._finish_batch(batch_id, "completed", "일괄 승인 삭제 완료")
+                items = ModelBatchItem.by_batch(batch_id)
+                if any(item.status == "scan_pending" for item in items):
+                    self._finish_batch(
+                        batch_id,
+                        "scan_pending",
+                        "파일 격리 완료 · Plex 부분 스캔 검증 대기",
+                    )
+                else:
+                    self._finish_batch(batch_id, "completed", "일괄 승인 삭제 완료")
         except DeletionLeaseLost:
             P.logger.warning(
                 "Batch worker could not renew DB deletion lease; recovery owner will finalize plan %s",
@@ -559,6 +776,7 @@ class BatchDeleteManager:
         if batch is None:
             raise ValueError("일괄 삭제 계획을 찾을 수 없습니다.")
         payload = batch.as_api()
+        payload["backend"] = self._planned_backend(batch)
         payload["items"] = [item.as_api() for item in ModelBatchItem.by_batch(batch.id)]
         return payload
 
@@ -685,17 +903,35 @@ class BatchDeleteManager:
                                 "unknown",
                                 "verification_failed",
                                 "critical",
+                                "quarantined_pending_scan",
+                                "scan_running",
                             ):
-                                item.status = log.status
+                                item.status = (
+                                    "scan_pending"
+                                    if log.status
+                                    in ("quarantined_pending_scan", "scan_running")
+                                    else log.status
+                                )
                                 item.action_log_id = log.id
                                 item.message = log.message or "삭제 감사 이력에서 복구됨"
+                                item.finished_at = (
+                                    None if item.status == "scan_pending" else now
+                                )
                             else:
                                 item.status = "unknown"
                                 item.message = "FlaskFarm 재시작으로 삭제 결과를 확정할 수 없음"
-                            item.finished_at = now
-                    batch.status = "interrupted"
-                    batch.finished_at = now
-                    batch.current_message = "재시작으로 보수적 중단 · 자동 재개하지 않음"
+                                item.finished_at = now
+                    scan_pending = any(
+                        item.status == "scan_pending"
+                        for item in ModelBatchItem.by_batch(batch.id)
+                    )
+                    batch.status = "scan_pending" if scan_pending else "interrupted"
+                    batch.finished_at = None if scan_pending else now
+                    batch.current_message = (
+                        "파일 격리 완료 · Plex 부분 스캔 검증 대기"
+                        if scan_pending
+                        else "재시작으로 보수적 중단 · 자동 재개하지 않음"
+                    )
                     batch.nonce_hash = ""
                     batch.lease_key = None
                     batch.deletion_lease_token = ""

@@ -43,13 +43,21 @@
     {{ macros.m_tab_content_end() }}
 
     {{ macros.m_tab_content_start('delete', false) }}
-      <div class="pdff-danger mb-3"><strong>주의:</strong> Plex Media 삭제는 해당 버전의 실제 파일을 삭제할 수 있습니다. 개별 삭제와 일괄 승인형 반자동 삭제는 모두 기본값이 꺼져 있습니다.</div>
+      <div class="pdff-danger mb-3"><strong>주의:</strong> Plex 방식은 PMS에 실제 파일 삭제를 요청하고, 안전 격리 방식은 FlaskFarm에서 실제 파일을 이동합니다. 개별 삭제와 일괄 승인형 반자동 삭제는 모두 기본값이 꺼져 있습니다.</div>
       {{ macros.setting_checkbox('setting_delete_enabled', '그룹별 수동 삭제 활성화', value=arg.get('setting_delete_enabled', 'False'), desc='삭제 전 사전확인, 확인문구, 서버·metadata·Media·Part 재검증을 모두 수행합니다.') }}
       {{ macros.setting_checkbox('setting_batch_delete_enabled', '일괄 승인형 반자동 삭제 활성화', value=arg.get('setting_batch_delete_enabled', 'False'), desc=['수동 삭제가 함께 활성화되어야 합니다.', '정확히 2개 버전이고 유지 추천이 단독 1위인 안전 그룹만 계획에 포함합니다.', '계획 전체를 검토한 뒤 정확한 확인문구를 한 번 입력해야 순차 처리를 시작합니다.']) }}
       {{ macros.setting_input_int('setting_batch_max_items', '배치 계획 최대 항목 수', value=arg.get('setting_batch_max_items', '10'), min=1, max=100, desc='1~100. 실제 처리 수는 이 값과 스캔 1회당 최대 삭제 수 중 더 작은 한도를 따릅니다.') }}
       {{ macros.setting_input_textarea('setting_allowed_roots', '삭제 허용 미디어 루트', value=arg.get('setting_allowed_roots', ''), row='6', desc=['한 줄에 하나씩 Plex가 반환하는 절대 경로를 입력합니다.', '비어 있거나 후보 경로가 루트 밖이면 삭제를 차단합니다.']) }}
+      {{ macros.setting_select('setting_delete_backend', '파일 처리 방식', [['plex', 'Plex Media DELETE (기존 방식)'], ['quarantine', '안전 격리 (영상 + 전용 외부 자막)']], value=arg.get('setting_delete_backend', 'plex'), desc=['기본값은 기존 Plex 방식이며 자막 자동 정리는 꺼져 있습니다.', '안전 격리는 PMS DELETE를 호출하지 않고, 삭제 영상과 그 영상에만 귀속된 일반 외부 자막을 같은 파일시스템의 격리 폴더로 원자적으로 이동합니다.', '유지본과 공유될 수 있거나 판별이 모호한 자막은 이동하지 않고 위험 예외로 기록합니다.']) }}
+      {{ macros.setting_input_text('setting_quarantine_root', '안전 격리 루트', value=arg.get('setting_quarantine_root', ''), desc=['안전 격리 선택 시 필수인 FlaskFarm 호스트 기준 절대 경로입니다.', 'FlaskFarm 프로세스가 Plex 미디어 경로와 이 경로를 직접 읽고 쓸 수 있어야 하며, 대상 파일과 다른 파일시스템이면 처리를 차단합니다.', '격리는 영구삭제가 아닙니다. 이 플러그인은 격리 파일을 자동 완전삭제하지 않습니다.']) }}
+      <div id="quarantine_mode_notice" class="pdff-warning mb-3" style="display:none">
+        <strong>안전 격리 전제:</strong> Plex가 반환한 경로가 FlaskFarm에서도 같은 파일을 가리켜야 합니다. 삭제 영상과 파일명이 정확히 대응하는 전용 외부 자막만 함께 격리하며, 유지본 자막으로 의심되거나 공유·심볼릭 링크·경로 판별이 모호한 항목은 그대로 보존하고 결과 및 감사 이력에 별도로 표시합니다.
+      </div>
+      <div id="plex_delete_mode_notice" class="pdff-danger mb-3" style="display:none">
+        <strong>Plex 방식 주의:</strong> 파일 처리를 PMS에 위임하므로 외부 자막의 실제 처리 범위를 이 플러그인이 보장할 수 없습니다. 유지본 자막 보호가 우선이면 안전 격리 방식을 사용하세요.
+      </div>
       {{ macros.setting_input_int('setting_max_delete_per_run', '스캔 1회당 전역 삭제 시도 한도', value=arg.get('setting_max_delete_per_run', '1'), min=1, max=100, desc='개별 삭제와 배치 삭제 시도를 합산합니다. 실패하거나 결과가 불명확한 시도도 한도를 소비합니다.') }}
-      {{ macros.setting_select('setting_post_delete_scan_mode', '삭제 성공 후 Plex 부분 스캔 방식', [['none', '사용 안 함'], ['binary', 'Plex Media Scanner (Binary)'], ['web', 'Plex Web API']], value=arg.get('setting_post_delete_scan_mode', 'none'), desc=['기본값은 사용 안 함입니다. Plex DELETE와 사후 검증이 성공한 뒤에만 영향 경로를 best-effort로 갱신합니다.', 'Binary/Web 선택 시 정확한 library section과 영화 폴더 또는 TV 쇼 루트를 DELETE 전에 필수 검증하며, 만들 수 없으면 삭제를 차단합니다.', 'Binary는 plex_mate가 Plex Media Scanner와 Plex 파일 경로를 사용할 수 있어야 합니다.', 'Web은 plex_mate 연결정보, 라이브러리 section ID 및 Plex 서버에서 보이는 경로가 필요합니다.', '이 요청은 DupeFinder 중복 재검사가 아니며 처리 그룹의 rescan_required 잠금을 해제하지 않습니다.']) }}
+      {{ macros.setting_select('setting_post_delete_scan_mode', '삭제 성공 후 Plex 부분 스캔 방식', [['none', '사용 안 함'], ['binary', 'Plex Media Scanner (Binary)'], ['web', 'Plex Web API']], value=arg.get('setting_post_delete_scan_mode', 'none'), desc=['기본값은 사용 안 함입니다. 안전 격리 방식에서는 PMS DB 반영 및 사후 검증을 위해 Binary 또는 Web 부분 스캔이 필수입니다.', 'Binary/Web 선택 시 정확한 library section과 영화 폴더 또는 TV 쇼 루트를 Plex 방식은 DELETE 전에 필수 검증하고, 안전 격리 방식은 파일 이동 전에 필수 검증합니다. 만들 수 없으면 처리를 차단합니다.', 'Binary는 plex_mate가 Plex Media Scanner와 Plex 파일 경로를 사용할 수 있어야 합니다.', 'Web은 plex_mate 연결정보, 라이브러리 section ID 및 Plex 서버에서 보이는 경로가 필요합니다.', '이 요청은 DupeFinder 중복 재검사가 아니며 처리 그룹의 rescan_required 잠금을 해제하지 않습니다.']) }}
       {{ macros.setting_checkbox('setting_require_guid', 'GUID 필수', value=arg.get('setting_require_guid', 'True')) }}
       {{ macros.setting_checkbox('setting_block_multipart', '멀티파트 삭제 차단', value=arg.get('setting_block_multipart', 'True')) }}
     {{ macros.m_tab_content_end() }}
@@ -62,32 +70,71 @@
 var packageName = {{ arg['package_name']|tojson }};
 var wasDeleteEnabled = {{ 'true' if arg.get('setting_delete_enabled', 'False') == 'True' else 'false' }};
 var wasBatchDeleteEnabled = {{ 'true' if arg.get('setting_batch_delete_enabled', 'False') == 'True' else 'false' }};
+var wasDeleteBackend = {{ arg.get('setting_delete_backend', 'plex')|tojson }};
 var postDeleteScanModes = ['none', 'binary', 'web'];
+var deleteBackends = ['plex', 'quarantine'];
+
+function updateDeleteBackendNotice() {
+  var backend = String($('#setting_delete_backend').val() || 'plex').trim().toLowerCase();
+  $('#quarantine_mode_notice').toggle(backend === 'quarantine');
+  $('#plex_delete_mode_notice').toggle(backend === 'plex');
+}
 
 function globalSettingSaveBefore() {
   var deleteEnabled = $('#setting_delete_enabled').is(':checked');
   var batchEnabled = $('#setting_batch_delete_enabled').is(':checked');
+  var deleteBackend = String($('#setting_delete_backend').val() || '').trim().toLowerCase();
+  var quarantineRoot = String($('#setting_quarantine_root').val() || '').trim();
   var scanMode = String($('#setting_post_delete_scan_mode').val() || '').trim().toLowerCase();
+  if (deleteBackends.indexOf(deleteBackend) < 0) {
+    window.alert('파일 처리 방식이 올바르지 않습니다. Plex 또는 안전 격리 중 하나를 선택하세요.');
+    return false;
+  }
+  $('#setting_delete_backend').val(deleteBackend);
+  $('#setting_quarantine_root').val(quarantineRoot);
+  if (deleteBackend === 'quarantine' && !quarantineRoot) {
+    window.alert('안전 격리 방식을 사용하려면 FlaskFarm 호스트에서 접근 가능한 절대 격리 루트를 입력하세요.');
+    return false;
+  }
   if (postDeleteScanModes.indexOf(scanMode) < 0) {
     window.alert('삭제 후 Plex 부분 스캔 방식이 올바르지 않습니다. 사용 안 함, Binary, Web 중 하나를 선택하세요.');
     return false;
   }
   $('#setting_post_delete_scan_mode').val(scanMode);
+  if (deleteBackend === 'quarantine' && scanMode === 'none') {
+    window.alert('안전 격리 방식은 PMS DB 반영과 유지본 사후 검증을 위해 Binary 또는 Web 부분 스캔을 반드시 선택해야 합니다.');
+    return false;
+  }
   if (batchEnabled && !deleteEnabled) {
     window.alert('일괄 승인형 반자동 삭제를 사용하려면 그룹별 수동 삭제도 활성화해야 합니다.');
     return false;
   }
   if ((!wasDeleteEnabled && deleteEnabled) || (!wasBatchDeleteEnabled && batchEnabled)) {
-    var message = batchEnabled
-      ? '개별 삭제와 일괄 승인형 반자동 삭제를 활성화합니다. 각 계획을 직접 검토했고 Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?'
-      : '수동 삭제를 활성화합니다. Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?';
+    var message;
+    if (deleteBackend === 'quarantine') {
+      message = batchEnabled
+        ? '개별 처리와 일괄 승인형 반자동 처리를 안전 격리 방식으로 활성화합니다. 격리·미디어 경로 접근, 같은 파일시스템, 부분 스캔 설정 및 백업 상태를 확인했습니까?'
+        : '수동 처리를 안전 격리 방식으로 활성화합니다. 격리·미디어 경로 접근, 같은 파일시스템, 부분 스캔 설정 및 백업 상태를 확인했습니까?';
+    } else {
+      message = batchEnabled
+        ? '개별 삭제와 일괄 승인형 반자동 삭제를 활성화합니다. 각 계획을 직접 검토했고 Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?'
+        : '수동 삭제를 활성화합니다. Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?';
+    }
     return window.confirm(message);
+  }
+  if (deleteBackend === 'quarantine' && wasDeleteBackend !== 'quarantine') {
+    return window.confirm('안전 격리 방식을 활성화합니다. 입력한 격리 루트와 Plex 미디어 경로가 FlaskFarm에서 직접 접근 가능하고 같은 파일시스템에 있는지 확인했습니까?');
+  }
+  if (deleteBackend === 'plex' && wasDeleteBackend === 'quarantine' && (deleteEnabled || batchEnabled)) {
+    return window.confirm('안전 격리에서 Plex Media DELETE 방식으로 전환합니다. PMS가 실제 영상과 외부 자막을 처리할 수 있으며 유지본 자막의 범위를 이 플러그인이 보장할 수 없음을 확인했습니까?');
   }
   return true;
 }
 
 function renderConnection(data) {
   var scan = data.post_delete_scan || {};
+  var deleteBackend = String($('#setting_delete_backend').val() || 'plex').trim().toLowerCase();
+  var quarantineBackend = deleteBackend === 'quarantine';
   var modeLabels = {none: '사용 안 함', binary: 'Binary', web: 'Web'};
   var reportedMode = String(scan.mode || '');
   var mode = postDeleteScanModes.indexOf(reportedMode) >= 0 ? reportedMode : 'none';
@@ -101,9 +148,14 @@ function renderConnection(data) {
     '<div><span class="pdff-kv-label">비파괴 capability 확인</span>Web 연결 ' + PDFF.esc(scan.web_connection_validated === true ? '확인' : '미확인') + ' · Binary helper ' + PDFF.esc(scan.binary_helper_exported === true ? '확인' : '미확인') + ' · Scanner 설정 ' + PDFF.esc(scan.binary_scanner_configured === true ? '확인' : '미확인') + '</div>' +
     '</div>';
   if (!data.machine_match) html += '<div class="pdff-warning mt-3">Machine ID가 비어 있거나 일치하지 않습니다. 읽기 스캔은 가능할 수 있지만 삭제는 차단됩니다.</div>';
-  if (mode === 'binary') html += '<div class="pdff-warning mt-3">Binary 진단은 helper와 Scanner 설정 문자열만 확인합니다. 실행파일 존재·권한과 Plex 파일 경로 접근은 시험하지 않습니다. 정확한 section과 대상 폴더를 DELETE 전에 만들 수 없으면 삭제가 차단됩니다. Scanner 종료 여부가 불명확하면 자동 재실행을 차단하고 다른 삭제·부분 스캔을 1시간 격리하므로 작업 이력과 실제 Scanner 종료 상태를 확인하세요.</div>';
-  if (mode === 'web') html += '<div class="pdff-warning mt-3">Web 진단은 header 인증 Plex 연결까지만 확인합니다. 정확한 library section ID와 Plex 서버 기준 대상 경로를 DELETE 전에 만들 수 없으면 삭제가 차단됩니다.</div>';
-  if (!selectedSupported) html += '<div class="pdff-danger mt-3">선택한 사후 스캔 방식의 최소 요구조건을 확인하지 못했습니다. 삭제 자체는 재시도하지 않으며, 사후 스캔 실패는 삭제 성공 판정을 되돌리지 않습니다.</div>';
+  var beforeMutation = quarantineBackend ? '안전 격리 이동 전에' : 'Plex DELETE 전에';
+  if (mode === 'binary') html += '<div class="pdff-warning mt-3">Binary 진단은 helper와 Scanner 설정 문자열만 확인합니다. 실행파일 존재·권한과 Plex 파일 경로 접근은 시험하지 않습니다. 정확한 section과 대상 폴더를 ' + beforeMutation + ' 만들 수 없으면 작업이 차단됩니다. Scanner 종료 여부가 불명확하면 자동 재실행을 차단하고 다른 삭제·부분 스캔을 1시간 격리하므로 작업 이력과 실제 Scanner 종료 상태를 확인하세요.</div>';
+  if (mode === 'web') html += '<div class="pdff-warning mt-3">Web 진단은 header 인증 Plex 연결까지만 확인합니다. 정확한 library section ID와 Plex 서버 기준 대상 경로를 ' + beforeMutation + ' 만들 수 없으면 작업이 차단됩니다.</div>';
+  if (!selectedSupported) {
+    html += quarantineBackend
+      ? '<div class="pdff-danger mt-3">선택한 부분 스캔 방식의 최소 요구조건을 확인하지 못했습니다. 안전 격리는 파일을 이동하지 않으며, 스캔·사후검증이 최종 실패하면 성공 처리하지 않고 수동 확인 상태로 남깁니다.</div>'
+      : '<div class="pdff-danger mt-3">선택한 사후 스캔 방식의 최소 요구조건을 확인하지 못했습니다. Plex DELETE 자체는 재시도하지 않으며, 이미 확인된 Plex 삭제 성공은 사후 스캔 실패로 되돌리지 않습니다.</div>';
+  }
   $('#connection_status').removeClass('pdff-empty').html(html);
 }
 
@@ -121,5 +173,7 @@ $('#libraries_btn').on('click', function () {
     $('#library_status').html(html);
   });
 });
+$('#setting_delete_backend').on('change', updateDeleteBackendNotice);
+$(document).ready(updateDeleteBackendNotice);
 </script>
 {% endblock %}

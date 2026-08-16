@@ -54,6 +54,7 @@ try:
         ModelDuplicateGroup,
         ModelMediaCandidate,
         ModelPostDeleteScanJob,
+        ModelQuarantineJournal,
         ModelScanRun,
     )
     from .mod_history import ModuleHistory
@@ -68,6 +69,7 @@ try:
     P.ModelBatchItem = ModelBatchItem
     P.ModelDeletionLease = ModelDeletionLease
     P.ModelPostDeleteScanJob = ModelPostDeleteScanJob
+    P.ModelQuarantineJournal = ModelQuarantineJournal
     P.set_module_list([ModuleSetting, ModuleScan, ModuleHistory])
 except Exception as exc:
     P.logger.error("Exception:%s", str(exc))

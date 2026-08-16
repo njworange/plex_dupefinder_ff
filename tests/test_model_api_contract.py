@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from test_flaskfarm_compat import FlaskFarmImportHarness
@@ -59,6 +60,91 @@ class ModelApiContractTest(unittest.TestCase):
             self.assertNotIn("after", summary)
             self.assertEqual(detail["before"], {"media": ["10", "20"]})
             self.assertEqual(detail["after"], {"media": ["20"]})
+
+    def test_quarantine_serializer_hides_internal_snapshots_and_secret_like_fields(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            model = harness.setup_module.P.ModelQuarantineJournal
+            item = model()
+            item.id = 9
+            item.created_at = None
+            item.updated_at = None
+            item.finished_at = None
+            item.action_log_id = 1
+            item.batch_run_id = None
+            item.run_id = 2
+            item.group_id = 3
+            item.candidate_id = 4
+            item.keep_candidate_id = 5
+            item.operation_key = "public-operation-id"
+            item.status = "quarantined_pending_scan"
+            item.plan_digest = "a" * 64
+            item.operation_path = "/quarantine/<img src=x onerror=alert(1)>"
+            item.eligible_count = 1
+            item.excluded_count = 1
+            item.protected_count = 1
+            item.quarantined_count = 1
+            item.last_error = ""
+            item.moved_json = json.dumps(
+                [
+                    {
+                        "source_path": "/media/<script>alert(1)</script>.ko.srt",
+                        "destination_path": "/quarantine/item.ko.srt",
+                        "kind": "subtitle",
+                        "inode": 999,
+                        "sha256": "hidden-moved-hash",
+                    }
+                ]
+            )
+            item.manifest_json = json.dumps(
+                {
+                    "eligible": [
+                        {
+                            "path": "/media/<script>alert(1)</script>.ko.srt",
+                            "reason": "exclusive_to_deleted_video",
+                            "snapshot": {
+                                "inode": 123,
+                                "device": 456,
+                                "sha256": "private-file-hash",
+                                "plex_token": "must-never-escape",
+                            },
+                        }
+                    ],
+                    "excluded": [
+                        {
+                            "path": "/media/keep.ko.srt",
+                            "reason": "survivor_owned",
+                            "snapshot": {"inode": 789},
+                        }
+                    ],
+                }
+            )
+
+            detail = item.cleanup_api(include_paths=True)
+            summary = item.cleanup_api(include_paths=False)
+            serialized = json.dumps(detail, ensure_ascii=False).lower()
+
+            self.assertEqual(detail["counts"]["quarantined"], 1)
+            self.assertEqual(
+                detail["eligible"][0]["path"],
+                "/media/<script>alert(1)</script>.ko.srt",
+            )
+            self.assertEqual(
+                detail["eligible"][0]["quarantine_path"],
+                "/quarantine/item.ko.srt",
+            )
+            self.assertEqual(summary["eligible"], [])
+            self.assertEqual(summary["excluded"], [])
+            for forbidden in (
+                "snapshot",
+                "inode",
+                "device",
+                "sha256",
+                "plex_token",
+                "must-never-escape",
+                "private-file-hash",
+                "hidden-moved-hash",
+            ):
+                self.assertNotIn(forbidden, serialized)
 
 
 if __name__ == "__main__":

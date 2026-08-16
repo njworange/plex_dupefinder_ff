@@ -7,9 +7,10 @@
   <div class="row">
     <div class="col-md-2"><label class="small text-muted">Run ID</label><input id="run_filter" type="number" min="1" class="form-control form-control-sm"></div>
     <div class="col-md-3"><label class="small text-muted">상태</label><select id="status_filter" class="form-control form-control-sm"><option value="">전체</option><option value="success">성공</option><option value="blocked">차단</option><option value="failed">실패</option><option value="unknown">결과 확인 필요</option><option value="verification_failed">삭제 검증 실패</option><option value="critical">긴급 점검</option></select></div>
+    <div class="col-md-3"><label class="small text-muted">외부 자막</label><select id="subtitle_filter" class="form-control form-control-sm"><option value="">전체</option><option value="excluded">위험·모호하여 제외됨</option><option value="quarantined">함께 격리됨</option></select></div>
     <div class="col-md-2 d-flex align-items-end"><button id="history_filter_btn" class="btn btn-sm btn-primary">검색</button></div>
   </div>
-  <div class="pdff-muted mt-3">검증 차단과 timeout 후 확인 불가 결과도 보존됩니다. 플러그인 UI에서는 감사 이력을 삭제하지 않습니다.</div>
+  <div class="pdff-muted mt-3">검증 차단과 timeout 후 확인 불가 결과도 보존됩니다. 위험·모호하여 제외된 자막은 이동되지 않은 보존 대상이며, 경로와 제외 사유를 감사 상세에서 확인할 수 있습니다. 플러그인 UI에서는 감사 이력을 삭제하지 않습니다.</div>
 </section>
 
 <section class="pdff-panel">
@@ -17,7 +18,7 @@
     <h3 class="pdff-title" style="margin:0">삭제 후 부분 스캔 작업</h3>
     <button id="post_scan_refresh_btn" type="button" class="btn btn-sm btn-outline-secondary">새로고침</button>
   </div>
-  <div class="pdff-muted mb-2">최근 100개 작업입니다. 이 상태는 삭제 성공 판정과 별개이며, 실패해도 DELETE를 다시 실행하지 않습니다.</div>
+  <div class="pdff-muted mb-2">최근 100개 작업입니다. 기존 Plex 방식은 확인된 DELETE를 다시 실행하지 않습니다. 안전 격리는 부분 스캔과 유지본 재검증까지 성공해야 완료되며, 최종 실패하면 수동 확인 상태로 남습니다.</div>
   <div id="post_scan_list" class="pdff-empty">부분 스캔 작업을 조회하는 중입니다.</div>
 </section>
 
@@ -29,6 +30,7 @@
 
 <section id="history_detail" class="pdff-panel" style="display:none">
   <div class="pdff-toolbar"><h3 class="pdff-title" style="margin:0">감사 상세</h3><button id="history_close_btn" class="btn btn-sm btn-outline-secondary">닫기</button></div>
+  <div id="history_subtitle_detail" class="mb-3" style="display:none"></div>
   <pre id="history_json" class="pdff-code" style="max-height:65vh;overflow:auto;white-space:pre-wrap"></pre>
 </section>
 
@@ -85,14 +87,20 @@ function renderHistory() {
   if (!actionRows.length) { $('#history_list').addClass('pdff-empty').text('조건에 맞는 감사 이력이 없습니다.'); return; }
   var html = '';
   actionRows.forEach(function (item) {
-    html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-2"><strong>#' + PDFF.esc(item.id) + '</strong><br>' + PDFF.badge(item.status) + '</div><div class="col-md-4"><strong>' + PDFF.esc(item.action) + '</strong><div class="pdff-muted">Run #' + PDFF.esc(item.run_id) + ' · Group #' + PDFF.esc(item.group_id) + '</div><div class="small">' + PDFF.esc(item.message || '') + '</div></div><div class="col-md-3"><span class="pdff-kv-label">유지 / 삭제 후보</span>#' + PDFF.esc(item.keep_candidate_id || '-') + ' / #' + PDFF.esc(item.candidate_id || '-') + '</div><div class="col-md-2"><span class="pdff-kv-label">시각</span>' + PDFF.esc(PDFF.date(item.created_at)) + '</div><div class="col-md-1"><button class="btn btn-sm btn-outline-secondary action-detail" data-id="' + PDFF.esc(item.id) + '">JSON</button></div></div></article>';
+    var cleanup = PDFF.subtitleCleanup(item);
+    var subtitleSummary = '';
+    if (cleanup.present) {
+      subtitleSummary = '<div class="small mt-1">외부 자막 · 격리 ' + PDFF.esc(cleanup.quarantinedCount) + ' · 위험 예외 ' + PDFF.esc(cleanup.excludedCount) + '</div>';
+      if (cleanup.excludedCount > 0) subtitleSummary += '<span class="pdff-badge pdff-warning-badge">자막 예외 확인</span>';
+    }
+    html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-2"><strong>#' + PDFF.esc(item.id) + '</strong><br>' + PDFF.badge(item.status) + subtitleSummary + '</div><div class="col-md-4"><strong>' + PDFF.esc(item.action) + '</strong><div class="pdff-muted">Run #' + PDFF.esc(item.run_id) + ' · Group #' + PDFF.esc(item.group_id) + '</div><div class="small">' + PDFF.esc(item.message || '') + '</div></div><div class="col-md-3"><span class="pdff-kv-label">유지 / 삭제 후보</span>#' + PDFF.esc(item.keep_candidate_id || '-') + ' / #' + PDFF.esc(item.candidate_id || '-') + '</div><div class="col-md-2"><span class="pdff-kv-label">시각</span>' + PDFF.esc(PDFF.date(item.created_at)) + '</div><div class="col-md-1"><button class="btn btn-sm btn-outline-secondary action-detail" data-id="' + PDFF.esc(item.id) + '">상세</button></div></div></article>';
   });
   $('#history_list').removeClass('pdff-empty').html(html);
 }
 
 function loadHistory(resetPage) {
   if (resetPage) currentPage = 1;
-  var payload = {page: currentPage, page_size: pageSize, status: $('#status_filter').val()};
+  var payload = {page: currentPage, page_size: pageSize, status: $('#status_filter').val(), subtitle_filter: $('#subtitle_filter').val()};
   var runId = $('#run_filter').val();
   if (runId) payload.run_id = runId;
   PDFF.request(packageName, 'history', 'actions', payload, 'GET', function (ret) {
@@ -118,7 +126,11 @@ $(document).on('click', '.action-detail', function () {
   var id = Number($(this).data('id'));
   PDFF.request(packageName, 'history', 'action_detail', {action_id: id}, 'GET', function (ret) {
     if (ret.ret !== 'success') return;
-    $('#history_json').text(JSON.stringify(PDFF.redact(ret.data || {}), null, 2));
+    var detail = ret.data || {};
+    var cleanup = PDFF.subtitleCleanup(detail);
+    if (cleanup.present) $('#history_subtitle_detail').html(PDFF.subtitleCleanupHtml(detail, 'result')).show();
+    else $('#history_subtitle_detail').empty().hide();
+    $('#history_json').text(JSON.stringify(PDFF.redact(detail), null, 2));
     $('#history_detail').show()[0].scrollIntoView({behavior:'smooth', block:'start'});
   });
 });

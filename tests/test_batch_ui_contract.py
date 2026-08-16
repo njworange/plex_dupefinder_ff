@@ -49,6 +49,7 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("scan.binary_scanner_configured === true", self.setting)
         self.assertIn("scan.web_connection_validated === true", self.setting)
         self.assertIn("DELETE 전에 필수 검증", self.setting)
+        self.assertIn("파일 이동 전에 필수 검증", self.setting)
 
     def test_capability_diagnostics_do_not_execute_a_scan(self) -> None:
         setting_module = (ROOT / "mod_setting.py").read_text(encoding="utf-8")

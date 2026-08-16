@@ -953,6 +953,277 @@ class SQLiteDeletionLeaseIntegrationTest(unittest.TestCase):
             self.assertIsNone(stored.lease_key)
             self.assertEqual(lease.owner_token, "")
 
+    def test_scan_completion_callback_never_runs_after_final_lease_proof_is_lost(self) -> None:
+        with self.app.app_context():
+            job_id = self._new_scan_job(mode="web")
+        manager = self.post_scan_module.PostDeleteScanManager()
+        completed = []
+        manager.completion_callback = lambda job: completed.append(job.id)
+
+        def lose_lease(*args, **kwargs):
+            raise self.lease_module.DeletionLeaseLost(
+                "recovery owner already claimed the lease"
+            )
+
+        with mock.patch.object(manager, "_execute", return_value=200), mock.patch.object(
+            manager.lease_service,
+            "renew",
+            side_effect=lose_lease,
+        ):
+            self.assertTrue(manager.process_one())
+
+        self.assertEqual(completed, [])
+        with self.app.app_context():
+            stored = self.models.ModelPostDeleteScanJob.get(job_id)
+            self.assertEqual(stored.status, "running")
+
+    def test_scan_completion_callback_requires_worker_token_cas_proof(self) -> None:
+        with self.app.app_context():
+            job_id = self._new_scan_job(mode="web")
+        manager = self.post_scan_module.PostDeleteScanManager()
+        completed = []
+        manager.completion_callback = lambda job: completed.append(job.id)
+
+        with mock.patch.object(manager, "_execute", return_value=200), mock.patch.object(
+            manager,
+            "_renew_job_claim",
+            return_value=False,
+        ):
+            self.assertTrue(manager.process_one())
+
+        self.assertEqual(completed, [])
+        with self.app.app_context():
+            stored = self.models.ModelPostDeleteScanJob.get(job_id)
+            self.assertEqual(stored.status, "running")
+
+    def test_web_metadata_poll_reuses_one_refresh_until_visible(self) -> None:
+        with self.app.app_context():
+            job_id = self._new_scan_job(mode="web")
+        manager = self.post_scan_module.PostDeleteScanManager()
+        refresh_calls = []
+        callback_calls = []
+        gateway = types.SimpleNamespace(
+            refresh_section_path=lambda section, path: (
+                refresh_calls.append((section, path)) or 200
+            )
+        )
+
+        def completion(job):
+            callback_calls.append(job.id)
+            if len(callback_calls) == 1:
+                raise self.post_scan_module.PostDeleteScanRetryable("not visible yet")
+
+        manager.completion_callback = completion
+        with mock.patch.object(
+            manager, "_validated_runtime", return_value=(None, gateway, None)
+        ), mock.patch.object(
+            self.post_scan_module, "_WEB_POLL_INTERVAL_SECONDS", 0.0
+        ), mock.patch.object(
+            self.post_scan_module, "_WEB_POLL_TIMEOUT_SECONDS", 1.0
+        ):
+            self.assertTrue(manager.process_one())
+
+        self.assertEqual(len(refresh_calls), 1)
+        self.assertEqual(callback_calls, [job_id, job_id])
+        with self.app.app_context():
+            stored = self.models.ModelPostDeleteScanJob.get(job_id)
+            self.assertEqual(stored.status, "success")
+            self.assertEqual(stored.response_status, 200)
+
+    def test_restored_subtitle_schedules_one_new_web_refresh(self) -> None:
+        with self.app.app_context():
+            job_id = self._new_scan_job(mode="web")
+        manager = self.post_scan_module.PostDeleteScanManager()
+        refresh_calls = []
+        callback_calls = []
+        gateway = types.SimpleNamespace(
+            refresh_section_path=lambda section, path: (
+                refresh_calls.append((section, path)) or 200
+            )
+        )
+
+        def completion(job):
+            callback_calls.append(job.id)
+            if len(callback_calls) == 1:
+                raise self.post_scan_module.PostDeleteScanRefreshRequired(
+                    "protected subtitle restored"
+                )
+
+        manager.completion_callback = completion
+        with mock.patch.object(
+            manager, "_validated_runtime", return_value=(None, gateway, None)
+        ):
+            self.assertTrue(manager.process_one())
+            with self.app.app_context():
+                stored = self.models.ModelPostDeleteScanJob.get(job_id)
+                self.assertEqual(stored.status, "retry_wait")
+                self.assertIsNone(stored.response_status)
+                stored.next_attempt_at = datetime.now() - timedelta(seconds=1)
+                self.db.session.commit()
+            self.assertTrue(manager.process_one())
+
+        self.assertEqual(len(refresh_calls), 2)
+        self.assertEqual(callback_calls, [job_id, job_id])
+        with self.app.app_context():
+            stored = self.models.ModelPostDeleteScanJob.get(job_id)
+            self.assertEqual(stored.status, "success")
+            self.assertEqual(stored.response_status, 200)
+
+    def test_binary_refresh_required_reexecutes_scanner_next_attempt(self) -> None:
+        with self.app.app_context():
+            job_id = self._new_scan_job(mode="binary")
+        manager = self.post_scan_module.PostDeleteScanManager()
+        scanner_calls = []
+        callback_calls = []
+
+        def execute_binary(provider, job, worker_token, deletion_token):
+            scanner_calls.append(job.id)
+            return 0
+
+        def completion(job):
+            callback_calls.append(job.id)
+            if len(callback_calls) == 1:
+                raise self.post_scan_module.PostDeleteScanRefreshRequired(
+                    "protected subtitle restored"
+                )
+
+        manager.completion_callback = completion
+        with mock.patch.object(
+            manager,
+            "_validated_runtime",
+            return_value=(types.SimpleNamespace(), None, None),
+        ), mock.patch.object(
+            manager, "_execute_binary", side_effect=execute_binary
+        ):
+            self.assertTrue(manager.process_one())
+            with self.app.app_context():
+                stored = self.models.ModelPostDeleteScanJob.get(job_id)
+                self.assertEqual(stored.status, "retry_wait")
+                self.assertIsNone(stored.response_status)
+                stored.next_attempt_at = datetime.now() - timedelta(seconds=1)
+                self.db.session.commit()
+            self.assertTrue(manager.process_one())
+
+        self.assertEqual(scanner_calls, [job_id, job_id])
+        self.assertEqual(callback_calls, [job_id, job_id])
+        with self.app.app_context():
+            self.assertEqual(
+                self.models.ModelPostDeleteScanJob.get(job_id).status,
+                "success",
+            )
+
+    def test_terminal_failure_callback_runs_while_both_leases_are_owned(self) -> None:
+        with self.app.app_context():
+            job_id = self._new_scan_job(mode="web")
+        manager = self.post_scan_module.PostDeleteScanManager()
+        observed = []
+
+        def failure_callback(job, status, message):
+            lease = self.models.ModelDeletionLease.get_singleton()
+            stored = self.models.ModelPostDeleteScanJob.get(job.id)
+            observed.append(
+                (
+                    status,
+                    lease.owner_kind,
+                    lease.owner_ref,
+                    bool(lease.owner_token),
+                    stored.status,
+                    bool(stored.worker_token),
+                )
+            )
+
+        manager.failure_callback = failure_callback
+        blocked = self.post_scan_module.PostDeleteScanBlocked("blocked")
+        with mock.patch.object(manager, "_execute", side_effect=blocked):
+            self.assertTrue(manager.process_one())
+
+        self.assertEqual(
+            observed,
+            [("blocked", "post_scan", str(job_id), True, "running", True)],
+        )
+        with self.app.app_context():
+            self.assertEqual(
+                self.models.ModelPostDeleteScanJob.get(job_id).status,
+                "blocked",
+            )
+            self.assertEqual(
+                self.models.ModelDeletionLease.get_singleton().owner_token,
+                "",
+            )
+
+    def test_failure_callback_exception_does_not_terminally_close_job(self) -> None:
+        with self.app.app_context():
+            job_id = self._new_scan_job(mode="web")
+        manager = self.post_scan_module.PostDeleteScanManager()
+
+        def failure_callback(job, status, message):
+            raise RuntimeError("injected reconciliation failure")
+
+        manager.failure_callback = failure_callback
+        blocked = self.post_scan_module.PostDeleteScanBlocked("blocked")
+        with mock.patch.object(manager, "_execute", side_effect=blocked):
+            try:
+                manager.process_one()
+            except RuntimeError:
+                pass
+
+        with self.app.app_context():
+            stored = self.models.ModelPostDeleteScanJob.get(job_id)
+            self.assertEqual(stored.status, "running")
+            self.assertTrue(stored.worker_token)
+
+    def test_stale_terminal_recovery_reconciles_pending_quarantine_state(self) -> None:
+        now = datetime.now()
+        with self.app.app_context():
+            job_id = self._new_scan_job(
+                status="running",
+                attempts=3,
+                max_attempts=3,
+                worker_token="dead-worker",
+                lease_key="global",
+                lease_expires_at=now - timedelta(seconds=1),
+            )
+            lease = self.models.ModelDeletionLease.get_singleton()
+            lease.owner_token = "dead-global-token"
+            lease.owner_kind = "post_scan"
+            lease.owner_ref = str(job_id)
+            lease.acquired_at = now - timedelta(minutes=30)
+            lease.heartbeat_at = now - timedelta(minutes=30)
+            lease.expires_at = now - timedelta(seconds=1)
+            self.db.session.commit()
+
+        pending = {
+            "journal": "scan_running",
+            "action": "scan_running",
+            "group": "delete_in_progress",
+            "batch": "scan_pending",
+        }
+        reconciled = []
+        manager = self.post_scan_module.PostDeleteScanManager()
+
+        def failure_callback(job, status, message):
+            reconciled.append((job.id, status))
+            pending.update(
+                journal="recovery_required",
+                action="unknown",
+                group="manual_check_required",
+                batch="failed",
+            )
+
+        manager.failure_callback = failure_callback
+        self.assertEqual(manager.recover_stale(), 1)
+
+        self.assertEqual(reconciled, [(job_id, "failed")])
+        self.assertEqual(
+            pending,
+            {
+                "journal": "recovery_required",
+                "action": "unknown",
+                "group": "manual_check_required",
+                "batch": "failed",
+            },
+        )
+
     def test_binary_failed_kill_is_quarantined_instead_of_retried(self) -> None:
         manager = self.post_scan_module.PostDeleteScanManager()
 

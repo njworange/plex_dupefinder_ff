@@ -32,11 +32,15 @@ class ModuleHistory(PluginModuleBase):
                 run_value = req.values.get("run_id", "")
                 run_id = int(run_value) if str(run_value).strip() else None
                 status = str(req.values.get("status", "")).strip()
+                subtitle_filter = str(req.values.get("subtitle_filter", "")).strip()
+                if subtitle_filter not in ("", "excluded", "quarantined"):
+                    raise ValueError("외부 자막 필터가 올바르지 않습니다.")
                 result = ModelActionLog.search(
                     page=page,
                     page_size=page_size,
                     run_id=run_id,
                     status=status,
+                    subtitle_filter=subtitle_filter,
                 )
                 total = result["total"]
                 return jsonify(

@@ -17,7 +17,11 @@ from .deletion_lease import (
     DeletionLeaseLost,
     DeletionLeaseService,
 )
-from .models import ModelDeletionLease, ModelPostDeleteScanJob
+from .models import (
+    ModelDeletionLease,
+    ModelPostDeleteScanJob,
+    ModelQuarantineJournal,
+)
 from .scan_manager import current_safety_policy
 from .services.plex_gateway import (
     PlexAuthenticationError,
@@ -39,6 +43,9 @@ _WORKER_LEASE_SECONDS = 20 * 60
 _BINARY_TIMEOUT_SECONDS = 15 * 60
 _BINARY_KILL_GRACE_SECONDS = 5
 _BINARY_QUARANTINE_SECONDS = 60 * 60
+_WEB_POLL_INTERVAL_SECONDS = 5.0
+_WEB_POLL_TIMEOUT_SECONDS = 120.0
+_TERMINAL_FAILURE_STATUSES = ("blocked", "failed", "unverified")
 
 
 class PostDeleteScanBlocked(RuntimeError):
@@ -46,6 +53,12 @@ class PostDeleteScanBlocked(RuntimeError):
 
 
 class PostDeleteScanRetryable(RuntimeError):
+    pass
+
+
+class PostDeleteScanRefreshRequired(PostDeleteScanRetryable):
+    """Filesystem state changed and requires one new Web refresh command."""
+
     pass
 
 
@@ -105,6 +118,8 @@ class PostDeleteScanManager:
     def __init__(self) -> None:
         self.lease_service = DeletionLeaseService()
         self.deletion_recovery_callback: Optional[Any] = None
+        self.completion_callback: Optional[Any] = None
+        self.failure_callback: Optional[Any] = None
         self._wake = threading.Event()
         self._unloading = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -329,17 +344,24 @@ class PostDeleteScanManager:
 
     def recover_stale(self) -> int:
         recovered = 0
+        terminal_recovered: List[int] = []
         with F.app.app_context():
             now = datetime.now()
             stale = [
-                (job.id, job.worker_token or "")
+                (
+                    job.id,
+                    job.worker_token or "",
+                    int(job.attempts or 0) >= int(job.max_attempts or _MAX_ATTEMPTS),
+                )
                 for job in ModelPostDeleteScanJob.stale_running(now)
             ]
-            for job_id, worker_token in stale:
+            for job_id, worker_token, terminal in stale:
                 if ModelPostDeleteScanJob.recover_stale_one(
                     job_id, worker_token, now
                 ):
                     recovered += 1
+                    if terminal:
+                        terminal_recovered.append(int(job_id))
             if recovered:
                 F.db.session.commit()
             else:
@@ -366,7 +388,103 @@ class PostDeleteScanManager:
         except DeletionLeaseError:
             # The next bounded worker tick repeats this exact-owner cleanup.
             pass
+        # A worker can crash after its terminal job CAS but before the
+        # quarantine failure callback. Newly recovered terminal jobs are
+        # reconciled once even in test/fallback environments without journal
+        # query support; older crash gaps are found durably below.
+        for job_id in terminal_recovered:
+            self._reconcile_terminal_job(job_id, require_pending=False)
+        self.reconcile_terminal_quarantine_failures()
         return recovered
+
+    @staticmethod
+    def _has_pending_quarantine_journal(job: ModelPostDeleteScanJob) -> bool:
+        terminal = {"verified", "trash_pending", "critical", "recovery_required"}
+        for action_id in _action_ids(job):
+            journal = ModelQuarantineJournal.for_action(action_id)
+            if journal is not None and str(journal.status or "") not in terminal:
+                return True
+        return False
+
+    def _reconcile_terminal_job(
+        self, job_id: int, require_pending: bool = True
+    ) -> bool:
+        """Idempotently apply quarantine failure state under the global lease."""
+
+        if self.failure_callback is None:
+            return False
+        with F.app.app_context():
+            job = ModelPostDeleteScanJob.get(job_id)
+            if job is None or job.status not in _TERMINAL_FAILURE_STATUSES:
+                F.db.session.rollback()
+                return False
+            if require_pending and not self._has_pending_quarantine_journal(job):
+                F.db.session.rollback()
+                return False
+
+        try:
+            token = self.lease_service.acquire("post_scan", str(job_id))
+        except DeletionLeaseError:
+            return False
+        try:
+            self.lease_service.renew(token, "post_scan", str(job_id))
+            with F.app.app_context():
+                job = ModelPostDeleteScanJob.get(job_id)
+                if job is None or job.status not in _TERMINAL_FAILURE_STATUSES:
+                    F.db.session.rollback()
+                    return False
+                if require_pending and not self._has_pending_quarantine_journal(job):
+                    F.db.session.rollback()
+                    return False
+
+                def heartbeat() -> None:
+                    self.lease_service.renew(token, "post_scan", str(job_id))
+
+                setattr(job, "_pdff_heartbeat", heartbeat)
+                try:
+                    self.failure_callback(
+                        job,
+                        str(job.status),
+                        str(job.last_error or "삭제 후 부분 스캔이 완료되지 않았습니다."),
+                    )
+                finally:
+                    try:
+                        delattr(job, "_pdff_heartbeat")
+                    except (AttributeError, TypeError):
+                        pass
+            self.lease_service.renew(token, "post_scan", str(job_id))
+            return True
+        except Exception:
+            try:
+                with F.app.app_context():
+                    F.db.session.rollback()
+            except Exception:
+                pass
+            return False
+        finally:
+            try:
+                self.lease_service.release(token)
+            except Exception:
+                pass
+
+    def reconcile_terminal_quarantine_failures(self, limit: int = 500) -> int:
+        """Repair terminal-job/journal crash gaps on every bounded worker tick."""
+
+        if self.failure_callback is None:
+            return 0
+        with F.app.app_context():
+            candidates = [
+                int(job.id)
+                for job in ModelPostDeleteScanJob.recent(limit)
+                if job.status in _TERMINAL_FAILURE_STATUSES
+                and self._has_pending_quarantine_journal(job)
+            ]
+            F.db.session.rollback()
+        reconciled = 0
+        for job_id in candidates:
+            if self._reconcile_terminal_job(job_id, require_pending=True):
+                reconciled += 1
+        return reconciled
 
     def _claim_next(self) -> Tuple[Optional[int], str, str]:
         """Return ``(job_id, worker_token, deletion_lease_token)``."""
@@ -632,6 +750,16 @@ class PostDeleteScanManager:
     ) -> int:
         provider, gateway, _section = self._validated_runtime(job)
         if job.mode == "web":
+            # A 2xx refresh is an accepted one-shot command. If metadata
+            # propagation was not visible during the bounded poll, later
+            # retry attempts re-run only the read-only finalizer instead of
+            # sending the same refresh command again.
+            try:
+                previous_status = int(getattr(job, "response_status", 0) or 0)
+            except (TypeError, ValueError):
+                previous_status = 0
+            if 200 <= previous_status < 300:
+                return previous_status
             return gateway.refresh_section_path(job.section_key, job.target_path)
         if job.mode == "binary":
             return self._execute_binary(
@@ -736,6 +864,84 @@ class PostDeleteScanManager:
                 # Never expose SQL parameters or the internal owner token.
                 return False
 
+    @staticmethod
+    def _renew_job_claim(job_id: int, worker_token: str) -> bool:
+        """CAS-prove and extend the durable job claim before callbacks."""
+
+        with F.app.app_context():
+            now = datetime.now()
+            job = ModelPostDeleteScanJob.get(job_id)
+            if (
+                job is None
+                or job.status != "running"
+                or job.worker_token != str(worker_token)
+            ):
+                F.db.session.rollback()
+                return False
+            desired = now + timedelta(seconds=_WORKER_LEASE_SECONDS)
+            if job.lease_expires_at is not None and job.lease_expires_at > desired:
+                desired = job.lease_expires_at
+            updated = (
+                F.db.session.query(ModelPostDeleteScanJob)
+                .filter(
+                    ModelPostDeleteScanJob.id == int(job_id),
+                    ModelPostDeleteScanJob.status == "running",
+                    ModelPostDeleteScanJob.worker_token == str(worker_token),
+                )
+                .update(
+                    {
+                        ModelPostDeleteScanJob.updated_at: now,
+                        ModelPostDeleteScanJob.lease_expires_at: desired,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated != 1:
+                F.db.session.rollback()
+                return False
+            F.db.session.commit()
+            return True
+
+    def _run_completion_callback(
+        self, job: ModelPostDeleteScanJob, heartbeat: Any
+    ) -> None:
+        """Poll Web metadata propagation without repeating its refresh PUT."""
+
+        is_web = str(job.mode or "") == "web"
+        deadline = time.monotonic() + (
+            _WEB_POLL_TIMEOUT_SECONDS if is_web else 0.0
+        )
+        setattr(job, "_pdff_heartbeat", heartbeat)
+        try:
+            while True:
+                heartbeat()
+                try:
+                    self.completion_callback(job)
+                    return
+                except PostDeleteScanRefreshRequired:
+                    # A protected sidecar was restored. The current refresh
+                    # predates that filesystem mutation, so polling the same
+                    # metadata state cannot prove completion.
+                    raise
+                except (PostDeleteScanRetryable, PlexGatewayError):
+                    if not is_web:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    stop_event = self._current_stop_event()
+                    wait_for = min(_WEB_POLL_INTERVAL_SECONDS, remaining)
+                    if stop_event.wait(timeout=max(0.0, wait_for)):
+                        raise PostDeleteScanRetryable(
+                            "플러그인 종료로 Plex 격리 반영 확인을 중단했습니다."
+                        ) from None
+                    heartbeat()
+        finally:
+            try:
+                delattr(job, "_pdff_heartbeat")
+            except (AttributeError, TypeError):
+                pass
+
     def process_one(self) -> bool:
         job_id, worker_token, deletion_token = self._claim_next()
         if job_id is None:
@@ -745,6 +951,7 @@ class PostDeleteScanManager:
         message = "Plex 부분 스캔 요청 완료"
         response_status: Optional[int] = None
         restore_retry_budget = False
+        refresh_required = False
         try:
             with F.app.app_context():
                 job = ModelPostDeleteScanJob.get(job_id)
@@ -797,44 +1004,134 @@ class PostDeleteScanManager:
             status = "retry_wait"
             message = "삭제 후 스캔 중 내부 오류가 발생해 제한적으로 재시도합니다."
 
+        finished = False
+        release_global_lease = True
         try:
-            # Prove this worker still owns the cross-process lease before any
-            # success, failure, retry, or audit mutation.
-            self.lease_service.renew(
-                deletion_token, "post_scan", str(job_id)
+            # Prove both the global deletion lease and the durable job-token
+            # claim before a completion callback mutates audit/group state.
+            self.lease_service.renew(deletion_token, "post_scan", str(job_id))
+            if not self._renew_job_claim(job_id, worker_token):
+                raise DeletionLeaseLost("삭제 후 스캔 작업 소유권을 확인할 수 없습니다.")
+
+            def heartbeat() -> None:
+                self.lease_service.renew(
+                    deletion_token, "post_scan", str(job_id)
+                )
+                if not self._renew_job_claim(job_id, worker_token):
+                    raise DeletionLeaseLost(
+                        "삭제 후 스캔 작업 소유권을 확인할 수 없습니다."
+                    )
+
+            if status == "success" and self.completion_callback is not None:
+                try:
+                    with F.app.app_context():
+                        job = ModelPostDeleteScanJob.get(job_id)
+                        if job is None:
+                            raise DeletionLeaseLost(
+                                "삭제 후 스캔 작업을 찾을 수 없습니다."
+                            )
+                        self._run_completion_callback(job, heartbeat)
+                except PostDeleteScanBlocked:
+                    status = "blocked"
+                    message = "격리 후 Plex 재검증에서 수동 확인이 필요합니다."
+                except PostDeleteScanRefreshRequired:
+                    status = "retry_wait"
+                    restore_retry_budget = True
+                    refresh_required = True
+                    response_status = None
+                    message = "복구된 유지 자막을 Plex에 반영하기 위해 부분 스캔을 다시 요청합니다."
+                except PostDeleteScanRetryable:
+                    status = "retry_wait"
+                    restore_retry_budget = True
+                    message = "Plex 격리 반영을 제한적으로 재확인합니다."
+                except PlexGatewayError:
+                    status = "retry_wait"
+                    restore_retry_budget = True
+                    message = "Plex 격리 재검증 요청이 실패해 제한적으로 재시도합니다."
+                except DeletionLeaseLost:
+                    raise
+                except Exception:
+                    status = "retry_wait"
+                    restore_retry_budget = True
+                    message = "격리 사후검증 중 내부 오류가 발생해 제한적으로 재시도합니다."
+
+            # The callback may have processed many coalesced actions. Prove
+            # both leases again immediately before the terminal/retry CAS.
+            self.lease_service.renew(deletion_token, "post_scan", str(job_id))
+            if not self._renew_job_claim(job_id, worker_token):
+                raise DeletionLeaseLost("삭제 후 스캔 작업 소유권을 확인할 수 없습니다.")
+
+            with F.app.app_context():
+                job = ModelPostDeleteScanJob.get(job_id)
+                attempts = int(job.attempts or 0) if job is not None else _MAX_ATTEMPTS
+                maximum = (
+                    _MAX_ATTEMPTS
+                    if restore_retry_budget
+                    else (
+                        int(job.max_attempts or _MAX_ATTEMPTS)
+                        if job is not None
+                        else _MAX_ATTEMPTS
+                    )
+                )
+            if (
+                status == "retry_wait"
+                and attempts >= maximum
+                and not refresh_required
+            ):
+                status = "failed"
+                message = "삭제 후 부분 스캔이 최대 재시도 횟수를 초과했습니다."
+
+            if status in _TERMINAL_FAILURE_STATUSES and self.failure_callback is not None:
+                # Journal/action/group failure state must be durable before
+                # the job becomes terminal, while both ownership proofs are
+                # still live. A callback error deliberately leaves both
+                # leases in place for stale recovery/reconciliation.
+                heartbeat()
+                try:
+                    with F.app.app_context():
+                        job = ModelPostDeleteScanJob.get(job_id)
+                        if job is None:
+                            raise DeletionLeaseLost(
+                                "삭제 후 스캔 작업을 찾을 수 없습니다."
+                            )
+                        setattr(job, "_pdff_heartbeat", heartbeat)
+                        try:
+                            self.failure_callback(job, status, message)
+                        finally:
+                            try:
+                                delattr(job, "_pdff_heartbeat")
+                            except (AttributeError, TypeError):
+                                pass
+                except DeletionLeaseLost:
+                    raise
+                except Exception:
+                    try:
+                        with F.app.app_context():
+                            F.db.session.rollback()
+                    except Exception:
+                        pass
+                    release_global_lease = False
+                    return True
+                heartbeat()
+            # Transition the worker-token CAS while the global lease is still
+            # held. Only then may another delete/scan transaction proceed.
+            finished = self._finish_claimed(
+                job_id,
+                worker_token,
+                status,
+                message,
+                response_status=response_status,
+                restore_retry_budget=restore_retry_budget,
             )
         except DeletionLeaseLost:
-            # Stale-job recovery owns the next transition.
+            # Stale-job recovery owns the next transition and audit decision.
             return True
         finally:
-            try:
-                self.lease_service.release(deletion_token)
-            except Exception:
-                pass
-
-        with F.app.app_context():
-            job = ModelPostDeleteScanJob.get(job_id)
-            attempts = int(job.attempts or 0) if job is not None else _MAX_ATTEMPTS
-            maximum = (
-                _MAX_ATTEMPTS
-                if restore_retry_budget
-                else (
-                    int(job.max_attempts or _MAX_ATTEMPTS)
-                    if job is not None
-                    else _MAX_ATTEMPTS
-                )
-            )
-        if status == "retry_wait" and attempts >= maximum:
-            status = "failed"
-            message = "삭제 후 부분 스캔이 최대 재시도 횟수를 초과했습니다."
-        self._finish_claimed(
-            job_id,
-            worker_token,
-            status,
-            message,
-            response_status=response_status,
-            restore_retry_budget=restore_retry_budget,
-        )
+            if release_global_lease:
+                try:
+                    self.lease_service.release(deletion_token)
+                except Exception:
+                    pass
         return True
 
     def status(

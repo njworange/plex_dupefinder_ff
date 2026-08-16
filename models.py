@@ -361,6 +361,20 @@ class ModelActionLog(ModelBase):
         if include_snapshots:
             value["before"] = _json_load(self.before_json, {})
             value["after"] = _json_load(self.after_json, {})
+        try:
+            journal = (
+                ModelQuarantineJournal.for_action(self.id)
+                if self.id is not None
+                else None
+            )
+        except Exception:
+            # Stub/unit-test DBs and a pre-create_all startup window must not
+            # break legacy audit serialization.
+            journal = None
+        if journal is not None:
+            cleanup = journal.cleanup_api(include_paths=include_snapshots)
+            value["subtitle_cleanup"] = cleanup
+            value["subtitle_cleanup_summary"] = journal.cleanup_api(False)
         return value
 
     @classmethod
@@ -375,7 +389,7 @@ class ModelActionLog(ModelBase):
     def interrupted(cls) -> List["ModelActionLog"]:
         return (
             db.session.query(cls)
-            .filter(cls.status.in_(["validating", "deleting"]))
+            .filter(cls.status.in_(["validating", "deleting", "quarantining"]))
             .order_by(cls.id.asc())
             .all()
         )
@@ -386,7 +400,7 @@ class ModelActionLog(ModelBase):
             db.session.query(cls)
             .filter(
                 cls.action == "delete_media",
-                cls.status.in_(["validating", "deleting"]),
+                cls.status.in_(["validating", "deleting", "quarantining"]),
             )
             .order_by(cls.id.asc())
             .first()
@@ -415,12 +429,23 @@ class ModelActionLog(ModelBase):
         page_size: int = 50,
         run_id: Optional[int] = None,
         status: str = "",
+        subtitle_filter: str = "",
     ) -> Dict[str, Any]:
         query = db.session.query(cls)
         if run_id is not None:
             query = query.filter_by(run_id=int(run_id))
         if status:
             query = query.filter_by(status=status)
+        if subtitle_filter == "excluded":
+            query = query.join(
+                ModelQuarantineJournal,
+                ModelQuarantineJournal.action_log_id == cls.id,
+            ).filter(ModelQuarantineJournal.excluded_count > 0)
+        elif subtitle_filter == "quarantined":
+            query = query.join(
+                ModelQuarantineJournal,
+                ModelQuarantineJournal.action_log_id == cls.id,
+            ).filter(ModelQuarantineJournal.quarantined_count > 0)
         total = query.count()
         items = (
             query.order_by(cls.id.desc())
@@ -527,6 +552,27 @@ class ModelPostDeleteScanJob(ModelBase):
         )
 
     @classmethod
+    def active_for_action(cls, action_id: Any) -> Optional["ModelPostDeleteScanJob"]:
+        target = int(action_id)
+        jobs = (
+            db.session.query(cls)
+            .filter(cls.status.in_(["queued", "running", "retry_wait"]))
+            .order_by(cls.id.asc())
+            .all()
+        )
+        for job in jobs:
+            if int(job.action_log_id or 0) == target:
+                return job
+            values = _json_load(job.action_ids_json, [])
+            for value in values if isinstance(values, list) else []:
+                try:
+                    if int(value) == target:
+                        return job
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    @classmethod
     def eligible_next(cls, now: datetime) -> Optional["ModelPostDeleteScanJob"]:
         return (
             db.session.query(cls)
@@ -606,6 +652,172 @@ class ModelPostDeleteScanJob(ModelBase):
         return updated == 1
 
 
+class ModelQuarantineJournal(ModelBase):
+    """Durable manifest for the opt-in filesystem quarantine backend.
+
+    A new table preserves v1.2 upgrade compatibility because FlaskFarm's
+    ``create_all`` lifecycle does not ALTER existing plugin tables.
+    """
+
+    P = P
+    __tablename__ = "quarantine_journal"
+    __table_args__ = {"mysql_collate": "utf8_general_ci"}
+    __bind_key__ = P.package_name
+
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    finished_at = db.Column(db.DateTime)
+    action_log_id = db.Column(db.Integer, index=True)
+    batch_run_id = db.Column(db.Integer, index=True)
+    run_id = db.Column(db.Integer, nullable=False, index=True)
+    group_id = db.Column(db.Integer, nullable=False, index=True)
+    candidate_id = db.Column(db.Integer, nullable=False)
+    keep_candidate_id = db.Column(db.Integer, nullable=False)
+    operation_key = db.Column(db.String(64), nullable=False, unique=True)
+    status = db.Column(db.String(32), nullable=False, index=True)
+    plan_digest = db.Column(db.String(64), nullable=False, index=True)
+    manifest_json = db.Column(db.Text, default="{}", nullable=False)
+    moved_json = db.Column(db.Text, default="[]", nullable=False)
+    backups_json = db.Column(db.Text, default="[]", nullable=False)
+    operation_path = db.Column(db.Text, default="")
+    eligible_count = db.Column(db.Integer, default=0, nullable=False)
+    excluded_count = db.Column(db.Integer, default=0, nullable=False, index=True)
+    protected_count = db.Column(db.Integer, default=0, nullable=False)
+    quarantined_count = db.Column(db.Integer, default=0, nullable=False, index=True)
+    last_error = db.Column(db.Text, default="")
+
+    def cleanup_api(self, include_paths: bool = True) -> Dict[str, Any]:
+        manifest = _json_load(self.manifest_json, {})
+        moved = _json_load(self.moved_json, [])
+        eligible = manifest.get("eligible", []) if isinstance(manifest, dict) else []
+        excluded = manifest.get("excluded", []) if isinstance(manifest, dict) else []
+        moved_subtitles = {
+            str(raw.get("source_path") or ""): str(
+                raw.get("destination_path") or ""
+            )
+            for raw in moved
+            if isinstance(raw, dict)
+            and raw.get("kind") == "subtitle"
+            and raw.get("source_path")
+        } if isinstance(moved, list) else {}
+
+        def public_entries(values: Any) -> List[Dict[str, Any]]:
+            result: List[Dict[str, Any]] = []
+            if not isinstance(values, list):
+                return result
+            for raw in values:
+                if not isinstance(raw, dict):
+                    continue
+                path = str(raw.get("path") or raw.get("source_path") or "")
+                result.append(
+                    {
+                        "path": path,
+                        "source_path": path,
+                        "reason": str(raw.get("reason") or ""),
+                    }
+                )
+                destination = moved_subtitles.get(path, "")
+                if destination:
+                    result[-1]["quarantine_path"] = destination
+            return result
+
+        value: Dict[str, Any] = {
+            "enabled": True,
+            "backend": "quarantine",
+            "status": self.status or "",
+            "operation_id": self.operation_key,
+            "eligible": public_entries(eligible) if include_paths else [],
+            "excluded": public_entries(excluded) if include_paths else [],
+            "counts": {
+                "eligible": self.eligible_count or 0,
+                "excluded": self.excluded_count or 0,
+                "protected": self.protected_count or 0,
+                "quarantined": self.quarantined_count or 0,
+            },
+        }
+        if include_paths and self.operation_path:
+            value["quarantine_dir"] = self.operation_path
+        if self.last_error:
+            value["message"] = self.last_error
+        return value
+
+    def as_api(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "created_at": _iso(self.created_at),
+            "updated_at": _iso(self.updated_at),
+            "finished_at": _iso(self.finished_at),
+            "action_id": self.action_log_id,
+            "batch_id": self.batch_run_id,
+            "run_id": self.run_id,
+            "group_id": self.group_id,
+            "candidate_id": self.candidate_id,
+            "keep_candidate_id": self.keep_candidate_id,
+            "plan_digest": self.plan_digest,
+            "subtitle_cleanup": self.cleanup_api(True),
+        }
+
+    @classmethod
+    def get(cls, journal_id: Any) -> Optional["ModelQuarantineJournal"]:
+        return db.session.query(cls).filter_by(id=int(journal_id)).first()
+
+    @classmethod
+    def for_action(cls, action_id: Any) -> Optional["ModelQuarantineJournal"]:
+        return (
+            db.session.query(cls)
+            .filter_by(action_log_id=int(action_id))
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    @classmethod
+    def for_plan(
+        cls, run_id: Any, group_id: Any, candidate_id: Any, plan_digest: str
+    ) -> Optional["ModelQuarantineJournal"]:
+        return (
+            db.session.query(cls)
+            .filter_by(
+                run_id=int(run_id),
+                group_id=int(group_id),
+                candidate_id=int(candidate_id),
+                plan_digest=str(plan_digest),
+            )
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    @classmethod
+    def for_batch_candidate(
+        cls, batch_id: Any, candidate_id: Any, status: str = ""
+    ) -> Optional["ModelQuarantineJournal"]:
+        query = db.session.query(cls).filter_by(
+            batch_run_id=int(batch_id), candidate_id=int(candidate_id)
+        )
+        if status:
+            query = query.filter_by(status=str(status))
+        return query.order_by(cls.id.desc()).first()
+
+    @classmethod
+    def unfinished(cls) -> List["ModelQuarantineJournal"]:
+        return (
+            db.session.query(cls)
+            .filter(
+                cls.status.in_(
+                    [
+                        "planned",
+                        "backing_up",
+                        "quarantining",
+                        "quarantined_pending_scan",
+                        "scan_running",
+                    ]
+                )
+            )
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+
 class ModelBatchRun(ModelBase):
     P = P
     __tablename__ = "batch_run"
@@ -639,7 +851,7 @@ class ModelBatchRun(ModelBase):
     error_summary = db.Column(db.Text, default="")
 
     def as_api(self) -> Dict[str, Any]:
-        return {
+        value = {
             "plan_id": self.id,
             "run_id": self.scan_run_id,
             "created_at": _iso(self.created_at),
@@ -657,6 +869,7 @@ class ModelBatchRun(ModelBase):
             "current_message": self.current_message or "",
             "error_summary": self.error_summary or "",
         }
+        return value
 
     @classmethod
     def get(cls, batch_id: Any) -> Optional["ModelBatchRun"]:
@@ -764,7 +977,7 @@ class ModelBatchItem(ModelBase):
     delete_paths_json = db.Column(db.Text, default="[]")
 
     def as_api(self) -> Dict[str, Any]:
-        return {
+        value = {
             "id": self.id,
             "plan_id": self.batch_run_id,
             "run_id": self.scan_run_id,
@@ -790,6 +1003,18 @@ class ModelBatchItem(ModelBase):
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
         }
+        try:
+            journal = ModelQuarantineJournal.for_batch_candidate(
+                self.batch_run_id, self.delete_candidate_id
+            )
+        except Exception:
+            # Serialization of a legacy v1.2 row must remain available even if
+            # the new journal table has not yet been created in this process.
+            journal = None
+        if journal is not None:
+            value["plan_digest"] = journal.plan_digest
+            value["subtitle_cleanup"] = journal.cleanup_api(True)
+        return value
 
     @classmethod
     def get(cls, item_id: Any) -> Optional["ModelBatchItem"]:

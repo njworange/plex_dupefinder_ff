@@ -292,6 +292,140 @@ class BatchBackendTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "다시 스캔"):
                 module.BatchDeleteManager._assert_settings_snapshot(run)
 
+    def test_quarantine_batch_rejects_shared_video_or_subtitle_source(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            shared_video = "/media/movies/Shared/Film.mkv"
+            shared_subtitle = "/media/movies/Shared/Film.ko.srt"
+
+            with self.assertRaisesRegex(RuntimeError, "공유"):
+                module.BatchDeleteManager._assert_source_sets_disjoint(
+                    [
+                        {
+                            "subtitle_cleanup": {
+                                "video": {"path": shared_video},
+                                "eligible": [{"source_path": shared_subtitle}],
+                            }
+                        },
+                        {
+                            "subtitle_cleanup": {
+                                "video": {"path": shared_video},
+                                "eligible": [],
+                            }
+                        },
+                    ]
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "공유"):
+                module.BatchDeleteManager._assert_source_sets_disjoint(
+                    [
+                        {
+                            "subtitle_cleanup": {
+                                "video": {"path": "/media/movies/A/A.mkv"},
+                                "eligible": [{"source_path": shared_subtitle}],
+                            }
+                        },
+                        {
+                            "subtitle_cleanup": {
+                                "video": {"path": "/media/movies/B/B.mkv"},
+                                "eligible": [{"path": shared_subtitle}],
+                            }
+                        },
+                    ]
+                )
+
+    def test_quarantine_preview_cannot_be_approved_after_backend_switch_to_plex(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            harness.setup_module.P.ModelSetting._data.update(
+                {
+                    "setting_delete_backend": "plex",
+                    "setting_post_delete_scan_mode": "web",
+                    "setting_quarantine_root": "/quarantine",
+                    "setting_max_delete_per_run": "10",
+                    "setting_batch_max_items": "10",
+                }
+            )
+            run = _Record(id=9, status="completed", deletion_attempts=0)
+            batch = _Record(
+                id=7,
+                scan_run_id=9,
+                total_items=1,
+                confirmation="BATCH QUARANTINE 7 ITEMS 1 SUBTITLES 1 aaaaaaaaaaaa",
+            )
+            group = _Record(
+                id=4,
+                run_id=9,
+                safe_to_delete=True,
+                resolution_status="open",
+                recommended_candidate_id=5,
+            )
+            keep = _Record(id=5, media_id="20", score=100.0)
+            target = _Record(id=6, media_id="10", score=50.0)
+            item = _Record(
+                batch_run_id=7,
+                group_id=4,
+                keep_candidate_id=5,
+                delete_candidate_id=6,
+                keep_media_id="20",
+                delete_media_id="10",
+            )
+            journal = _Record(
+                plan_digest="a" * 64,
+                manifest_json=json.dumps(
+                    {
+                        "batch_binding": {
+                            "backend": "quarantine",
+                            "post_delete_scan_mode": "web",
+                            "quarantine_root": "/quarantine",
+                        }
+                    }
+                ),
+            )
+
+            class Runs:
+                @classmethod
+                def get(cls, run_id):
+                    return run
+
+            class Items:
+                @classmethod
+                def by_batch(cls, batch_id):
+                    return [item]
+
+            class Groups:
+                @classmethod
+                def get(cls, group_id):
+                    return group
+
+            class Candidates:
+                @classmethod
+                def by_group(cls, group_id, include_deleted=False):
+                    return [keep, target]
+
+            class Journals:
+                @classmethod
+                def for_batch_candidate(cls, batch_id, candidate_id, status=""):
+                    return journal
+
+            module.ModelScanRun = Runs
+            module.ModelBatchItem = Items
+            module.ModelDuplicateGroup = Groups
+            module.ModelMediaCandidate = Candidates
+            module.ModelQuarantineJournal = Journals
+            manager = module.BatchDeleteManager(
+                types.SimpleNamespace(
+                    preview=lambda **kwargs: (_ for _ in ()).throw(
+                        AssertionError("backend drift must block before fresh preview")
+                    )
+                )
+            )
+            manager._assert_settings_snapshot = lambda value: None
+            manager._cross_group_path_conflicts = lambda run_id: set()
+
+            with self.assertRaisesRegex(RuntimeError, "변경|사전확인|격리"):
+                manager._validate_plan_unchanged(batch)
+
     def test_approve_requires_byte_exact_confirmation_and_maps_lease_conflict(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
@@ -435,6 +569,11 @@ class BatchBackendTest(unittest.TestCase):
                 def latest_for_delete(cls, run_id, group_id, candidate_id):
                     return _Record(id=88, status="blocked", message="fresh check failed")
 
+            class Journals:
+                @classmethod
+                def for_batch_candidate(cls, batch_id, candidate_id, status=""):
+                    return None
+
             class Deletes:
                 def __init__(self):
                     self.calls = []
@@ -448,6 +587,7 @@ class BatchBackendTest(unittest.TestCase):
             module.ModelBatchRun = Batches
             module.ModelBatchItem = Items
             module.ModelActionLog = Actions
+            module.ModelQuarantineJournal = Journals
             session = _Session()
             module.F.db.session = session
             deletes = Deletes()
@@ -466,6 +606,104 @@ class BatchBackendTest(unittest.TestCase):
             self.assertEqual(batch.processed_items, 2)
             self.assertEqual(batch.skipped_items, 1)
             self.assertEqual(session.removes, 1)
+
+    def test_quarantine_worker_backend_drift_makes_zero_delete_service_calls(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            harness.setup_module.P.ModelSetting._data.update(
+                {
+                    "setting_delete_enabled": "True",
+                    "setting_batch_delete_enabled": "True",
+                    "setting_delete_backend": "plex",
+                }
+            )
+            batch = _Record(
+                id=31,
+                scan_run_id=9,
+                status="queued",
+                confirmation="BATCH QUARANTINE 31 ITEMS 1 SUBTITLES 1 aaaaaaaaaaaa",
+                total_items=1,
+                processed_items=0,
+                succeeded_items=0,
+                failed_items=0,
+                skipped_items=0,
+                lease_key="global",
+                nonce_hash="",
+                current_message="",
+                error_summary="",
+                finished_at=None,
+                deletion_lease_token="batch-lease",
+            )
+            item = _Record(
+                id=32,
+                batch_run_id=31,
+                scan_run_id=9,
+                group_id=33,
+                delete_candidate_id=34,
+                keep_candidate_id=35,
+                delete_media_id="10",
+                status="planned",
+                message="",
+                action_log_id=None,
+                started_at=None,
+                finished_at=None,
+            )
+
+            class Batches:
+                @classmethod
+                def claim_for_worker(cls, batch_id, now):
+                    batch.status = "running"
+                    return True
+
+                @classmethod
+                def get(cls, batch_id):
+                    return batch
+
+            class Items:
+                @classmethod
+                def by_batch(cls, batch_id):
+                    return [item]
+
+                @classmethod
+                def get(cls, item_id):
+                    return item
+
+                @classmethod
+                def claim_for_worker(cls, item_id, now):
+                    item.status = "running"
+                    item.started_at = now
+                    return True
+
+            class Actions:
+                @classmethod
+                def latest_for_delete(cls, run_id, group_id, candidate_id):
+                    return None
+
+            class Deletes:
+                def __init__(self):
+                    self.calls = []
+
+                def delete(self, **kwargs):
+                    self.calls.append(kwargs)
+                    return {"action_id": 99, "verification": "confirmed"}
+
+            module.ModelBatchRun = Batches
+            module.ModelBatchItem = Items
+            module.ModelActionLog = Actions
+            module.F.db.session = _Session()
+            deletes = Deletes()
+            manager = module.BatchDeleteManager(deletes)
+            manager.lease_service = types.SimpleNamespace(
+                renew=lambda *args: None,
+                release=lambda *args: True,
+            )
+            manager._worker_should_stop = lambda batch_id: None
+
+            manager._worker(31)
+
+            self.assertEqual(deletes.calls, [])
+            self.assertEqual(item.status, "failed")
+            self.assertEqual(batch.status, "stopped")
 
     def test_restart_running_item_uses_unknown_audit_and_never_looks_skipped(self) -> None:
         with FlaskFarmImportHarness() as harness:

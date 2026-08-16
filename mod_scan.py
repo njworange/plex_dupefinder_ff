@@ -63,6 +63,12 @@ class ModuleScan(PluginModuleBase):
         self.post_delete_scan_manager.deletion_recovery_callback = (
             self.batch_manager.recover_interrupted
         )
+        self.post_delete_scan_manager.completion_callback = (
+            self.delete_service.finalize_quarantine_scan
+        )
+        self.post_delete_scan_manager.failure_callback = (
+            self.delete_service.fail_quarantine_scan
+        )
 
     def plugin_load(self) -> None:
         scan_count = self.manager.recover_interrupted()
@@ -325,6 +331,9 @@ class ModuleScan(PluginModuleBase):
                 if P.ModelSetting.get("setting_delete_enabled") != "True":
                     raise RuntimeError("설정에서 수동 삭제를 활성화해야 합니다.")
 
+                preview_data = self.delete_service.preview(
+                    group.id, candidate.id, keep.id
+                )
                 nonce = secrets.token_urlsafe(24)
                 expires_at = int(time.time()) + 120
                 session["plex_dupefinder_ff_delete_preview"] = {
@@ -332,18 +341,15 @@ class ModuleScan(PluginModuleBase):
                     "group_id": group.id,
                     "candidate_id": candidate.id,
                     "keep_candidate_id": keep.id,
+                    "plan_digest": str(preview_data.get("plan_digest") or ""),
+                    "backend": str(preview_data.get("backend") or "plex"),
                     "expires_at": expires_at,
                 }
+                preview_data.update({"nonce": nonce, "expires_at": expires_at})
                 return jsonify(
                     {
                         "ret": "success",
-                        "data": {
-                            "nonce": nonce,
-                            "confirmation": "DELETE %s" % candidate.media_id,
-                            "expires_at": expires_at,
-                            "delete_media_id": candidate.media_id,
-                            "keep_media_id": keep.media_id,
-                        },
+                        "data": preview_data,
                     }
                 )
 
@@ -365,13 +371,24 @@ class ModuleScan(PluginModuleBase):
                     str(preview.get("nonce", "")), str(req.form.get("nonce", ""))
                 ) or any(int(preview.get(key, 0)) != value for key, value in supplied.items()):
                     raise ValueError("삭제 사전확인 정보가 일치하지 않습니다.")
+                supplied_digest = str(req.form.get("plan_digest", ""))
+                if not secrets.compare_digest(
+                    str(preview.get("plan_digest", "")), supplied_digest
+                ):
+                    raise ValueError("삭제 사전확인 계획이 일치하지 않습니다.")
                 result = self.delete_service.delete(
                     group_id=supplied["group_id"],
                     candidate_id=supplied["candidate_id"],
                     keep_candidate_id=supplied["keep_candidate_id"],
                     confirmation=req.form.get("confirmation", ""),
+                    plan_digest=supplied_digest,
                 )
-                return jsonify({"ret": "success", "msg": "삭제와 사후 검증을 완료했습니다.", "data": result})
+                message = (
+                    "안전 격리를 완료했고 Plex 부분 스캔 검증을 예약했습니다."
+                    if result.get("verification") == "quarantined_pending_scan"
+                    else "삭제와 사후 검증을 완료했습니다."
+                )
+                return jsonify({"ret": "success", "msg": message, "data": result})
 
             return jsonify({"ret": "danger", "msg": "지원하지 않는 요청입니다."}), 400
         except Exception as exc:

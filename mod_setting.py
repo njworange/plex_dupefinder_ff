@@ -40,6 +40,9 @@ def _post_delete_scan_capabilities(web_connection_validated: bool = False) -> Di
     mode = _normalize_post_delete_scan_mode(
         P.ModelSetting.get("setting_post_delete_scan_mode")
     )
+    delete_backend = str(
+        P.ModelSetting.get("setting_delete_backend") or "plex"
+    ).strip().lower()
     plex_mate = None
     try:
         from framework import F
@@ -61,12 +64,13 @@ def _post_delete_scan_capabilities(web_connection_validated: bool = False) -> Di
         pass
 
     selected_supported = (
-        mode == "none"
+        (mode == "none" and delete_backend != "quarantine")
         or (mode == "web" and web_connection_validated)
         or (mode == "binary" and binary_helper_exported and binary_scanner_configured)
     )
     return {
         "mode": mode,
+        "delete_backend": delete_backend,
         "web_connection_validated": bool(web_connection_validated),
         "binary_helper_exported": binary_helper_exported,
         "binary_scanner_configured": binary_scanner_configured,
@@ -82,6 +86,8 @@ class ModuleSetting(PluginModuleBase):
         "setting_batch_max_items": "10",
         "setting_allowed_roots": "",
         "setting_max_delete_per_run": "1",
+        "setting_delete_backend": "plex",
+        "setting_quarantine_root": "",
         "setting_request_timeout": "20",
         "setting_post_delete_scan_mode": "none",
         "setting_require_guid": "True",

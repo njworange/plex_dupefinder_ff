@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0
+
+- Added an opt-in quarantine backend that never calls Plex Media DELETE and moves one validated video version to a configured same-filesystem quarantine root.
+- Added conservative sidecar subtitle discovery for common Plex subtitle names; only subtitles proven exclusive to the removed video version are quarantined with it.
+- Added fail-closed protection for retained and ambiguous/shared subtitles, with full paths and exclusion reasons in preview, results and durable audit details.
+- Added subtitle exception filtering in History and dedicated escaped UI rendering for quarantined and excluded subtitle paths.
+- Added mandatory Binary/Web partial-scan preflight for quarantine mode so PMS state and retained versions can be revalidated after the move.
+- Kept the existing Plex backend as the compatibility default; safe subtitle cleanup remains explicitly opt-in and quarantine files are never automatically purged.
+
 ## 1.2.0
 
 - Added an opt-in post-delete Plex partial scan mode: disabled by default, Plex Media Scanner (Binary), or Plex Web API.
