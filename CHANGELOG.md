@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+- Added an opt-in post-delete Plex partial scan mode: disabled by default, Plex Media Scanner (Binary), or Plex Web API.
+- Added non-destructive Plex connection and plex_mate Binary-helper diagnostics plus fail-closed setting validation.
+- Added a one-hour global operational quarantine with automatic retry disabled when a Binary scanner child cannot be proven terminated.
+- Added a durable best-effort scan outbox with bounded retry after confirmed deletion; DELETE requests are never retried by this workflow.
+- Added fail-closed preflight target resolution: an enabled post-delete scan must resolve an exact movie folder or TV-show root before DELETE starts.
+- Added a read-only history panel for recent post-delete scan status, target, attempts and sanitized result/error details.
+- Documented movie-folder and TV-show-root targeting, runtime requirements and the separation between Plex partial scans and DupeFinder duplicate rescans.
+
 ## 1.1.0
 
 - Added opt-in batch-approved semi-automatic deletion for safe groups with exactly two active Media versions and one unique score winner.

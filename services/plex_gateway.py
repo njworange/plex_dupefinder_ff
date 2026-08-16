@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import requests
 
+from .safety import is_absolute_remote_path, normalize_remote_path
 from .domain import (
     AudioTrack,
     LibrarySection,
@@ -19,6 +20,12 @@ from .domain import (
 
 class PlexGatewayError(RuntimeError):
     pass
+
+
+class PlexHTTPError(PlexGatewayError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super(PlexHTTPError, self).__init__(message)
+        self.status_code = int(status_code)
 
 
 class PlexAuthenticationError(PlexGatewayError):
@@ -160,7 +167,7 @@ def parse_metadata(item: Dict[str, Any]) -> MetadataItem:
 
 class PlexGateway:
     PRODUCT = "Plex DupeFinder FF"
-    VERSION = "1.1.0"
+    VERSION = "1.2.0"
 
     def __init__(
         self,
@@ -218,7 +225,10 @@ class PlexGateway:
                 )
             if response.status_code in (401, 403):
                 raise PlexAuthenticationError("Plex 토큰이 거부되었습니다.")
-            raise PlexGatewayError("Plex 요청이 실패했습니다. HTTP %s" % response.status_code)
+            raise PlexHTTPError(
+                "Plex 요청이 실패했습니다. HTTP %s" % response.status_code,
+                response.status_code,
+            )
         return response
 
     def identity(self) -> PlexIdentity:
@@ -232,7 +242,11 @@ class PlexGateway:
         identity = self.identity()
         if require_match and not expected_machine_id:
             raise PlexGatewayError("plex_mate의 Machine ID가 비어 있습니다.")
-        if expected_machine_id and identity.machine_id != expected_machine_id:
+        if (
+            require_match
+            and expected_machine_id
+            and identity.machine_id != expected_machine_id
+        ):
             raise PlexGatewayError("Plex Machine ID가 plex_mate 설정과 일치하지 않습니다.")
         return identity
 
@@ -247,14 +261,31 @@ class PlexGateway:
                 continue
             key = str(item.get("key") or "")
             if key:
+                locations = []
+                for location in _as_list(item.get("Location")):
+                    if not isinstance(location, dict):
+                        continue
+                    value = str(location.get("path") or "")
+                    if value and value not in locations:
+                        locations.append(value)
                 sections.append(
                     LibrarySection(
                         key=key,
                         title=str(item.get("title") or key),
                         section_type=section_type,
+                        locations=tuple(locations),
                     )
                 )
         return sections
+
+    def section_locations(self, section_key: str) -> List[str]:
+        key = str(section_key or "")
+        if not key.isdigit():
+            raise PlexGatewayError("잘못된 Plex library section ID입니다.")
+        for section in self.list_sections():
+            if section.key == key:
+                return list(section.locations)
+        raise PlexGatewayError("Plex library section을 찾을 수 없습니다.")
 
     def duplicate_rating_keys(
         self,
@@ -316,5 +347,19 @@ class PlexGateway:
         response = self._request(
             "DELETE",
             "/library/metadata/%s/media/%s" % (rating_key, media_id),
+        )
+        return response.status_code
+
+    def refresh_section_path(self, section_key: str, path: str) -> int:
+        key = str(section_key or "")
+        target = normalize_remote_path(str(path or ""))
+        if not key.isdigit():
+            raise PlexGatewayError("잘못된 Plex library section ID입니다.")
+        if not target or not is_absolute_remote_path(target):
+            raise PlexGatewayError("Plex 부분 스캔 경로는 절대 경로여야 합니다.")
+        response = self._request(
+            "GET",
+            "/library/sections/%s/refresh" % key,
+            params={"path": target},
         )
         return response.status_code

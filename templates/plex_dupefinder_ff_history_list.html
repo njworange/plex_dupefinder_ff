@@ -13,6 +13,15 @@
 </section>
 
 <section class="pdff-panel">
+  <div class="pdff-toolbar">
+    <h3 class="pdff-title" style="margin:0">삭제 후 부분 스캔 작업</h3>
+    <button id="post_scan_refresh_btn" type="button" class="btn btn-sm btn-outline-secondary">새로고침</button>
+  </div>
+  <div class="pdff-muted mb-2">최근 100개 작업입니다. 이 상태는 삭제 성공 판정과 별개이며, 실패해도 DELETE를 다시 실행하지 않습니다.</div>
+  <div id="post_scan_list" class="pdff-empty">부분 스캔 작업을 조회하는 중입니다.</div>
+</section>
+
+<section class="pdff-panel">
   <div id="history_summary" class="pdff-muted mb-2"></div>
   <div id="history_list" class="pdff-empty">이력을 조회하는 중입니다.</div>
   <div class="pdff-toolbar justify-content-center mt-3"><button id="history_prev_btn" type="button" class="btn btn-sm btn-outline-secondary">이전</button><span id="history_page_label" class="pdff-muted"></span><button id="history_next_btn" type="button" class="btn btn-sm btn-outline-secondary">다음</button></div>
@@ -31,6 +40,46 @@ var actionRows = [];
 var currentPage = 1;
 var totalPages = 1;
 var pageSize = 50;
+var postDeleteScanRows = [];
+
+function renderPostDeleteScans() {
+  if (!postDeleteScanRows.length) {
+    $('#post_scan_list').addClass('pdff-empty').text('최근 삭제 후 부분 스캔 작업이 없습니다.');
+    return;
+  }
+  var html = '';
+  postDeleteScanRows.forEach(function (item) {
+    var mode = item.mode === 'binary' ? 'Binary' : (item.mode === 'web' ? 'Web' : String(item.mode || '-'));
+    var actionIds = Array.isArray(item.action_ids) ? item.action_ids : [];
+    var attempts = Number(item.attempts || 0) + ' / ' + Number(item.max_attempts || 0);
+    var links = 'Action ' + (actionIds.length ? '#' + actionIds.join(', #') : '#-');
+    if (item.batch_id) links += ' · Batch #' + String(item.batch_id);
+    var result = item.last_error
+      ? '<div class="small mt-1"><span class="pdff-kv-label">결과/오류</span>' + PDFF.esc(item.last_error) + '</div>'
+      : '';
+    html += '<article class="pdff-row"><div class="row align-items-center">' +
+      '<div class="col-md-2"><strong>작업 #' + PDFF.esc(item.id) + '</strong><br>' + PDFF.badge(item.status || 'unknown') + '<div class="pdff-muted">' + PDFF.esc(PDFF.date(item.updated_at || item.created_at)) + '</div></div>' +
+      '<div class="col-md-2"><span class="pdff-kv-label">방식 / 섹션</span>' + PDFF.esc(mode) + ' / ' + PDFF.esc(item.section_key || '-') + '<div class="pdff-muted">' + PDFF.esc(item.media_type || '-') + '</div></div>' +
+      '<div class="col-md-4"><span class="pdff-kv-label">대상 경로</span><div class="pdff-code" style="word-break:break-all">' + PDFF.esc(item.target_path || '-') + '</div>' + result + '</div>' +
+      '<div class="col-md-2"><span class="pdff-kv-label">시도</span>' + PDFF.esc(attempts) + '<div class="pdff-muted">HTTP ' + PDFF.esc(item.response_status || '-') + '</div></div>' +
+      '<div class="col-md-2"><span class="pdff-kv-label">연결된 감사</span>' + PDFF.esc(links) + '</div>' +
+      '</div></article>';
+  });
+  $('#post_scan_list').removeClass('pdff-empty').html(html);
+}
+
+function loadPostDeleteScans() {
+  $('#post_scan_refresh_btn').prop('disabled', true);
+  PDFF.request(packageName, 'scan', 'post_delete_scan_status', {}, 'GET', function (ret) {
+    $('#post_scan_refresh_btn').prop('disabled', false);
+    if (ret.ret !== 'success') {
+      $('#post_scan_list').addClass('pdff-empty').text('부분 스캔 작업 조회에 실패했습니다.');
+      return;
+    }
+    postDeleteScanRows = (ret.data && Array.isArray(ret.data.items)) ? ret.data.items : [];
+    renderPostDeleteScans();
+  });
+}
 
 function renderHistory() {
   if (!actionRows.length) { $('#history_list').addClass('pdff-empty').text('조건에 맞는 감사 이력이 없습니다.'); return; }
@@ -61,6 +110,7 @@ function loadHistory(resetPage) {
 }
 
 $('#history_filter_btn').on('click', function () { loadHistory(true); });
+$('#post_scan_refresh_btn').on('click', loadPostDeleteScans);
 $('#run_filter').on('keydown', function (e) { if (e.key === 'Enter') loadHistory(true); });
 $('#history_prev_btn').on('click', function () { if (currentPage > 1) { currentPage -= 1; loadHistory(false); } });
 $('#history_next_btn').on('click', function () { if (currentPage < totalPages) { currentPage += 1; loadHistory(false); } });
@@ -73,6 +123,6 @@ $(document).on('click', '.action-detail', function () {
   });
 });
 $('#history_close_btn').on('click', function () { $('#history_detail').hide(); });
-$(document).ready(function () { loadHistory(true); });
+$(document).ready(function () { loadPostDeleteScans(); loadHistory(true); });
 </script>
 {% endblock %}

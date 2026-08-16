@@ -19,6 +19,9 @@ class BatchUiContractTests(unittest.TestCase):
         self.setting = (
             ROOT / "templates" / "plex_dupefinder_ff_setting_setting.html"
         ).read_text(encoding="utf-8")
+        self.history = (
+            ROOT / "templates" / "plex_dupefinder_ff_history_list.html"
+        ).read_text(encoding="utf-8")
 
     def test_library_select_buttons_start_disabled_and_update_scan_state(self) -> None:
         for element_id in ("select_all_libraries_btn", "clear_all_libraries_btn"):
@@ -35,6 +38,45 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("setting_batch_max_items", self.setting)
         self.assertRegex(self.setting, r"setting_batch_max_items[^\n]+min=1, max=100")
         self.assertIn("batchEnabled && !deleteEnabled", self.setting)
+
+    def test_post_delete_scan_setting_is_opt_in_and_enum_validated(self) -> None:
+        self.assertIn("setting_post_delete_scan_mode", self.setting)
+        for value in ("none", "binary", "web"):
+            self.assertRegex(self.setting, r"['\"]%s['\"]" % value)
+        self.assertIn("postDeleteScanModes.indexOf(scanMode) < 0", self.setting)
+        self.assertIn("scan.selected_supported === true", self.setting)
+        self.assertIn("scan.binary_helper_exported === true", self.setting)
+        self.assertIn("scan.binary_scanner_configured === true", self.setting)
+        self.assertIn("scan.web_connection_validated === true", self.setting)
+        self.assertIn("DELETE 전에 필수 검증", self.setting)
+
+    def test_capability_diagnostics_do_not_execute_a_scan(self) -> None:
+        setting_module = (ROOT / "mod_setting.py").read_text(encoding="utf-8")
+        self.assertIn('getattr(binary_scanner, "scan_refresh", None)', setting_module)
+        self.assertNotIn("PlexWebHandle", setting_module)
+        self.assertNotRegex(setting_module, r"\.scan_refresh\s*\(")
+
+    def test_history_shows_post_delete_scan_status_with_escaped_fields(self) -> None:
+        self.assertIn('id="post_scan_refresh_btn"', self.history)
+        self.assertRegex(
+            self.history,
+            r"PDFF\.request\(packageName, 'scan', 'post_delete_scan_status', \{\}, 'GET'",
+        )
+        self.assertIn("PDFF.badge(item.status || 'unknown')", self.history)
+        for field in (
+            "item.last_error",
+            "item.section_key || '-'",
+            "item.target_path || '-'",
+            "attempts",
+            "links",
+        ):
+            self.assertIn("PDFF.esc(%s)" % field, self.history)
+        self.assertIn("Array.isArray(ret.data.items)", self.history)
+
+    def test_post_delete_scan_retry_statuses_have_warning_badges(self) -> None:
+        static = (ROOT / "static" / "pdff.js").read_text(encoding="utf-8")
+        self.assertIn("'retry_wait'", static)
+        self.assertIn("'unverified'", static)
 
     def test_batch_mutations_use_post_and_csrf(self) -> None:
         functions = {

@@ -13,6 +13,7 @@ from .path_conflicts import group_has_cross_path_conflict
 from .scan_manager import current_safety_policy
 from .services.plex_gateway import PlexDeleteOutcomeUnknown, PlexGateway
 from .services.plex_mate_provider import PlexMateProvider
+from .services.post_delete_scan_targets import build_scan_targets, validate_scan_target
 from .services.safety import assess_group, validate_fresh_snapshot
 from .setup import P
 
@@ -40,9 +41,21 @@ def _timeout() -> int:
 
 
 class DeleteService:
-    def __init__(self) -> None:
+    def __init__(self, post_delete_scan_manager: Optional[Any] = None) -> None:
         self._lock = threading.Lock()
         self.lease_service = DeletionLeaseService()
+        self.post_delete_scan_manager = post_delete_scan_manager
+
+    @staticmethod
+    def _post_delete_scan_mode() -> str:
+        value = str(
+            P.ModelSetting.get("setting_post_delete_scan_mode") or "none"
+        ).strip().lower()
+        return value if value in ("none", "binary", "web") else "none"
+
+    def wake_post_delete_scans(self) -> None:
+        if self.post_delete_scan_manager is not None:
+            self.post_delete_scan_manager.wake()
 
     def _load(
         self, group_id: int, candidate_id: int, keep_candidate_id: int
@@ -207,8 +220,9 @@ class DeleteService:
             lease_owner_token = self.lease_service.acquire(owner_kind, owner_ref)
         else:
             self.lease_service.renew(lease_owner_token, owner_kind, owner_ref)
+        result: Optional[Dict[str, Any]] = None
         try:
-            return self._delete_transaction(
+            result = self._delete_transaction(
                 group_id,
                 candidate_id,
                 keep_candidate_id,
@@ -217,9 +231,14 @@ class DeleteService:
                 owner_kind,
                 owner_ref,
             )
+            return result
         finally:
             if owns_lease:
-                self.lease_service.release(lease_owner_token)
+                try:
+                    self.lease_service.release(lease_owner_token)
+                finally:
+                    if result is not None:
+                        self.wake_post_delete_scans()
 
     def _delete_transaction(
         self,
@@ -265,7 +284,8 @@ class DeleteService:
                 if not freshness.safe:
                     raise RuntimeError("스캔 이후 Plex 항목이 변경되었습니다: %s" % ", ".join(freshness.flags))
 
-                safety = assess_group(current, current_safety_policy())
+                safety_policy = current_safety_policy()
+                safety = assess_group(current, safety_policy)
                 if not safety.safe:
                     raise RuntimeError("현재 항목이 안전 정책을 통과하지 못했습니다: %s" % ", ".join(safety.flags))
 
@@ -274,6 +294,44 @@ class DeleteService:
                     raise RuntimeError("유지 또는 삭제할 Media ID가 Plex에 존재하지 않습니다.")
                 if len(current_ids) < 2:
                     raise RuntimeError("마지막 Media 버전은 삭제할 수 없습니다.")
+
+                post_scan_mode = self._post_delete_scan_mode()
+                post_scan_locations: Tuple[str, ...] = ()
+                if post_scan_mode != "none":
+                    if self.post_delete_scan_manager is None:
+                        raise RuntimeError(
+                            "삭제 후 Plex 스캔 관리자가 초기화되지 않았습니다."
+                        )
+                    expected_section_type = (
+                        "show" if group.media_type == "episode" else "movie"
+                    )
+                    section = next(
+                        (
+                            item
+                            for item in gateway.list_sections()
+                            if item.key == str(group.section_key)
+                        ),
+                        None,
+                    )
+                    if section is None or section.section_type != expected_section_type:
+                        raise RuntimeError(
+                            "삭제 대상의 Plex library section을 확인할 수 없습니다."
+                        )
+                    post_scan_locations = tuple(section.locations)
+                    post_scan_targets = build_scan_targets(
+                        group, candidate, current, post_scan_locations
+                    )
+                    if not post_scan_targets or any(
+                        not validate_scan_target(
+                            target,
+                            post_scan_locations,
+                            safety_policy.allowed_roots,
+                        )
+                        for target in post_scan_targets
+                    ):
+                        raise RuntimeError(
+                            "삭제 대상의 정확한 Plex 부분 스캔 폴더를 확인할 수 없습니다."
+                        )
 
                 self.lease_service.renew(
                     lease_owner_token, lease_owner_kind, lease_owner_ref
@@ -389,6 +447,26 @@ class DeleteService:
                 log.message = "삭제 후 Plex 재검증 완료"
                 log.response_status = response_status
                 log.after_json = _json(after.as_dict())
+                post_scan_jobs = []
+                if post_scan_mode != "none":
+                    batch_run_id: Optional[int] = None
+                    if lease_owner_kind == "batch":
+                        try:
+                            batch_run_id = int(lease_owner_ref)
+                        except (TypeError, ValueError):
+                            raise RuntimeError(
+                                "일괄 삭제의 작업 식별자를 확인할 수 없습니다."
+                            )
+                    post_scan_jobs = self.post_delete_scan_manager.enqueue_confirmed(
+                        run=run,
+                        group=group,
+                        candidate=candidate,
+                        action_log=log,
+                        current_item=current,
+                        section_locations=post_scan_locations,
+                        mode=post_scan_mode,
+                        batch_run_id=batch_run_id,
+                    )
                 F.db.session.commit()
                 return {
                     "action_id": log.id,
@@ -396,6 +474,11 @@ class DeleteService:
                     "kept_media_id": keep.media_id,
                     "response_status": response_status,
                     "verification": "confirmed",
+                    "post_delete_scan": {
+                        "mode": post_scan_mode,
+                        "status": "queued" if post_scan_jobs else "disabled",
+                        "job_ids": [job.id for job in post_scan_jobs if job.id is not None],
+                    },
                 }
             except DeletionLeaseLost:
                 # The recovery CAS owner is now solely responsible for turning

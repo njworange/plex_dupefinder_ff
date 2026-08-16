@@ -33,11 +33,14 @@ class PlexMateProvider:
 
         return F.PluginManager
 
-    def resolve(self, require_machine_id: bool = False) -> PlexConnection:
-        manager = self._manager()
-        plex_mate = manager.get_plugin_instance("plex_mate")
+    def plugin_instance(self) -> Any:
+        plex_mate = self._manager().get_plugin_instance("plex_mate")
         if plex_mate is None or getattr(plex_mate, "ModelSetting", None) is None:
             raise PlexMateUnavailable("plex_mate가 설치되어 로드된 상태여야 합니다.")
+        return plex_mate
+
+    def resolve(self, require_machine_id: bool = False) -> PlexConnection:
+        plex_mate = self.plugin_instance()
 
         setting = plex_mate.ModelSetting
         base_url = normalize_base_url(setting.get("base_url") or "")
@@ -50,6 +53,17 @@ class PlexMateProvider:
             raise PlexMateUnavailable("삭제를 사용하려면 plex_mate의 Machine ID가 필요합니다.")
 
         return PlexConnection(base_url=base_url, machine_id=machine_id, token=token)
+
+    def binary_scanner(self) -> Any:
+        """Resolve PlexMate's public scanner helper only when a job executes."""
+
+        plex_mate = self.plugin_instance()
+        scanner = getattr(plex_mate, "PlexBinaryScanner", None)
+        if scanner is None or not callable(getattr(scanner, "scan_refresh", None)):
+            raise PlexMateUnavailable(
+                "현재 plex_mate가 PlexBinaryScanner.scan_refresh를 제공하지 않습니다."
+            )
+        return plex_mate, scanner
 
 
 def redact_secret(message: str, secret: str) -> str:

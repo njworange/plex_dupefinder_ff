@@ -13,6 +13,7 @@ from plugin import PluginModuleBase
 from .batch_delete_manager import BatchDeleteManager
 from .delete_service import DeleteService
 from .models import ModelDuplicateGroup, ModelMediaCandidate, ModelScanRun
+from .post_delete_scan import PostDeleteScanManager
 from .scan_manager import ScanManager
 from .services.plex_gateway import PlexGateway
 from .services.plex_mate_provider import PlexMateProvider
@@ -54,10 +55,14 @@ class ModuleScan(PluginModuleBase):
     def __init__(self, plugin: Any) -> None:
         super(ModuleScan, self).__init__(plugin, name=name, first_menu="list")
         self.manager = ScanManager()
-        self.delete_service = DeleteService()
+        self.post_delete_scan_manager = PostDeleteScanManager()
+        self.delete_service = DeleteService(self.post_delete_scan_manager)
         # Share DeleteService so manual and batch work serialize inside this
         # process; DB claims provide the cross-process protection.
         self.batch_manager = BatchDeleteManager(self.delete_service)
+        self.post_delete_scan_manager.deletion_recovery_callback = (
+            self.batch_manager.recover_interrupted
+        )
 
     def plugin_load(self) -> None:
         scan_count = self.manager.recover_interrupted()
@@ -73,10 +78,16 @@ class ModuleScan(PluginModuleBase):
             )
         if batch_count:
             P.logger.warning("Interrupted batch deletes recovered: %s", batch_count)
+        post_scan_count = self.post_delete_scan_manager.plugin_load()
+        if post_scan_count:
+            P.logger.warning(
+                "Interrupted post-delete scans recovered: %s", post_scan_count
+            )
 
     def plugin_unload(self) -> None:
         self.manager.unload()
         self.batch_manager.unload()
+        self.post_delete_scan_manager.unload()
 
     def process_menu(self, sub: str, req: Any) -> Any:
         arg: Dict[str, Any] = P.ModelSetting.to_dict()
@@ -128,6 +139,25 @@ class ModuleScan(PluginModuleBase):
                 self.batch_manager.recover_interrupted()
             if sub == "libraries":
                 return jsonify({"ret": "success", "data": self._libraries()})
+
+            if sub == "post_delete_scan_status":
+                if req.method != "GET":
+                    raise ValueError("삭제 후 스캔 상태 조회는 GET만 허용합니다.")
+                action_raw = req.args.get("action_id", "")
+                batch_raw = req.args.get("batch_id", "")
+                action_id = _positive_int(action_raw, "action_id") if action_raw else None
+                batch_id = _positive_int(batch_raw, "batch_id") if batch_raw else None
+                return jsonify(
+                    {
+                        "ret": "success",
+                        "data": {
+                            "items": self.post_delete_scan_manager.status(
+                                action_id=action_id,
+                                batch_id=batch_id,
+                            )
+                        },
+                    }
+                )
 
             if sub == "start":
                 if req.method != "POST":

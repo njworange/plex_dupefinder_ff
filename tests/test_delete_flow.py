@@ -13,7 +13,14 @@ try:
     from ._requests_compat import requests as requests
 except ImportError:
     from _requests_compat import requests as requests
-from services.domain import MediaPart, MediaVersion, MetadataItem, PlexConnection, PlexIdentity
+from services.domain import (
+    LibrarySection,
+    MediaPart,
+    MediaVersion,
+    MetadataItem,
+    PlexConnection,
+    PlexIdentity,
+)
 from services.plex_gateway import PlexDeleteOutcomeUnknown, PlexGatewayError
 from services.safety import SafetyPolicy
 import services as services_package
@@ -25,7 +32,12 @@ import services.safety as safety_module
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _version(media_id: str, *, bitrate: int = 1_000) -> MediaVersion:
+def _version(
+    media_id: str,
+    *,
+    bitrate: int = 1_000,
+    path: str = "",
+) -> MediaVersion:
     return MediaVersion(
         media_id=media_id,
         duration=7_200_000,
@@ -40,7 +52,7 @@ def _version(media_id: str, *, bitrate: int = 1_000) -> MediaVersion:
         parts=(
             MediaPart(
                 part_id=media_id + "1",
-                file="/media/movies/%s.mkv" % media_id,
+                file=path or "/media/movies/%s.mkv" % media_id,
                 size=1_000,
                 duration=7_200_000,
                 container="mkv",
@@ -136,6 +148,8 @@ class DeleteServiceHarness:
         self.group = _Record(
             id=10,
             run_id=1,
+            section_key="7",
+            media_type=before.media_type,
             rating_key=before.rating_key,
             identity_fingerprint=before.identity_fingerprint(),
             safe_to_delete=True,
@@ -316,7 +330,7 @@ class DeleteServiceHarness:
                 else:
                     sys.modules[name] = previous
 
-    def service_for(self, gateway):
+    def service_for(self, gateway, post_delete_scan_manager=None):
         harness = self
 
         class Provider:
@@ -326,7 +340,7 @@ class DeleteServiceHarness:
 
         self.module.PlexMateProvider = Provider
         self.module.PlexGateway = lambda *args, **kwargs: gateway
-        return self.module.DeleteService()
+        return self.module.DeleteService(post_delete_scan_manager)
 
 
 class _Gateway:
@@ -352,6 +366,16 @@ class _Gateway:
             raise self.delete_result
         return self.delete_result
 
+    def list_sections(self):
+        return [
+            LibrarySection(
+                "7",
+                "Movies",
+                "movie",
+                locations=("/media/movies",),
+            )
+        ]
+
 
 class DeleteFlowTest(unittest.TestCase):
     def test_confirmation_is_byte_exact_and_rejects_surrounding_space(self) -> None:
@@ -371,7 +395,14 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertEqual(harness.lease_events[-1][0], "release")
 
     def test_confirmed_delete_updates_audit_and_requires_rescan(self) -> None:
-        before = _item(_version("10"), _version("20", bitrate=2_000))
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version(
+                "20",
+                bitrate=2_000,
+                path="/media/movies/Delete Review/20.mkv",
+            ),
+        )
         after = _item(before.media[1])
         harness = DeleteServiceHarness(before)
         gateway = _Gateway([before, after])
@@ -389,6 +420,161 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertTrue(harness.require_machine_id)
         self.assertEqual(harness.lease_events[0][0], "acquire")
         self.assertEqual(harness.lease_events[-1][0], "release")
+
+    def test_confirmed_success_enqueues_before_success_commit_and_wakes_after_release(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version(
+                "20",
+                bitrate=2_000,
+                path="/media/movies/Delete Review/20.mkv",
+            ),
+        )
+        after = _item(before.media[1])
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+
+        class ScanManager:
+            def __init__(self):
+                self.calls = []
+                self.commit_counts = []
+                self.wake_count = 0
+
+            def enqueue_confirmed(self, **kwargs):
+                self.calls.append(kwargs)
+                self.commit_counts.append(harness.session.commits)
+                self.asserted_success_state = (
+                    kwargs["action_log"].status,
+                    kwargs["candidate"].deleted,
+                )
+                return [types.SimpleNamespace(id=None)]
+
+            def wake(self):
+                self.wake_count += 1
+
+        manager = ScanManager()
+        commits_before = harness.session.commits
+        result = harness.service_for(
+            _Gateway([before, after]), manager
+        ).delete(10, 1, 2, "DELETE 10")
+
+        self.assertEqual(result["verification"], "confirmed")
+        self.assertEqual(result["post_delete_scan"]["status"], "queued")
+        self.assertEqual(len(manager.calls), 1)
+        self.assertEqual(manager.asserted_success_state, ("success", True))
+        self.assertEqual(manager.commit_counts, [harness.session.commits - 1])
+        self.assertGreater(harness.session.commits, commits_before)
+        self.assertEqual(manager.wake_count, 1)
+        self.assertEqual(harness.lease_events[-1][0], "release")
+
+    def test_none_mode_never_enqueues_post_delete_scan(self) -> None:
+        before = _item(_version("10"), _version("20", bitrate=2_000))
+        after = _item(before.media[1])
+        harness = DeleteServiceHarness(before)
+
+        class ScanManager:
+            def __init__(self):
+                self.wake_count = 0
+
+            def enqueue_confirmed(self, **kwargs):
+                raise AssertionError("none mode must not enqueue")
+
+            def wake(self):
+                self.wake_count += 1
+
+        manager = ScanManager()
+        result = harness.service_for(
+            _Gateway([before, after]), manager
+        ).delete(10, 1, 2, "DELETE 10")
+
+        self.assertEqual(result["verification"], "confirmed")
+        self.assertEqual(
+            result["post_delete_scan"],
+            {"mode": "none", "status": "disabled", "job_ids": []},
+        )
+
+    def test_unconfirmed_delete_never_enqueues_post_delete_scan(self) -> None:
+        before = _item(
+            _version("10", path="/media/movies/Delete Review/10.mkv"),
+            _version("20", path="/media/movies/Delete Review/20.mkv"),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+
+        class ScanManager:
+            def __init__(self):
+                self.enqueue_count = 0
+                self.wake_count = 0
+
+            def enqueue_confirmed(self, **kwargs):
+                self.enqueue_count += 1
+
+            def wake(self):
+                self.wake_count += 1
+
+        manager = ScanManager()
+        gateway = _Gateway(
+            [before, PlexGatewayError("post-read unavailable")],
+            delete_result=PlexDeleteOutcomeUnknown("unknown"),
+        )
+
+        with self.assertRaises(RuntimeError):
+            harness.service_for(gateway, manager).delete(10, 1, 2, "DELETE 10")
+
+        self.assertEqual(manager.enqueue_count, 0)
+        self.assertEqual(manager.wake_count, 0)
+
+    def test_episode_scan_target_must_remain_inside_delete_allowed_root(self) -> None:
+        before = MetadataItem(
+            rating_key="100",
+            guid="plex://episode/delete-review",
+            media_type="episode",
+            title="Episode",
+            grandparent_title="Example Show",
+            grandparent_rating_key="50",
+            parent_index=1,
+            index=2,
+            media=(
+                _version(
+                    "10",
+                    path="/media/tv/Example Show/Season 01/10.mkv",
+                ),
+                _version(
+                    "20",
+                    bitrate=2_000,
+                    path="/media/tv/Example Show/Season 01/20.mkv",
+                ),
+            ),
+        )
+        harness = DeleteServiceHarness(before)
+        harness.module.P.ModelSetting.values["setting_post_delete_scan_mode"] = "web"
+        harness.module.current_safety_policy = lambda: SafetyPolicy(
+            allowed_roots=("/media/tv/Example Show/Season 01",),
+            require_guid=True,
+            block_multipart=True,
+            require_allowed_roots=True,
+        )
+
+        class EpisodeGateway(_Gateway):
+            def list_sections(self):
+                return [
+                    LibrarySection(
+                        "7",
+                        "TV",
+                        "show",
+                        locations=("/media/tv",),
+                    )
+                ]
+
+        gateway = EpisodeGateway([before])
+        with self.assertRaisesRegex(RuntimeError, "부분 스캔 폴더"):
+            harness.service_for(gateway, object()).delete(
+                10, 1, 2, "DELETE 10"
+            )
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.run.deletion_attempts, 0)
+        self.assertEqual(harness.session.logs[-1].status, "blocked")
 
     def test_batch_call_reuses_global_lease_without_releasing_it_per_item(self) -> None:
         before = _item(_version("10"), _version("20", bitrate=2_000))

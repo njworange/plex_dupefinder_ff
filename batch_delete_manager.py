@@ -105,6 +105,11 @@ class BatchDeleteManager:
         self._thread_lock = threading.Lock()
         self._unloading = threading.Event()
 
+    def _wake_post_delete_scans(self) -> None:
+        wake = getattr(self.delete_service, "wake_post_delete_scans", None)
+        if callable(wake):
+            wake()
+
     @staticmethod
     def _require_enabled() -> None:
         if not _delete_enabled():
@@ -376,8 +381,11 @@ class BatchDeleteManager:
         batch.lease_key = None
         batch.deletion_lease_token = ""
         F.db.session.commit()
-        if release_deletion_lease and deletion_lease_token:
-            self.lease_service.release(deletion_lease_token)
+        try:
+            if release_deletion_lease and deletion_lease_token:
+                self.lease_service.release(deletion_lease_token)
+        finally:
+            self._wake_post_delete_scans()
 
     def _worker_should_stop(self, batch_id: int) -> Optional[Tuple[str, str, str]]:
         _expire_session()
@@ -614,6 +622,7 @@ class BatchDeleteManager:
                 F.db.session.commit()
                 if deletion_lease_token:
                     self.lease_service.release(deletion_lease_token)
+                self._wake_post_delete_scans()
                 return self._status_locked(batch_id)
 
             updated = (
@@ -694,7 +703,10 @@ class BatchDeleteManager:
                 F.db.session.commit()
                 return len(batches)
         finally:
-            self.lease_service.release(recovery_claim.token)
+            try:
+                self.lease_service.release(recovery_claim.token)
+            finally:
+                self._wake_post_delete_scans()
 
     def live_delete_keys(self) -> set:
         """Audit keys protected by a valid DB-owned batch lease."""

@@ -216,6 +216,45 @@ class FlaskFarmSetupCompatibilityTest(unittest.TestCase):
             self.assertEqual(plugin.home_module, "scan")
             self.assertEqual([module.name for module in plugin.module_list], ["setting", "scan", "history"])
 
+    def test_post_delete_scan_capability_check_is_non_destructive(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            scanner_called = []
+
+            class Scanner:
+                @classmethod
+                def scan_refresh(cls, *args: Any, **kwargs: Any) -> None:
+                    scanner_called.append((args, kwargs))
+
+            class PlexMateSetting:
+                @classmethod
+                def get(cls, key: str):
+                    return "/opt/plex/Plex Media Scanner" if key == "base_bin_scanner" else None
+
+            plex_mate = types.SimpleNamespace(
+                ModelSetting=PlexMateSetting,
+                PlexBinaryScanner=Scanner,
+            )
+
+            class PluginManager:
+                @classmethod
+                def get_plugin_instance(cls, package_name: str):
+                    self.assertEqual(package_name, "plex_mate")
+                    return plex_mate
+
+            sys.modules["framework"].F.PluginManager = PluginManager
+            harness.setup_module.P.ModelSetting.set("setting_post_delete_scan_mode", "binary")
+            setting_module = sys.modules[PACKAGE_NAME + ".mod_setting"]
+            payload = setting_module._post_delete_scan_capabilities(
+                web_connection_validated=True
+            )
+
+            self.assertEqual(scanner_called, [])
+            self.assertEqual(payload["mode"], "binary")
+            self.assertTrue(payload["binary_helper_exported"])
+            self.assertTrue(payload["binary_scanner_configured"])
+            self.assertTrue(payload["web_connection_validated"])
+            self.assertTrue(payload["selected_supported"])
+
     def test_models_are_registered_on_plugin_instance(self) -> None:
         with FlaskFarmImportHarness() as harness:
             plugin = harness.setup_module.P
@@ -224,6 +263,7 @@ class FlaskFarmSetupCompatibilityTest(unittest.TestCase):
                 "ModelDuplicateGroup": "duplicate_group",
                 "ModelMediaCandidate": "media_candidate",
                 "ModelActionLog": "action_log",
+                "ModelPostDeleteScanJob": "post_delete_scan_job",
                 "ModelBatchRun": "batch_run",
                 "ModelBatchItem": "batch_item",
                 "ModelDeletionLease": "deletion_lease",
@@ -274,19 +314,45 @@ class FlaskFarmSetupCompatibilityTest(unittest.TestCase):
                 def unload(self) -> None:
                     self.unloaded = True
 
+            class PostDeleteScanManagerStub:
+                def __init__(self) -> None:
+                    self.loaded = False
+                    self.unloaded = False
+
+                def plugin_load(self) -> int:
+                    self.loaded = True
+                    return 0
+
+                def unload(self) -> None:
+                    self.unloaded = True
+
             manager = ManagerStub()
             delete_service = DeleteServiceStub()
             batch_manager = BatchManagerStub()
+            post_scan_manager = PostDeleteScanManagerStub()
             scan_module.manager = manager
             scan_module.delete_service = delete_service
             scan_module.batch_manager = batch_manager
+            scan_module.post_delete_scan_manager = post_scan_manager
             scan_module.plugin_load()
             scan_module.plugin_unload()
             self.assertTrue(manager.recovered)
             self.assertFalse(delete_service.recovered)
             self.assertTrue(batch_manager.recovered)
+            self.assertTrue(post_scan_manager.loaded)
             self.assertTrue(manager.unloaded)
             self.assertTrue(batch_manager.unloaded)
+            self.assertTrue(post_scan_manager.unloaded)
+
+    def test_post_scan_worker_uses_full_delete_recovery_callback(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            scan_module = harness.setup_module.P.module_list[1]
+            callback = (
+                scan_module.post_delete_scan_manager.deletion_recovery_callback
+            )
+            self.assertIsNotNone(callback)
+            self.assertIs(callback.__self__, scan_module.batch_manager)
+            self.assertEqual(callback.__func__.__name__, "recover_interrupted")
 
     def test_action_log_supports_summary_and_detail_serialization(self) -> None:
         with FlaskFarmImportHarness() as harness:
@@ -338,6 +404,11 @@ class FlaskFarmStaticContractTest(unittest.TestCase):
             (PROJECT_ROOT / "__init__.py").read_text(encoding="utf-8"),
             re.MULTILINE,
         )
+        readme = re.search(
+            r'^현재 버전:\s*`([^`]+)`',
+            (PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
         gateway = re.search(
             r'^\s*VERSION\s*=\s*["\']([^"\']+)',
             (PROJECT_ROOT / "services" / "plex_gateway.py").read_text(encoding="utf-8"),
@@ -345,8 +416,29 @@ class FlaskFarmStaticContractTest(unittest.TestCase):
         )
         self.assertIsNotNone(manifest)
         self.assertIsNotNone(package)
+        self.assertIsNotNone(readme)
         self.assertIsNotNone(gateway)
-        self.assertEqual({manifest.group(1), package.group(1), gateway.group(1)}, {"1.1.0"})
+        self.assertEqual(
+            {manifest.group(1), package.group(1), readme.group(1), gateway.group(1)},
+            {"1.2.0"},
+        )
+
+    def test_post_delete_scan_mode_normalization_is_fail_closed(self) -> None:
+        with FlaskFarmImportHarness():
+            module = sys.modules[PACKAGE_NAME + ".mod_setting"]
+            normalize = module._normalize_post_delete_scan_mode
+            cases = {
+                None: "none",
+                "": "none",
+                "none": "none",
+                " Binary ": "binary",
+                "WEB": "web",
+                "full": "none",
+                "../../../scan": "none",
+            }
+            for raw, expected in cases.items():
+                with self.subTest(raw=raw):
+                    self.assertEqual(normalize(raw), expected)
 
     def test_menu_routes_have_modules_and_templates(self) -> None:
         with FlaskFarmImportHarness() as harness:

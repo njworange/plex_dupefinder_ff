@@ -118,6 +118,15 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(PlexGatewayError):
             PlexGateway(self.connection(), session=session).validate_identity("machine-1")
 
+    def test_identity_mismatch_can_be_classified_by_caller_without_retry(self):
+        session = FakeSession(
+            [FakeResponse({"MediaContainer": {"machineIdentifier": "other"}})]
+        )
+        identity = PlexGateway(self.connection(), session=session).validate_identity(
+            "machine-1", require_match=False
+        )
+        self.assertEqual(identity.machine_id, "other")
+
     def test_duplicate_search_paginates_and_deduplicates_keys(self):
         session = FakeSession(
             [
@@ -159,6 +168,63 @@ class GatewayTests(unittest.TestCase):
             gateway.get_metadata("../identity")
         with self.assertRaises(PlexGatewayError):
             gateway.delete_media("100", "x")
+        self.assertEqual(session.calls, [])
+
+    def test_partial_refresh_uses_section_path_and_keeps_token_in_header(self):
+        session = FakeSession([FakeResponse(status=200)])
+        gateway = PlexGateway(self.connection(), session=session)
+
+        status = gateway.refresh_section_path("7", "/library/tv/Example Show")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(call["method"], "GET")
+        self.assertTrue(call["url"].endswith("/library/sections/7/refresh"))
+        self.assertEqual(call["params"], {"path": "/library/tv/Example Show"})
+        self.assertEqual(session.headers["X-Plex-Token"], "secret-token")
+        self.assertNotIn("X-Plex-Token", call["params"])
+        self.assertNotIn("secret-token", call["url"])
+
+    def test_section_locations_come_from_the_selected_live_library(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "MediaContainer": {
+                            "Directory": [
+                                {
+                                    "key": "7",
+                                    "title": "Shows",
+                                    "type": "show",
+                                    "Location": [
+                                        {"id": "1", "path": "/library/tv"},
+                                        {"id": "2", "path": "/archive/tv"},
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                )
+            ]
+        )
+
+        locations = PlexGateway(self.connection(), session=session).section_locations("7")
+
+        self.assertEqual(locations, ["/library/tv", "/archive/tv"])
+        self.assertEqual(session.calls[0]["method"], "GET")
+        self.assertTrue(session.calls[0]["url"].endswith("/library/sections"))
+        self.assertNotIn("secret-token", session.calls[0]["url"])
+
+    def test_partial_refresh_rejects_invalid_section_or_path_before_request(self):
+        session = FakeSession([])
+        gateway = PlexGateway(self.connection(), session=session)
+
+        for section, path in (("../7", "/library/tv"), ("7", ""), ("7", "relative")):
+            with self.subTest(section=section, path=path):
+                with self.assertRaises(PlexGatewayError):
+                    gateway.refresh_section_path(section, path)
+
         self.assertEqual(session.calls, [])
 
 

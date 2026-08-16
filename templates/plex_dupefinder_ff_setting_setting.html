@@ -49,6 +49,7 @@
       {{ macros.setting_input_int('setting_batch_max_items', '배치 계획 최대 항목 수', value=arg.get('setting_batch_max_items', '10'), min=1, max=100, desc='1~100. 실제 처리 수는 이 값과 스캔 1회당 최대 삭제 수 중 더 작은 한도를 따릅니다.') }}
       {{ macros.setting_input_textarea('setting_allowed_roots', '삭제 허용 미디어 루트', value=arg.get('setting_allowed_roots', ''), row='6', desc=['한 줄에 하나씩 Plex가 반환하는 절대 경로를 입력합니다.', '비어 있거나 후보 경로가 루트 밖이면 삭제를 차단합니다.']) }}
       {{ macros.setting_input_int('setting_max_delete_per_run', '스캔 1회당 전역 삭제 시도 한도', value=arg.get('setting_max_delete_per_run', '1'), min=1, max=100, desc='개별 삭제와 배치 삭제 시도를 합산합니다. 실패하거나 결과가 불명확한 시도도 한도를 소비합니다.') }}
+      {{ macros.setting_select('setting_post_delete_scan_mode', '삭제 성공 후 Plex 부분 스캔 방식', [['none', '사용 안 함'], ['binary', 'Plex Media Scanner (Binary)'], ['web', 'Plex Web API']], value=arg.get('setting_post_delete_scan_mode', 'none'), desc=['기본값은 사용 안 함입니다. Plex DELETE와 사후 검증이 성공한 뒤에만 영향 경로를 best-effort로 갱신합니다.', 'Binary/Web 선택 시 정확한 library section과 영화 폴더 또는 TV 쇼 루트를 DELETE 전에 필수 검증하며, 만들 수 없으면 삭제를 차단합니다.', 'Binary는 plex_mate가 Plex Media Scanner와 Plex 파일 경로를 사용할 수 있어야 합니다.', 'Web은 plex_mate 연결정보, 라이브러리 section ID 및 Plex 서버에서 보이는 경로가 필요합니다.', '이 요청은 DupeFinder 중복 재검사가 아니며 처리 그룹의 rescan_required 잠금을 해제하지 않습니다.']) }}
       {{ macros.setting_checkbox('setting_require_guid', 'GUID 필수', value=arg.get('setting_require_guid', 'True')) }}
       {{ macros.setting_checkbox('setting_block_multipart', '멀티파트 삭제 차단', value=arg.get('setting_block_multipart', 'True')) }}
     {{ macros.m_tab_content_end() }}
@@ -61,10 +62,17 @@
 var packageName = {{ arg['package_name']|tojson }};
 var wasDeleteEnabled = {{ 'true' if arg.get('setting_delete_enabled', 'False') == 'True' else 'false' }};
 var wasBatchDeleteEnabled = {{ 'true' if arg.get('setting_batch_delete_enabled', 'False') == 'True' else 'false' }};
+var postDeleteScanModes = ['none', 'binary', 'web'];
 
 function globalSettingSaveBefore() {
   var deleteEnabled = $('#setting_delete_enabled').is(':checked');
   var batchEnabled = $('#setting_batch_delete_enabled').is(':checked');
+  var scanMode = String($('#setting_post_delete_scan_mode').val() || '').trim().toLowerCase();
+  if (postDeleteScanModes.indexOf(scanMode) < 0) {
+    window.alert('삭제 후 Plex 부분 스캔 방식이 올바르지 않습니다. 사용 안 함, Binary, Web 중 하나를 선택하세요.');
+    return false;
+  }
+  $('#setting_post_delete_scan_mode').val(scanMode);
   if (batchEnabled && !deleteEnabled) {
     window.alert('일괄 승인형 반자동 삭제를 사용하려면 그룹별 수동 삭제도 활성화해야 합니다.');
     return false;
@@ -79,13 +87,23 @@ function globalSettingSaveBefore() {
 }
 
 function renderConnection(data) {
+  var scan = data.post_delete_scan || {};
+  var modeLabels = {none: '사용 안 함', binary: 'Binary', web: 'Web'};
+  var reportedMode = String(scan.mode || '');
+  var mode = postDeleteScanModes.indexOf(reportedMode) >= 0 ? reportedMode : 'none';
+  var selectedSupported = scan.selected_supported === true;
   var html = '<div class="pdff-grid">' +
     '<div><span class="pdff-kv-label">Plex URL</span>' + PDFF.esc(data.base_url || '-') + '</div>' +
     '<div><span class="pdff-kv-label">PMS 버전</span>' + PDFF.esc(data.server_version || '-') + '</div>' +
     '<div><span class="pdff-kv-label">설정 Machine</span><span class="pdff-code">' + PDFF.esc(data.configured_machine || '-') + '</span></div>' +
     '<div><span class="pdff-kv-label">서버 Machine</span><span class="pdff-code">' + PDFF.esc(data.server_machine || '-') + '</span></div>' +
+    '<div><span class="pdff-kv-label">사후 부분 스캔</span>' + PDFF.esc(modeLabels[mode]) + ' ' + PDFF.badge(selectedSupported ? 'supported' : 'blocked') + '</div>' +
+    '<div><span class="pdff-kv-label">비파괴 capability 확인</span>Web 연결 ' + PDFF.esc(scan.web_connection_validated === true ? '확인' : '미확인') + ' · Binary helper ' + PDFF.esc(scan.binary_helper_exported === true ? '확인' : '미확인') + ' · Scanner 설정 ' + PDFF.esc(scan.binary_scanner_configured === true ? '확인' : '미확인') + '</div>' +
     '</div>';
   if (!data.machine_match) html += '<div class="pdff-warning mt-3">Machine ID가 비어 있거나 일치하지 않습니다. 읽기 스캔은 가능할 수 있지만 삭제는 차단됩니다.</div>';
+  if (mode === 'binary') html += '<div class="pdff-warning mt-3">Binary 진단은 helper와 Scanner 설정 문자열만 확인합니다. 실행파일 존재·권한과 Plex 파일 경로 접근은 시험하지 않습니다. 정확한 section과 대상 폴더를 DELETE 전에 만들 수 없으면 삭제가 차단됩니다. Scanner 종료 여부가 불명확하면 자동 재실행을 차단하고 다른 삭제·부분 스캔을 1시간 격리하므로 작업 이력과 실제 Scanner 종료 상태를 확인하세요.</div>';
+  if (mode === 'web') html += '<div class="pdff-warning mt-3">Web 진단은 header 인증 Plex 연결까지만 확인합니다. 정확한 library section ID와 Plex 서버 기준 대상 경로를 DELETE 전에 만들 수 없으면 삭제가 차단됩니다.</div>';
+  if (!selectedSupported) html += '<div class="pdff-danger mt-3">선택한 사후 스캔 방식의 최소 요구조건을 확인하지 못했습니다. 삭제 자체는 재시도하지 않으며, 사후 스캔 실패는 삭제 성공 판정을 되돌리지 않습니다.</div>';
   $('#connection_status').removeClass('pdff-empty').html(html);
 }
 

@@ -35,6 +35,7 @@ class LibrarySection:
     key: str
     title: str
     section_type: str
+    locations: Tuple[str, ...] = ()
 
     def as_dict(self) -> Dict[str, str]:
         return {"key": self.key, "title": self.title, "type": self.section_type}

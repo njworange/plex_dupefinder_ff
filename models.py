@@ -431,6 +431,181 @@ class ModelActionLog(ModelBase):
         return {"items": items, "total": total}
 
 
+class ModelPostDeleteScanJob(ModelBase):
+    """Durable, non-destructive scan work created by a confirmed DELETE.
+
+    ``dedupe_key`` is scoped to an action for manual deletes and to a batch for
+    batch deletes.  The latter lets several confirmed deletes in the same
+    folder share one physical scan while retaining every ActionLog id in
+    ``action_ids_json``.  ``lease_key`` is nullable/unique so SQLite and MySQL
+    both enforce a single active scan worker across FlaskFarm processes.
+    """
+
+    P = P
+    __tablename__ = "post_delete_scan_job"
+    __table_args__ = {"mysql_collate": "utf8_general_ci"}
+    __bind_key__ = P.package_name
+
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    started_at = db.Column(db.DateTime)
+    finished_at = db.Column(db.DateTime)
+    action_log_id = db.Column(db.Integer, nullable=False, index=True)
+    action_ids_json = db.Column(db.Text, default="[]", nullable=False)
+    batch_run_id = db.Column(db.Integer, index=True)
+    run_id = db.Column(db.Integer, nullable=False, index=True)
+    group_id = db.Column(db.Integer, nullable=False, index=True)
+    candidate_id = db.Column(db.Integer, nullable=False)
+    server_machine_id = db.Column(db.String(128), nullable=False)
+    mode = db.Column(db.String(16), nullable=False)
+    section_key = db.Column(db.String(32), nullable=False)
+    media_type = db.Column(db.String(32), nullable=False)
+    target_path = db.Column(db.Text, nullable=False)
+    target_key = db.Column(db.String(64), nullable=False, index=True)
+    dedupe_key = db.Column(db.String(64), nullable=False, unique=True)
+    status = db.Column(db.String(32), nullable=False, index=True)
+    attempts = db.Column(db.Integer, default=0, nullable=False)
+    max_attempts = db.Column(db.Integer, default=3, nullable=False)
+    next_attempt_at = db.Column(db.DateTime, nullable=False, index=True)
+    response_status = db.Column(db.Integer)
+    last_error = db.Column(db.Text, default="")
+    # Cross-process worker internals.  None of these values is serialized.
+    lease_key = db.Column(db.String(32), unique=True, nullable=True)
+    worker_token = db.Column(db.String(128), default="", nullable=False)
+    lease_expires_at = db.Column(db.DateTime)
+
+    def as_api(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "created_at": _iso(self.created_at),
+            "updated_at": _iso(self.updated_at),
+            "started_at": _iso(self.started_at),
+            "finished_at": _iso(self.finished_at),
+            "action_id": self.action_log_id,
+            "action_ids": _json_load(self.action_ids_json, []),
+            "batch_id": self.batch_run_id,
+            "run_id": self.run_id,
+            "group_id": self.group_id,
+            "candidate_id": self.candidate_id,
+            "mode": self.mode,
+            "section_key": self.section_key,
+            "media_type": self.media_type,
+            "target_path": self.target_path,
+            "status": self.status,
+            "attempts": self.attempts or 0,
+            "max_attempts": self.max_attempts or 0,
+            "next_attempt_at": _iso(self.next_attempt_at),
+            "response_status": self.response_status,
+            "last_error": self.last_error or "",
+        }
+
+    @classmethod
+    def get(cls, job_id: Any) -> Optional["ModelPostDeleteScanJob"]:
+        return db.session.query(cls).filter_by(id=int(job_id)).first()
+
+    @classmethod
+    def by_dedupe_key(cls, dedupe_key: str) -> Optional["ModelPostDeleteScanJob"]:
+        return db.session.query(cls).filter_by(dedupe_key=str(dedupe_key)).first()
+
+    @classmethod
+    def recent(cls, limit: int = 100) -> List["ModelPostDeleteScanJob"]:
+        return (
+            db.session.query(cls)
+            .order_by(cls.id.desc())
+            .limit(max(1, min(int(limit), 500)))
+            .all()
+        )
+
+    @classmethod
+    def by_batch(cls, batch_id: Any) -> List["ModelPostDeleteScanJob"]:
+        return (
+            db.session.query(cls)
+            .filter_by(batch_run_id=int(batch_id))
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+    @classmethod
+    def eligible_next(cls, now: datetime) -> Optional["ModelPostDeleteScanJob"]:
+        return (
+            db.session.query(cls)
+            .filter(
+                cls.status.in_(["queued", "retry_wait"]),
+                cls.next_attempt_at <= now,
+            )
+            .order_by(cls.id.asc())
+            .first()
+        )
+
+    @classmethod
+    def claim_for_worker(
+        cls, job_id: Any, worker_token: str, now: datetime, lease_expires_at: datetime
+    ) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(
+                cls.id == int(job_id),
+                cls.status.in_(["queued", "retry_wait"]),
+                cls.next_attempt_at <= now,
+            )
+            .update(
+                {
+                    cls.status: "running",
+                    cls.started_at: now,
+                    cls.updated_at: now,
+                    cls.attempts: cls.attempts + 1,
+                    cls.lease_key: "global",
+                    cls.worker_token: str(worker_token),
+                    cls.lease_expires_at: lease_expires_at,
+                    cls.last_error: "",
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+    @classmethod
+    def stale_running(cls, now: datetime) -> List["ModelPostDeleteScanJob"]:
+        return (
+            db.session.query(cls)
+            .filter(
+                cls.status == "running",
+                cls.lease_expires_at < now,
+            )
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+    @classmethod
+    def recover_stale_one(cls, job_id: Any, worker_token: str, now: datetime) -> bool:
+        job = cls.get(job_id)
+        if job is None:
+            return False
+        terminal = int(job.attempts or 0) >= int(job.max_attempts or 3)
+        values = {
+            cls.status: "failed" if terminal else "retry_wait",
+            cls.updated_at: now,
+            cls.finished_at: now if terminal else None,
+            cls.next_attempt_at: now,
+            cls.last_error: "작업 worker 응답이 없어 만료 복구되었습니다.",
+            cls.lease_key: None,
+            cls.worker_token: "",
+            cls.lease_expires_at: None,
+        }
+        updated = (
+            db.session.query(cls)
+            .filter(
+                cls.id == int(job_id),
+                cls.status == "running",
+                cls.worker_token == str(worker_token),
+                cls.lease_expires_at < now,
+            )
+            .update(values, synchronize_session=False)
+        )
+        return updated == 1
+
+
 class ModelBatchRun(ModelBase):
     P = P
     __tablename__ = "batch_run"
@@ -761,6 +936,35 @@ class ModelDeletionLease(ModelBase):
                     cls.acquired_at: now,
                     cls.heartbeat_at: now,
                     cls.expires_at: expires_at,
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+    @classmethod
+    def clear_expired_owner(
+        cls, owner_kind: str, owner_ref: str, now: datetime
+    ) -> bool:
+        """Release only the named expired owner; never steal a live lease."""
+
+        updated = (
+            db.session.query(cls)
+            .filter(
+                cls.id == 1,
+                cls.owner_token != "",
+                cls.owner_kind == str(owner_kind),
+                cls.owner_ref == str(owner_ref),
+                cls.expires_at < now,
+            )
+            .update(
+                {
+                    cls.owner_token: "",
+                    cls.owner_kind: "",
+                    cls.owner_ref: "",
+                    cls.acquired_at: None,
+                    cls.heartbeat_at: None,
+                    cls.expires_at: None,
                 },
                 synchronize_session=False,
             )

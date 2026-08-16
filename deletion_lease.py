@@ -122,8 +122,14 @@ class DeletionLeaseService:
                     "삭제 전역 잠금을 확보할 수 없습니다."
                 ) from None
 
-    def renew(self, token: str, owner_kind: str, owner_ref: str) -> None:
-        now = datetime.now()
+    def _renew_until(
+        self,
+        token: str,
+        owner_kind: str,
+        owner_ref: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> None:
         with F.app.app_context():
             try:
                 if not ModelDeletionLease.renew(
@@ -131,7 +137,7 @@ class DeletionLeaseService:
                     str(owner_kind),
                     str(owner_ref),
                     now,
-                    _expiry(now),
+                    expires_at,
                 ):
                     _rollback_quietly()
                     raise DeletionLeaseLost(
@@ -149,6 +155,16 @@ class DeletionLeaseService:
                 raise DeletionLeaseLost(
                     "삭제 전역 잠금 확인에 실패했습니다. 작업을 중단합니다."
                 ) from None
+
+    def renew(self, token: str, owner_kind: str, owner_ref: str) -> None:
+        now = datetime.now()
+        self._renew_until(
+            token,
+            owner_kind,
+            owner_ref,
+            now,
+            _expiry(now),
+        )
 
     def release(self, token: str) -> bool:
         if not token:
@@ -255,4 +271,43 @@ class DeletionLeaseService:
                 _rollback_quietly()
                 raise DeletionLeaseError(
                     "삭제 전역 잠금 상태를 확인할 수 없습니다."
+                ) from None
+
+    def clear_expired_owner(self, owner_kind: str, owner_ref: str) -> bool:
+        """Clear one exact expired non-delete owner with a DB CAS."""
+
+        now = datetime.now()
+        with F.app.app_context():
+            try:
+                cleared = ModelDeletionLease.clear_expired_owner(
+                    str(owner_kind), str(owner_ref), now
+                )
+                F.db.session.commit()
+                return cleared
+            except Exception:
+                _rollback_quietly()
+                raise DeletionLeaseError(
+                    "만료된 전역 잠금을 복구할 수 없습니다."
+                ) from None
+
+    def expired_owner(self) -> Optional[tuple]:
+        """Return only kind/ref for an expired lease; never expose its token."""
+
+        self._ensure_row()
+        now = datetime.now()
+        with F.app.app_context():
+            try:
+                lease = ModelDeletionLease.get_singleton()
+                if (
+                    lease is None
+                    or not lease.owner_token
+                    or lease.expires_at is None
+                    or lease.expires_at >= now
+                ):
+                    return None
+                return (str(lease.owner_kind or ""), str(lease.owner_ref or ""))
+            except Exception:
+                _rollback_quietly()
+                raise DeletionLeaseError(
+                    "만료된 전역 잠금 상태를 확인할 수 없습니다."
                 ) from None
