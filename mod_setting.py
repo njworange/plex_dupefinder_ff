@@ -32,6 +32,8 @@ class ModuleSetting(PluginModuleBase):
     db_default = {
         "setting_db_version": "1",
         "setting_delete_enabled": "False",
+        "setting_batch_delete_enabled": "False",
+        "setting_batch_max_items": "10",
         "setting_allowed_roots": "",
         "setting_max_delete_per_run": "1",
         "setting_request_timeout": "20",

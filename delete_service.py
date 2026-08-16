@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from framework import F
 
+from .deletion_lease import DeletionLeaseLost, DeletionLeaseService
 from .models import ModelActionLog, ModelDuplicateGroup, ModelMediaCandidate, ModelScanRun
+from .path_conflicts import group_has_cross_path_conflict
 from .scan_manager import current_safety_policy
 from .services.plex_gateway import PlexDeleteOutcomeUnknown, PlexGateway
 from .services.plex_mate_provider import PlexMateProvider
@@ -40,6 +42,7 @@ def _timeout() -> int:
 class DeleteService:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self.lease_service = DeletionLeaseService()
 
     def _load(
         self, group_id: int, candidate_id: int, keep_candidate_id: int
@@ -118,12 +121,25 @@ class DeleteService:
         group.safety_flags_json = _json([flag])
         F.db.session.commit()
 
-    def recover_interrupted(self) -> Dict[str, int]:
+    def recover_interrupted(
+        self, exclude_delete_keys: Optional[Set[Tuple[int, int, int]]] = None
+    ) -> Dict[str, int]:
         """Conservatively recover audit rows left mid-delete by a process restart."""
         counts = {"blocked": 0, "unknown": 0}
+        excluded = exclude_delete_keys or set()
         with self._lock, F.app.app_context():
             logs = ModelActionLog.interrupted()
             for log in logs:
+                key = (
+                    int(log.run_id or 0),
+                    int(log.group_id or 0),
+                    int(log.candidate_id or 0),
+                )
+                if key in excluded:
+                    # A prior plugin instance can still be completing its fresh
+                    # read/delete/post-read sequence during an in-process reload.
+                    # Its live batch worker owns this audit row; do not race it.
+                    continue
                 previous = log.status
                 if previous == "deleting":
                     log.status = "unknown"
@@ -152,9 +168,20 @@ class DeleteService:
         candidate_id: int,
         keep_candidate_id: int,
         confirmation: str,
+        lease_owner_token: str = "",
+        lease_owner_kind: str = "",
+        lease_owner_ref: str = "",
     ) -> Dict[str, Any]:
         with self._lock:
-            return self._delete_locked(group_id, candidate_id, keep_candidate_id, confirmation)
+            return self._delete_locked(
+                group_id,
+                candidate_id,
+                keep_candidate_id,
+                confirmation,
+                lease_owner_token,
+                lease_owner_kind,
+                lease_owner_ref,
+            )
 
     def _delete_locked(
         self,
@@ -162,14 +189,53 @@ class DeleteService:
         candidate_id: int,
         keep_candidate_id: int,
         confirmation: str,
+        lease_owner_token: str = "",
+        lease_owner_kind: str = "",
+        lease_owner_ref: str = "",
     ) -> Dict[str, Any]:
         if not _delete_enabled():
             raise RuntimeError("설정에서 수동 삭제를 먼저 활성화해야 합니다.")
 
+        owns_lease = not bool(lease_owner_token)
+        owner_kind = lease_owner_kind or "manual"
+        owner_ref = lease_owner_ref or "%s:%s:%s" % (
+            group_id,
+            candidate_id,
+            keep_candidate_id,
+        )
+        if owns_lease:
+            lease_owner_token = self.lease_service.acquire(owner_kind, owner_ref)
+        else:
+            self.lease_service.renew(lease_owner_token, owner_kind, owner_ref)
+        try:
+            return self._delete_transaction(
+                group_id,
+                candidate_id,
+                keep_candidate_id,
+                confirmation,
+                lease_owner_token,
+                owner_kind,
+                owner_ref,
+            )
+        finally:
+            if owns_lease:
+                self.lease_service.release(lease_owner_token)
+
+    def _delete_transaction(
+        self,
+        group_id: int,
+        candidate_id: int,
+        keep_candidate_id: int,
+        confirmation: str,
+        lease_owner_token: str,
+        lease_owner_kind: str,
+        lease_owner_ref: str,
+    ) -> Dict[str, Any]:
+
         with F.app.app_context():
             run, group, candidate, keep = self._load(group_id, candidate_id, keep_candidate_id)
             expected_confirmation = "DELETE %s" % candidate.media_id
-            if confirmation.strip() != expected_confirmation:
+            if str(confirmation) != expected_confirmation:
                 raise ValueError("확인 문구가 일치하지 않습니다: %s" % expected_confirmation)
             if not group.safe_to_delete or group.resolution_status != "open":
                 raise RuntimeError("이 그룹은 안전 삭제 조건을 충족하지 않습니다. 다시 스캔하세요.")
@@ -180,6 +246,10 @@ class DeleteService:
 
             log = self._claim_group_and_create_log(run, group, candidate, keep)
             try:
+                if group_has_cross_path_conflict(run.id, group.id):
+                    raise RuntimeError(
+                        "다른 Plex metadata 그룹과 Part 파일 경로가 겹쳐 삭제를 차단했습니다."
+                    )
                 connection = PlexMateProvider().resolve(require_machine_id=True)
                 gateway = PlexGateway(connection, timeout=(5, _timeout()))
                 identity = gateway.validate_identity(connection.machine_id, require_match=True)
@@ -205,6 +275,9 @@ class DeleteService:
                 if len(current_ids) < 2:
                     raise RuntimeError("마지막 Media 버전은 삭제할 수 없습니다.")
 
+                self.lease_service.renew(
+                    lease_owner_token, lease_owner_kind, lease_owner_ref
+                )
                 self._reserve_attempt_and_mark_deleting(run, log, _json(current.as_dict()))
 
                 response_status: Optional[int] = None
@@ -214,6 +287,9 @@ class DeleteService:
                 except PlexDeleteOutcomeUnknown:
                     outcome_unknown = True
 
+                self.lease_service.renew(
+                    lease_owner_token, lease_owner_kind, lease_owner_ref
+                )
                 try:
                     after = gateway.get_metadata(group.rating_key)
                 except Exception as verify_exc:
@@ -300,6 +376,9 @@ class DeleteService:
                     )
                     raise RuntimeError(message)
 
+                self.lease_service.renew(
+                    lease_owner_token, lease_owner_kind, lease_owner_ref
+                )
                 candidate.deleted = True
                 candidate.deleted_at = datetime.now()
                 group.safe_to_delete = False
@@ -318,6 +397,11 @@ class DeleteService:
                     "response_status": response_status,
                     "verification": "confirmed",
                 }
+            except DeletionLeaseLost:
+                # The recovery CAS owner is now solely responsible for turning
+                # validating/deleting into blocked/unknown. Do not race it.
+                F.db.session.rollback()
+                raise
             except Exception as exc:
                 F.db.session.rollback()
                 log = F.db.session.query(ModelActionLog).filter_by(id=log.id).first()

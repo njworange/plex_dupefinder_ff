@@ -6,6 +6,8 @@
   <h3 class="pdff-title">새 중복 검사</h3>
   <div class="pdff-toolbar">
     <button id="load_libraries_btn" type="button" class="btn btn-sm btn-outline-primary">라이브러리 불러오기</button>
+    <button id="select_all_libraries_btn" type="button" class="btn btn-sm btn-outline-secondary" disabled>라이브러리 전체 선택</button>
+    <button id="clear_all_libraries_btn" type="button" class="btn btn-sm btn-outline-secondary" disabled>전체 선택 해제</button>
     <button id="start_scan_btn" type="button" class="btn btn-sm btn-primary" disabled>선택 라이브러리 스캔</button>
   </div>
   <div id="library_list" class="pdff-empty">라이브러리를 불러오세요.</div>
@@ -34,17 +36,44 @@ var savedSectionIds = [];
 try { savedSectionIds = JSON.parse({{ arg.get('scan_last_section_ids', '[]')|tojson }}); } catch (e) { savedSectionIds = []; }
 var currentRunId = null;
 var pollHandle = null;
+var librariesLoaded = false;
+var librariesLoading = false;
+var scanStarting = false;
 
 function selectedIds() {
   return Array.prototype.slice.call(document.querySelectorAll('.pdff-section:checked')).map(function (node) { return node.value; });
 }
 
+function updateLibraryButtons() {
+  var count = document.querySelectorAll('.pdff-section').length;
+  var selected = selectedIds().length;
+  $('#load_libraries_btn').prop('disabled', librariesLoading);
+  $('#select_all_libraries_btn').prop('disabled', !librariesLoaded || librariesLoading || count === 0 || selected === count);
+  $('#clear_all_libraries_btn').prop('disabled', !librariesLoaded || librariesLoading || selected === 0);
+  $('#start_scan_btn').prop('disabled', !librariesLoaded || librariesLoading || scanStarting || selected === 0);
+}
+
 function loadLibraries() {
+  librariesLoading = true;
+  librariesLoaded = false;
+  $('#library_list').addClass('pdff-empty').text('라이브러리를 불러오는 중입니다…');
+  updateLibraryButtons();
   PDFF.request(packageName, 'scan', 'libraries', {}, 'GET', function (ret) {
-    if (ret.ret !== 'success') return;
+    librariesLoading = false;
+    if (ret.ret !== 'success') {
+      librariesLoaded = false;
+      $('#library_list').addClass('pdff-empty').text('라이브러리를 불러오지 못했습니다. 다시 시도하세요.');
+      updateLibraryButtons();
+      return;
+    }
     var target = $('#library_list');
     var items = (ret.data && ret.data.sections) || [];
-    if (!items.length) { target.addClass('pdff-empty').text('영화 또는 TV 라이브러리가 없습니다.'); return; }
+    librariesLoaded = true;
+    if (!items.length) {
+      target.addClass('pdff-empty').text('영화 또는 TV 라이브러리가 없습니다.');
+      updateLibraryButtons();
+      return;
+    }
     var html = '';
     if (!ret.data.machine_configured) html += '<div class="pdff-warning mb-2">plex_mate Machine ID가 비어 있어 삭제는 차단됩니다.</div>';
     items.forEach(function (item) {
@@ -52,7 +81,7 @@ function loadLibraries() {
       html += '<label class="pdff-library"><input class="pdff-section" type="checkbox" value="' + PDFF.esc(item.key) + '"' + checked + '> <span class="pdff-badge pdff-secondary">' + PDFF.esc(item.type) + '</span> <strong>' + PDFF.esc(item.title) + '</strong><span class="pdff-muted">ID ' + PDFF.esc(item.key) + '</span></label>';
     });
     target.removeClass('pdff-empty').html(html);
-    $('#start_scan_btn').prop('disabled', selectedIds().length === 0);
+    updateLibraryButtons();
   });
 }
 
@@ -62,6 +91,7 @@ function runCard(run, current) {
     '<div><span class="pdff-kv-label">Run</span><strong>#' + PDFF.esc(run.id) + '</strong> ' + PDFF.badge(run.status) + '</div>' +
     '<div><span class="pdff-kv-label">진행률</span>' + PDFF.esc(run.progress) + '%</div>' +
     '<div><span class="pdff-kv-label">그룹</span>' + PDFF.esc(run.total_groups) + ' (안전 ' + PDFF.esc(run.safe_groups) + ' / 차단 ' + PDFF.esc(run.unsafe_groups) + ')</div>' +
+    '<div><span class="pdff-kv-label">삭제</span>시도 ' + PDFF.esc(run.deletion_attempts || 0) + ' / 성공 ' + PDFF.esc(run.successful_deletions || 0) + '</div>' +
     '<div><span class="pdff-kv-label">시작</span>' + PDFF.esc(PDFF.date(run.started_at || run.created_at)) + '</div>' +
     '</div><div class="pdff-progress mt-2"><div style="width:' + Math.max(0, Math.min(100, Number(run.progress || 0))) + '%"></div></div>' +
     '<div class="pdff-muted mt-2">' + PDFF.esc(run.status_message || '') + '</div>';
@@ -104,13 +134,23 @@ function loadRuns() {
 }
 
 $('#load_libraries_btn').on('click', loadLibraries);
-$(document).on('change', '.pdff-section', function () { $('#start_scan_btn').prop('disabled', selectedIds().length === 0); });
+$('#select_all_libraries_btn').on('click', function () {
+  $('.pdff-section').prop('checked', true);
+  updateLibraryButtons();
+});
+$('#clear_all_libraries_btn').on('click', function () {
+  $('.pdff-section').prop('checked', false);
+  updateLibraryButtons();
+});
+$(document).on('change', '.pdff-section', updateLibraryButtons);
 $('#start_scan_btn').on('click', function () {
   var ids = selectedIds();
   if (!ids.length) return;
-  $(this).prop('disabled', true);
+  scanStarting = true;
+  updateLibraryButtons();
   PDFF.request(packageName, 'scan', 'start', {section_ids: JSON.stringify(ids), csrf_token: csrfToken}, 'POST', function (ret) {
-    $('#start_scan_btn').prop('disabled', false);
+    scanStarting = false;
+    updateLibraryButtons();
     if (ret.ret === 'success') { savedSectionIds = ids; renderCurrent(ret.data); loadRuns(); }
   });
 });

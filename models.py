@@ -198,6 +198,34 @@ class ModelDuplicateGroup(ModelBase):
         )
 
     @classmethod
+    def safe_open_by_run(cls, run_id: Any) -> List["ModelDuplicateGroup"]:
+        """Return batch-plan candidates in a deterministic order.
+
+        Candidate-count and recommendation checks intentionally happen against
+        active ``media_candidate`` rows in the batch planner, rather than trusting
+        the denormalized snapshot columns on this table.
+        """
+        return (
+            db.session.query(cls)
+            .filter_by(
+                run_id=int(run_id),
+                safe_to_delete=True,
+                resolution_status="open",
+            )
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+    @classmethod
+    def all_by_run(cls, run_id: Any) -> List["ModelDuplicateGroup"]:
+        return (
+            db.session.query(cls)
+            .filter_by(run_id=int(run_id))
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+    @classmethod
     def search(
         cls,
         run_id: Any,
@@ -353,6 +381,34 @@ class ModelActionLog(ModelBase):
         )
 
     @classmethod
+    def active_delete(cls) -> Optional["ModelActionLog"]:
+        return (
+            db.session.query(cls)
+            .filter(
+                cls.action == "delete_media",
+                cls.status.in_(["validating", "deleting"]),
+            )
+            .order_by(cls.id.asc())
+            .first()
+        )
+
+    @classmethod
+    def latest_for_delete(
+        cls, run_id: Any, group_id: Any, candidate_id: Any
+    ) -> Optional["ModelActionLog"]:
+        return (
+            db.session.query(cls)
+            .filter_by(
+                run_id=int(run_id),
+                group_id=int(group_id),
+                candidate_id=int(candidate_id),
+                action="delete_media",
+            )
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    @classmethod
     def search(
         cls,
         page: int = 1,
@@ -373,3 +429,340 @@ class ModelActionLog(ModelBase):
             .all()
         )
         return {"items": items, "total": total}
+
+
+class ModelBatchRun(ModelBase):
+    P = P
+    __tablename__ = "batch_run"
+    __table_args__ = {"mysql_collate": "utf8_general_ci"}
+    __bind_key__ = P.package_name
+
+    id = db.Column(db.Integer, primary_key=True)
+    scan_run_id = db.Column(db.Integer, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    approved_at = db.Column(db.DateTime)
+    started_at = db.Column(db.DateTime)
+    finished_at = db.Column(db.DateTime)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(32), nullable=False, index=True)
+    # A nullable unique value provides a cross-process/global batch lease on
+    # both SQLite and MySQL. Preview rows keep NULL; only an approved batch owns
+    # the literal ``global`` value until it reaches a terminal state.
+    lease_key = db.Column(db.String(32), unique=True, nullable=True)
+    deletion_lease_token = db.Column(db.String(128), default="")
+    confirmation = db.Column(db.String(128), default="")
+    # Only a SHA-256 digest is persisted. The raw nonce exists in the user's
+    # signed Flask session for the short preview window and is never stored here.
+    nonce_hash = db.Column(db.String(64), default="")
+    total_items = db.Column(db.Integer, default=0, nullable=False)
+    processed_items = db.Column(db.Integer, default=0, nullable=False)
+    succeeded_items = db.Column(db.Integer, default=0, nullable=False)
+    failed_items = db.Column(db.Integer, default=0, nullable=False)
+    skipped_items = db.Column(db.Integer, default=0, nullable=False)
+    cancellation_requested = db.Column(db.Boolean, default=False, nullable=False)
+    current_message = db.Column(db.String(512), default="")
+    error_summary = db.Column(db.Text, default="")
+
+    def as_api(self) -> Dict[str, Any]:
+        return {
+            "plan_id": self.id,
+            "run_id": self.scan_run_id,
+            "created_at": _iso(self.created_at),
+            "approved_at": _iso(self.approved_at),
+            "started_at": _iso(self.started_at),
+            "finished_at": _iso(self.finished_at),
+            "expires_at": _iso(self.expires_at),
+            "status": self.status,
+            "total": self.total_items or 0,
+            "processed": self.processed_items or 0,
+            "succeeded": self.succeeded_items or 0,
+            "failed": self.failed_items or 0,
+            "skipped": self.skipped_items or 0,
+            "cancel_requested": bool(self.cancellation_requested),
+            "current_message": self.current_message or "",
+            "error_summary": self.error_summary or "",
+        }
+
+    @classmethod
+    def get(cls, batch_id: Any) -> Optional["ModelBatchRun"]:
+        return db.session.query(cls).filter_by(id=int(batch_id)).first()
+
+    @classmethod
+    def active(cls) -> Optional["ModelBatchRun"]:
+        return (
+            db.session.query(cls)
+            .filter(cls.status.in_(["queued", "running", "cancelling"]))
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    @classmethod
+    def latest_for_scan(cls, run_id: Any) -> Optional["ModelBatchRun"]:
+        return (
+            db.session.query(cls)
+            .filter_by(scan_run_id=int(run_id))
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    @classmethod
+    def claim_for_approval(
+        cls,
+        batch_id: Any,
+        nonce_hash: str,
+        deletion_lease_token: str,
+        now: datetime,
+    ) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(
+                cls.id == int(batch_id),
+                cls.status == "preview",
+                cls.expires_at >= now,
+                cls.nonce_hash == str(nonce_hash),
+            )
+            .update(
+                {
+                    cls.status: "queued",
+                    cls.approved_at: now,
+                    cls.current_message: "승인됨 · 백그라운드 작업 대기 중",
+                    cls.nonce_hash: "",
+                    cls.lease_key: "global",
+                    cls.deletion_lease_token: str(deletion_lease_token),
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+    @classmethod
+    def claim_for_worker(cls, batch_id: Any, now: datetime) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(cls.id == int(batch_id), cls.status == "queued")
+            .update(
+                {
+                    cls.status: "running",
+                    cls.started_at: now,
+                    cls.current_message: "일괄 승인 삭제 시작",
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+    @classmethod
+    def unfinished(cls) -> List["ModelBatchRun"]:
+        return (
+            db.session.query(cls)
+            .filter(cls.status.in_(["queued", "running", "cancelling"]))
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+
+class ModelBatchItem(ModelBase):
+    P = P
+    __tablename__ = "batch_item"
+    __table_args__ = {"mysql_collate": "utf8_general_ci"}
+    __bind_key__ = P.package_name
+
+    id = db.Column(db.Integer, primary_key=True)
+    batch_run_id = db.Column(db.Integer, nullable=False, index=True)
+    scan_run_id = db.Column(db.Integer, nullable=False, index=True)
+    group_id = db.Column(db.Integer, nullable=False, index=True)
+    keep_candidate_id = db.Column(db.Integer, nullable=False)
+    delete_candidate_id = db.Column(db.Integer, nullable=False)
+    action_log_id = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    started_at = db.Column(db.DateTime)
+    finished_at = db.Column(db.DateTime)
+    status = db.Column(db.String(32), nullable=False, index=True)
+    message = db.Column(db.Text, default="")
+    title = db.Column(db.String(512), default="")
+    media_type = db.Column(db.String(32), default="")
+    keep_media_id = db.Column(db.String(64), nullable=False)
+    delete_media_id = db.Column(db.String(64), nullable=False)
+    keep_score = db.Column(db.Float, default=0)
+    delete_score = db.Column(db.Float, default=0)
+    keep_paths_json = db.Column(db.Text, default="[]")
+    delete_paths_json = db.Column(db.Text, default="[]")
+
+    def as_api(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "plan_id": self.batch_run_id,
+            "run_id": self.scan_run_id,
+            "group_id": self.group_id,
+            "title": self.title or "",
+            "media_type": self.media_type or "",
+            "keep": {
+                "candidate_id": self.keep_candidate_id,
+                "media_id": self.keep_media_id,
+                "score": round(self.keep_score or 0, 3),
+                "paths": _json_load(self.keep_paths_json, []),
+            },
+            "delete": {
+                "candidate_id": self.delete_candidate_id,
+                "media_id": self.delete_media_id,
+                "score": round(self.delete_score or 0, 3),
+                "paths": _json_load(self.delete_paths_json, []),
+            },
+            "status": self.status,
+            "message": self.message or "",
+            "action_id": self.action_log_id,
+            "created_at": _iso(self.created_at),
+            "started_at": _iso(self.started_at),
+            "finished_at": _iso(self.finished_at),
+        }
+
+    @classmethod
+    def get(cls, item_id: Any) -> Optional["ModelBatchItem"]:
+        return db.session.query(cls).filter_by(id=int(item_id)).first()
+
+    @classmethod
+    def by_batch(cls, batch_id: Any) -> List["ModelBatchItem"]:
+        return (
+            db.session.query(cls)
+            .filter_by(batch_run_id=int(batch_id))
+            .order_by(cls.id.asc())
+            .all()
+        )
+
+    @classmethod
+    def claim_for_worker(cls, item_id: Any, now: datetime) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(cls.id == int(item_id), cls.status == "planned")
+            .update(
+                {
+                    cls.status: "running",
+                    cls.started_at: now,
+                    cls.message: "삭제 전 재검증 중",
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+
+class ModelDeletionLease(ModelBase):
+    """Singleton cross-process mutex for every Plex deletion transaction."""
+
+    P = P
+    __tablename__ = "deletion_lease"
+    __table_args__ = {"mysql_collate": "utf8_general_ci"}
+    __bind_key__ = P.package_name
+
+    id = db.Column(db.Integer, primary_key=True)
+    owner_token = db.Column(db.String(128), default="", nullable=False)
+    owner_kind = db.Column(db.String(32), default="", nullable=False)
+    owner_ref = db.Column(db.String(128), default="", nullable=False)
+    acquired_at = db.Column(db.DateTime)
+    heartbeat_at = db.Column(db.DateTime)
+    expires_at = db.Column(db.DateTime)
+
+    @classmethod
+    def get_singleton(cls) -> Optional["ModelDeletionLease"]:
+        return db.session.query(cls).filter_by(id=1).first()
+
+    @classmethod
+    def claim_free(
+        cls,
+        owner_token: str,
+        owner_kind: str,
+        owner_ref: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(cls.id == 1, cls.owner_token == "")
+            .update(
+                {
+                    cls.owner_token: owner_token,
+                    cls.owner_kind: owner_kind,
+                    cls.owner_ref: owner_ref,
+                    cls.acquired_at: now,
+                    cls.heartbeat_at: now,
+                    cls.expires_at: expires_at,
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+    @classmethod
+    def renew(
+        cls,
+        owner_token: str,
+        owner_kind: str,
+        owner_ref: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(
+                cls.id == 1,
+                cls.owner_token == owner_token,
+                cls.owner_kind == owner_kind,
+                cls.owner_ref == owner_ref,
+                cls.expires_at >= now,
+            )
+            .update(
+                {cls.heartbeat_at: now, cls.expires_at: expires_at},
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+    @classmethod
+    def release(cls, owner_token: str) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(cls.id == 1, cls.owner_token == owner_token)
+            .update(
+                {
+                    cls.owner_token: "",
+                    cls.owner_kind: "",
+                    cls.owner_ref: "",
+                    cls.acquired_at: None,
+                    cls.heartbeat_at: None,
+                    cls.expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1
+
+    @classmethod
+    def claim_expired_for_recovery(
+        cls,
+        previous_owner_token: str,
+        recovery_token: str,
+        owner_ref: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        updated = (
+            db.session.query(cls)
+            .filter(
+                cls.id == 1,
+                cls.owner_token == previous_owner_token,
+                cls.owner_token != "",
+                cls.expires_at < now,
+            )
+            .update(
+                {
+                    cls.owner_token: recovery_token,
+                    cls.owner_kind: "recovery",
+                    cls.owner_ref: owner_ref,
+                    cls.acquired_at: now,
+                    cls.heartbeat_at: now,
+                    cls.expires_at: expires_at,
+                },
+                synchronize_session=False,
+            )
+        )
+        return updated == 1

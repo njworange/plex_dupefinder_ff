@@ -58,9 +58,10 @@
   function badge(status) {
     var key = String(status || 'unknown').toLowerCase();
     var kind = 'pdff-secondary';
-    if (['completed', 'success', 'safe'].indexOf(key) >= 0) kind = 'pdff-success';
-    else if (['running', 'queued'].indexOf(key) >= 0) kind = 'pdff-primary';
-    else if (['cancelled', 'cancelling', 'completed_with_warnings', 'unknown'].indexOf(key) >= 0) kind = 'pdff-warning-badge';
+    if (['completed', 'success', 'succeeded', 'safe'].indexOf(key) >= 0) kind = 'pdff-success';
+    else if (['running', 'executing', 'approved', 'queued'].indexOf(key) >= 0) kind = 'pdff-primary';
+    else if (['planned', 'preview', 'ready', 'draft', 'pending', 'skipped'].indexOf(key) >= 0) kind = 'pdff-secondary';
+    else if (['cancelled', 'cancelling', 'completed_with_warnings', 'completed_with_errors', 'unknown', 'stopped', 'interrupted', 'expired'].indexOf(key) >= 0) kind = 'pdff-warning-badge';
     else if (['failed', 'blocked', 'critical', 'verification_failed'].indexOf(key) >= 0) kind = 'pdff-danger-badge';
     return '<span class="pdff-badge ' + kind + '">' + esc(status || '-') + '</span>';
   }

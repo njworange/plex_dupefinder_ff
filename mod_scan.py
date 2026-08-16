@@ -10,6 +10,7 @@ from flask import jsonify, render_template, session
 from framework import F
 from plugin import PluginModuleBase
 
+from .batch_delete_manager import BatchDeleteManager
 from .delete_service import DeleteService
 from .models import ModelDuplicateGroup, ModelMediaCandidate, ModelScanRun
 from .scan_manager import ScanManager
@@ -54,21 +55,28 @@ class ModuleScan(PluginModuleBase):
         super(ModuleScan, self).__init__(plugin, name=name, first_menu="list")
         self.manager = ScanManager()
         self.delete_service = DeleteService()
+        # Share DeleteService so manual and batch work serialize inside this
+        # process; DB claims provide the cross-process protection.
+        self.batch_manager = BatchDeleteManager(self.delete_service)
 
     def plugin_load(self) -> None:
         scan_count = self.manager.recover_interrupted()
         if scan_count:
             P.logger.warning("Interrupted duplicate scans recovered: %s", scan_count)
-        delete_counts = self.delete_service.recover_interrupted()
+        batch_count = self.batch_manager.recover_interrupted()
+        delete_counts = self.batch_manager.last_delete_recovery_counts
         if delete_counts["blocked"] or delete_counts["unknown"]:
             P.logger.warning(
                 "Interrupted deletes recovered: blocked=%s unknown=%s",
                 delete_counts["blocked"],
                 delete_counts["unknown"],
             )
+        if batch_count:
+            P.logger.warning("Interrupted batch deletes recovered: %s", batch_count)
 
     def plugin_unload(self) -> None:
         self.manager.unload()
+        self.batch_manager.unload()
 
     def process_menu(self, sub: str, req: Any) -> Any:
         arg: Dict[str, Any] = P.ModelSetting.to_dict()
@@ -107,6 +115,17 @@ class ModuleScan(PluginModuleBase):
 
     def process_ajax(self, sub: str, req: Any) -> Any:
         try:
+            if sub in {
+                "batch_preview",
+                "batch_approve",
+                "batch_status",
+                "batch_cancel",
+                "delete_preview",
+                "delete_media",
+            }:
+                # Opportunistically recover an expired DB lease. A valid lease
+                # always belongs to another live web worker and is untouched.
+                self.batch_manager.recover_interrupted()
             if sub == "libraries":
                 return jsonify({"ret": "success", "data": self._libraries()})
 
@@ -166,6 +185,73 @@ class ModuleScan(PluginModuleBase):
                             "page_size": page_size,
                             "pages": pages,
                         },
+                    }
+                )
+
+            if sub == "batch_preview":
+                if req.method != "POST":
+                    raise ValueError("일괄 삭제 사전확인은 POST만 허용합니다.")
+                self._csrf(req)
+                run_id = _positive_int(req.form.get("run_id"), "run_id")
+                data = self.batch_manager.preview(run_id)
+                session["plex_dupefinder_ff_batch_preview"] = {
+                    "plan_id": data["plan_id"],
+                    "nonce": data["nonce"],
+                    "expires_at": data["expires_at"],
+                }
+                return jsonify(
+                    {
+                        "ret": "success",
+                        "msg": "일괄 삭제 예정 목록을 생성했습니다.",
+                        "data": data,
+                    }
+                )
+
+            if sub == "batch_approve":
+                if req.method != "POST":
+                    raise ValueError("일괄 삭제 승인은 POST만 허용합니다.")
+                self._csrf(req)
+                preview = session.pop("plex_dupefinder_ff_batch_preview", None)
+                if not preview or int(preview.get("expires_at", 0)) < int(time.time()):
+                    raise ValueError("일괄 삭제 사전확인이 만료되었습니다. 다시 확인하세요.")
+                plan_id = _positive_int(req.form.get("plan_id"), "plan_id")
+                supplied_nonce = str(req.form.get("nonce", ""))
+                if int(preview.get("plan_id", 0)) != plan_id or not secrets.compare_digest(
+                    str(preview.get("nonce", "")), supplied_nonce
+                ):
+                    raise ValueError("일괄 삭제 사전확인 정보가 일치하지 않습니다.")
+                data = self.batch_manager.approve(
+                    batch_id=plan_id,
+                    nonce=supplied_nonce,
+                    confirmation=req.form.get("confirmation", ""),
+                )
+                return jsonify(
+                    {
+                        "ret": "success",
+                        "msg": "일괄 삭제를 승인했습니다.",
+                        "data": data,
+                    }
+                )
+
+            if sub == "batch_status":
+                plan_id_raw = req.values.get("plan_id")
+                run_id_raw = req.values.get("run_id")
+                plan_id = _positive_int(plan_id_raw, "plan_id") if plan_id_raw else None
+                run_id = _positive_int(run_id_raw, "run_id") if run_id_raw else None
+                data = self.batch_manager.status(batch_id=plan_id, run_id=run_id)
+                return jsonify({"ret": "success", "data": data})
+
+            if sub == "batch_cancel":
+                if req.method != "POST":
+                    raise ValueError("일괄 삭제 취소는 POST만 허용합니다.")
+                self._csrf(req)
+                plan_id = _positive_int(req.form.get("plan_id"), "plan_id")
+                data = self.batch_manager.cancel(plan_id)
+                return jsonify(
+                    {
+                        "ret": "success",
+                        "msg": "일괄 삭제 취소를 요청했습니다.",
+                        "data": data,
                     }
                 )
 

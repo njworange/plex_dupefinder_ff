@@ -46,7 +46,15 @@ P = create_plugin_instance(setting)
 
 try:
     # Models must be imported before FlaskFarm calls db.create_all().
-    from .models import ModelActionLog, ModelDuplicateGroup, ModelMediaCandidate, ModelScanRun
+    from .models import (
+        ModelActionLog,
+        ModelBatchItem,
+        ModelBatchRun,
+        ModelDeletionLease,
+        ModelDuplicateGroup,
+        ModelMediaCandidate,
+        ModelScanRun,
+    )
     from .mod_history import ModuleHistory
     from .mod_scan import ModuleScan
     from .mod_setting import ModuleSetting
@@ -55,6 +63,9 @@ try:
     P.ModelDuplicateGroup = ModelDuplicateGroup
     P.ModelMediaCandidate = ModelMediaCandidate
     P.ModelActionLog = ModelActionLog
+    P.ModelBatchRun = ModelBatchRun
+    P.ModelBatchItem = ModelBatchItem
+    P.ModelDeletionLease = ModelDeletionLease
     P.set_module_list([ModuleSetting, ModuleScan, ModuleHistory])
 except Exception as exc:
     P.logger.error("Exception:%s", str(exc))

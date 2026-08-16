@@ -252,6 +252,34 @@ class DeleteServiceHarness:
         )
         setup = types.ModuleType("delete_review.setup")
         setup.P = fake_p
+        self.path_conflict = False
+        self.lose_lease_on_renew = False
+        self.lease_events = []
+
+        class LeaseLost(RuntimeError):
+            pass
+
+        class LeaseService:
+            def acquire(inner_self, owner_kind, owner_ref):
+                harness.lease_events.append(("acquire", owner_kind, owner_ref))
+                return "manual-lease-token"
+
+            def renew(inner_self, token, owner_kind, owner_ref):
+                harness.lease_events.append(("renew", owner_kind, owner_ref))
+                if harness.lose_lease_on_renew:
+                    raise LeaseLost("lease lost")
+
+            def release(inner_self, token):
+                harness.lease_events.append(("release", token))
+                return True
+
+        deletion_lease = types.ModuleType("delete_review.deletion_lease")
+        deletion_lease.DeletionLeaseLost = LeaseLost
+        deletion_lease.DeletionLeaseService = LeaseService
+        path_conflicts = types.ModuleType("delete_review.path_conflicts")
+        path_conflicts.group_has_cross_path_conflict = (
+            lambda run_id, group_id: harness.path_conflict
+        )
 
         replacements = {
             "framework": framework,
@@ -259,6 +287,8 @@ class DeleteServiceHarness:
             "delete_review.models": models,
             "delete_review.scan_manager": scan_manager,
             "delete_review.setup": setup,
+            "delete_review.deletion_lease": deletion_lease,
+            "delete_review.path_conflicts": path_conflicts,
             "delete_review.services": services_package,
             "delete_review.services.plex_gateway": gateway_module,
             "delete_review.services.plex_mate_provider": provider_module,
@@ -324,6 +354,22 @@ class _Gateway:
 
 
 class DeleteFlowTest(unittest.TestCase):
+    def test_confirmation_is_byte_exact_and_rejects_surrounding_space(self) -> None:
+        before = _item(_version("10"), _version("20"))
+        harness = DeleteServiceHarness(before)
+        gateway = _Gateway([])
+
+        with self.assertRaises(ValueError):
+            harness.service_for(gateway).delete(10, 1, 2, " DELETE 10")
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.session.logs, [])
+        self.assertEqual(harness.run.deletion_attempts, 0)
+        self.assertTrue(harness.group.safe_to_delete)
+        self.assertEqual(harness.group.resolution_status, "open")
+        self.assertEqual(harness.lease_events[0][0], "acquire")
+        self.assertEqual(harness.lease_events[-1][0], "release")
+
     def test_confirmed_delete_updates_audit_and_requires_rescan(self) -> None:
         before = _item(_version("10"), _version("20", bitrate=2_000))
         after = _item(before.media[1])
@@ -341,6 +387,59 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertEqual(harness.run.deletion_attempts, 1)
         self.assertEqual(harness.session.logs[-1].status, "success")
         self.assertTrue(harness.require_machine_id)
+        self.assertEqual(harness.lease_events[0][0], "acquire")
+        self.assertEqual(harness.lease_events[-1][0], "release")
+
+    def test_batch_call_reuses_global_lease_without_releasing_it_per_item(self) -> None:
+        before = _item(_version("10"), _version("20", bitrate=2_000))
+        after = _item(before.media[1])
+        harness = DeleteServiceHarness(before)
+        service = harness.service_for(_Gateway([before, after]))
+
+        result = service.delete(
+            10,
+            1,
+            2,
+            "DELETE 10",
+            lease_owner_token="batch-lease",
+            lease_owner_kind="batch",
+            lease_owner_ref="77",
+        )
+
+        self.assertEqual(result["verification"], "confirmed")
+        self.assertTrue(harness.lease_events)
+        self.assertTrue(all(event[0] == "renew" for event in harness.lease_events))
+
+    def test_cross_group_part_path_conflict_blocks_manual_delete_under_lease(self) -> None:
+        before = _item(_version("10"), _version("20"))
+        harness = DeleteServiceHarness(before)
+        harness.path_conflict = True
+        gateway = _Gateway([])
+
+        with self.assertRaisesRegex(RuntimeError, "Part 파일 경로"):
+            harness.service_for(gateway).delete(10, 1, 2, "DELETE 10")
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.session.logs[-1].status, "blocked")
+        self.assertEqual(harness.group.resolution_status, "manual_check_required")
+        self.assertEqual(harness.run.deletion_attempts, 0)
+        self.assertEqual(harness.lease_events[0][0], "acquire")
+        self.assertEqual(harness.lease_events[-1][0], "release")
+
+    def test_lost_lease_leaves_audit_for_recovery_cas_owner(self) -> None:
+        before = _item(_version("10"), _version("20"))
+        harness = DeleteServiceHarness(before)
+        harness.lose_lease_on_renew = True
+        gateway = _Gateway([before])
+
+        with self.assertRaisesRegex(RuntimeError, "lease lost"):
+            harness.service_for(gateway).delete(10, 1, 2, "DELETE 10")
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(harness.session.logs[-1].status, "validating")
+        self.assertEqual(harness.session.logs[-1].message, "삭제 전 재검증 중")
+        self.assertEqual(harness.group.resolution_status, "delete_in_progress")
+        self.assertEqual(harness.run.deletion_attempts, 0)
 
     def test_unknown_delete_and_failed_reread_are_locked_for_manual_check(self) -> None:
         before = _item(_version("10"), _version("20"))
@@ -443,6 +542,29 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertEqual(log.status, "blocked")
         self.assertEqual(harness.group.resolution_status, "manual_check_required")
         self.assertEqual(harness.run.deletion_attempts, 0)
+
+    def test_hot_reload_does_not_recover_audit_owned_by_live_batch_worker(self) -> None:
+        before = _item(_version("10"), _version("20"))
+        harness = DeleteServiceHarness(before)
+        harness.group.safe_to_delete = False
+        harness.group.resolution_status = "delete_in_progress"
+        log = harness.ModelActionLog(
+            id=None,
+            run_id=1,
+            group_id=10,
+            candidate_id=1,
+            keep_candidate_id=2,
+            action="delete_media",
+            status="deleting",
+            message="deleting",
+        )
+        harness.session.add(log)
+
+        counts = harness.service_for(_Gateway([])).recover_interrupted({(1, 10, 1)})
+
+        self.assertEqual(counts, {"blocked": 0, "unknown": 0})
+        self.assertEqual(log.status, "deleting")
+        self.assertEqual(harness.group.resolution_status, "delete_in_progress")
 
     def test_restart_recovery_marks_deleting_as_unknown_and_keeps_slot_consumed(self) -> None:
         before = _item(_version("10"), _version("20"))

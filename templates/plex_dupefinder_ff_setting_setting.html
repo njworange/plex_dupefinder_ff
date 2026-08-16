@@ -43,10 +43,12 @@
     {{ macros.m_tab_content_end() }}
 
     {{ macros.m_tab_content_start('delete', false) }}
-      <div class="pdff-danger mb-3"><strong>주의:</strong> Plex Media 삭제는 해당 버전의 실제 파일을 삭제할 수 있습니다. 자동·일괄 삭제는 구현되어 있지 않으며 기본값은 꺼짐입니다.</div>
+      <div class="pdff-danger mb-3"><strong>주의:</strong> Plex Media 삭제는 해당 버전의 실제 파일을 삭제할 수 있습니다. 개별 삭제와 일괄 승인형 반자동 삭제는 모두 기본값이 꺼져 있습니다.</div>
       {{ macros.setting_checkbox('setting_delete_enabled', '그룹별 수동 삭제 활성화', value=arg.get('setting_delete_enabled', 'False'), desc='삭제 전 사전확인, 확인문구, 서버·metadata·Media·Part 재검증을 모두 수행합니다.') }}
+      {{ macros.setting_checkbox('setting_batch_delete_enabled', '일괄 승인형 반자동 삭제 활성화', value=arg.get('setting_batch_delete_enabled', 'False'), desc=['수동 삭제가 함께 활성화되어야 합니다.', '정확히 2개 버전이고 유지 추천이 단독 1위인 안전 그룹만 계획에 포함합니다.', '계획 전체를 검토한 뒤 정확한 확인문구를 한 번 입력해야 순차 처리를 시작합니다.']) }}
+      {{ macros.setting_input_int('setting_batch_max_items', '배치 계획 최대 항목 수', value=arg.get('setting_batch_max_items', '10'), min=1, max=100, desc='1~100. 실제 처리 수는 이 값과 스캔 1회당 최대 삭제 수 중 더 작은 한도를 따릅니다.') }}
       {{ macros.setting_input_textarea('setting_allowed_roots', '삭제 허용 미디어 루트', value=arg.get('setting_allowed_roots', ''), row='6', desc=['한 줄에 하나씩 Plex가 반환하는 절대 경로를 입력합니다.', '비어 있거나 후보 경로가 루트 밖이면 삭제를 차단합니다.']) }}
-      {{ macros.setting_input_int('setting_max_delete_per_run', '스캔 1회당 최대 삭제 수', value=arg.get('setting_max_delete_per_run', '1'), min=1, max=100) }}
+      {{ macros.setting_input_int('setting_max_delete_per_run', '스캔 1회당 전역 삭제 시도 한도', value=arg.get('setting_max_delete_per_run', '1'), min=1, max=100, desc='개별 삭제와 배치 삭제 시도를 합산합니다. 실패하거나 결과가 불명확한 시도도 한도를 소비합니다.') }}
       {{ macros.setting_checkbox('setting_require_guid', 'GUID 필수', value=arg.get('setting_require_guid', 'True')) }}
       {{ macros.setting_checkbox('setting_block_multipart', '멀티파트 삭제 차단', value=arg.get('setting_block_multipart', 'True')) }}
     {{ macros.m_tab_content_end() }}
@@ -58,10 +60,20 @@
 'use strict';
 var packageName = {{ arg['package_name']|tojson }};
 var wasDeleteEnabled = {{ 'true' if arg.get('setting_delete_enabled', 'False') == 'True' else 'false' }};
+var wasBatchDeleteEnabled = {{ 'true' if arg.get('setting_batch_delete_enabled', 'False') == 'True' else 'false' }};
 
 function globalSettingSaveBefore() {
-  if (!wasDeleteEnabled && $('#setting_delete_enabled').is(':checked')) {
-    return window.confirm('수동 삭제를 활성화합니다. Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?');
+  var deleteEnabled = $('#setting_delete_enabled').is(':checked');
+  var batchEnabled = $('#setting_batch_delete_enabled').is(':checked');
+  if (batchEnabled && !deleteEnabled) {
+    window.alert('일괄 승인형 반자동 삭제를 사용하려면 그룹별 수동 삭제도 활성화해야 합니다.');
+    return false;
+  }
+  if ((!wasDeleteEnabled && deleteEnabled) || (!wasBatchDeleteEnabled && batchEnabled)) {
+    var message = batchEnabled
+      ? '개별 삭제와 일괄 승인형 반자동 삭제를 활성화합니다. 각 계획을 직접 검토했고 Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?'
+      : '수동 삭제를 활성화합니다. Plex 설정의 미디어 삭제 허용 여부와 백업 상태를 확인했습니까?';
+    return window.confirm(message);
   }
   return true;
 }

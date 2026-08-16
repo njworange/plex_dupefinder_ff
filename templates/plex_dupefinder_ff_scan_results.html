@@ -15,6 +15,37 @@
 </section>
 
 <section class="pdff-panel">
+  <div class="pdff-toolbar">
+    <h3 class="pdff-title" style="margin:0">일괄 승인형 반자동 삭제</h3>
+    <button id="batch_preview_btn" class="btn btn-sm btn-outline-danger" type="button" disabled>삭제 계획 만들기</button>
+  </div>
+  <div class="alert alert-warning small">
+    정확히 2개 버전이고 유지 추천이 단독 1위인 안전 그룹만 계획에 포함합니다. 계획을 검토하고 확인문구를 한 번 입력하면 항목을 하나씩 재검증하며 순차 삭제합니다.
+  </div>
+  <div id="batch_empty" class="pdff-empty">스캔을 선택한 뒤 삭제 계획을 만드세요.</div>
+  <div id="batch_plan" style="display:none">
+    <div id="batch_summary" class="pdff-muted mb-2"></div>
+    <div id="batch_restore_warning" class="pdff-warning mb-3" style="display:none">이 계획은 이전 페이지 세션에서 만들어져 승인용 nonce가 없습니다. 내용을 확인한 뒤 새 삭제 계획을 만드세요.</div>
+    <div id="batch_progress_wrap" style="display:none">
+      <div class="pdff-progress"><div id="batch_progress_bar" style="width:0%"></div></div>
+      <div id="batch_progress_text" class="pdff-muted mt-2"></div>
+    </div>
+    <div id="batch_item_list" class="mt-3"></div>
+    <div id="batch_approval" class="pdff-danger mt-3" style="display:none">
+      <div class="small">아래 문구를 정확히 입력해야 계획 전체가 승인됩니다.</div>
+      <div id="batch_confirmation_phrase" class="pdff-code mt-2"></div>
+      <div class="pdff-toolbar mt-2 mb-0">
+        <input id="batch_confirmation_input" class="form-control form-control-sm pdff-confirm-input" type="text" autocomplete="off" aria-label="배치 삭제 확인문구">
+        <button id="batch_approve_btn" class="btn btn-sm btn-danger" type="button">검토한 계획 승인</button>
+      </div>
+    </div>
+    <div class="pdff-actions mt-3">
+      <button id="batch_cancel_btn" class="btn btn-sm btn-outline-warning" type="button" style="display:none">진행 중단 요청</button>
+    </div>
+  </div>
+</section>
+
+<section class="pdff-panel">
   <div id="group_list" class="pdff-empty">스캔을 선택하세요.</div>
   <div class="pdff-toolbar justify-content-center mt-3"><button id="prev_page" class="btn btn-sm btn-outline-secondary">이전</button><span id="page_label" class="pdff-muted"></span><button id="next_page" class="btn btn-sm btn-outline-secondary">다음</button></div>
 </section>
@@ -43,11 +74,14 @@ var currentPage = 1;
 var pageSize = 50;
 var totalPages = 1;
 var currentDetail = null;
+var batchPlan = null;
+var batchPollHandle = null;
+var batchBusy = false;
 
 function episodeLabel(group) {
-  if (group.media_type !== 'episode') return group.year ? ' (' + group.year + ')' : '';
-  var season = group.parent_index === null ? '?' : String(group.parent_index).padStart(2, '0');
-  var episode = group.index === null ? '?' : String(group.index).padStart(2, '0');
+  if (group.media_type !== 'episode') return group.year ? ' (' + PDFF.esc(group.year) + ')' : '';
+  var season = group.parent_index === null ? '?' : PDFF.esc(String(group.parent_index).padStart(2, '0'));
+  var episode = group.index === null ? '?' : PDFF.esc(String(group.index).padStart(2, '0'));
   return ' · ' + PDFF.esc(group.grandparent_title || '') + ' S' + season + 'E' + episode;
 }
 
@@ -60,7 +94,14 @@ function loadRuns() {
       select.append(new Option(label, run.id));
     });
     if (requestedRunId) select.val(String(requestedRunId));
-    if (select.val()) loadGroups(true); else $('#group_list').text('스캔 이력이 없습니다.');
+    updateBatchButtons();
+    if (select.val()) {
+      loadGroups(true);
+      restoreBatchForRun();
+    } else {
+      $('#group_list').text('스캔 이력이 없습니다.');
+      $('#batch_empty').text('스캔 이력이 없습니다.');
+    }
   });
 }
 
@@ -101,7 +142,10 @@ function renderGroups(items, total) {
   var html = '';
   items.forEach(function (group) {
     var flags = (group.safety_flags || []).map(PDFF.flagLabel);
-    html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-7"><strong>' + PDFF.esc(group.title || '-') + '</strong>' + episodeLabel(group) + '<div class="pdff-muted">' + PDFF.esc(group.section_title) + ' · ratingKey ' + PDFF.esc(group.rating_key) + '</div>' + (flags.length ? '<div class="small text-danger">' + PDFF.esc(flags.join(' · ')) + '</div>' : '') + '</div><div class="col-md-3">' + PDFF.badge(group.safe_to_delete ? 'safe' : 'blocked') + ' <span class="pdff-muted">' + PDFF.esc(group.candidate_count) + ' versions</span></div><div class="col-md-2 text-right"><button class="btn btn-sm btn-outline-primary group-detail" data-id="' + PDFF.esc(group.id) + '">상세 비교</button></div></div></article>';
+    var canOpenDelete = group.safe_to_delete && group.resolution_status === 'open';
+    var actions = '<button class="btn btn-sm btn-outline-primary group-detail" data-id="' + PDFF.esc(group.id) + '">상세 비교</button>';
+    if (canOpenDelete) actions += '<button class="btn btn-sm btn-outline-danger group-delete" data-id="' + PDFF.esc(group.id) + '">개별 삭제</button>';
+    html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-6"><strong>' + PDFF.esc(group.title || '-') + '</strong>' + episodeLabel(group) + '<div class="pdff-muted">' + PDFF.esc(group.section_title) + ' · ratingKey ' + PDFF.esc(group.rating_key) + '</div>' + (flags.length ? '<div class="small text-danger">' + PDFF.esc(flags.join(' · ')) + '</div>' : '') + '</div><div class="col-md-3">' + PDFF.badge(group.safe_to_delete ? 'safe' : 'blocked') + ' ' + PDFF.badge(group.resolution_status || 'open') + ' <span class="pdff-muted">' + PDFF.esc(group.candidate_count) + ' versions</span></div><div class="col-md-3"><div class="pdff-actions justify-content-md-end">' + actions + '</div></div></div></article>';
   });
   $('#group_list').removeClass('pdff-empty').html(html);
 }
@@ -110,7 +154,7 @@ function candidateLabel(candidate) {
   return 'Media #' + candidate.media_id + ' · ' + (candidate.video_resolution || candidate.height + 'p') + ' · ' + (candidate.video_codec || '-') + ' · ' + candidate.score;
 }
 
-function openGroup(groupId) {
+function openGroup(groupId, focusDelete) {
   PDFF.request(packageName, 'scan', 'group_detail', {group_id: groupId}, 'GET', function (ret) {
     if (ret.ret !== 'success') return;
     currentDetail = ret.data;
@@ -118,7 +162,9 @@ function openGroup(groupId) {
     var candidates = ret.data.candidates || [];
     $('#detail_title').text((group.title || '-') + ' · Group #' + group.id);
     var flags = (group.safety_flags || []).map(PDFF.flagLabel);
-    $('#detail_warning').html(group.safe_to_delete ? '<div class="alert alert-success">현재 스냅샷은 삭제 전 재검증 대상입니다. 실제 삭제 권한을 의미하지 않습니다.</div>' : '<div class="pdff-warning mb-3"><strong>삭제 차단:</strong> ' + PDFF.esc(flags.join(' · ') || '안전 조건 불충족') + '</div>');
+    var warningHtml = group.safe_to_delete ? '<div class="alert alert-success">현재 스냅샷은 삭제 전 재검증 대상입니다. 실제 삭제 권한을 의미하지 않습니다.</div>' : '<div class="pdff-warning mb-3"><strong>삭제 차단:</strong> ' + PDFF.esc(flags.join(' · ') || '안전 조건 불충족') + '</div>';
+    if (group.safe_to_delete && !ret.data.delete_enabled) warningHtml += '<div class="pdff-warning mb-3">설정에서 그룹별 수동 삭제를 활성화해야 개별 삭제를 진행할 수 있습니다.</div>';
+    $('#detail_warning').html(warningHtml);
     var html = '';
     candidates.forEach(function (candidate) {
       var recommended = group.recommended_candidate_id === candidate.id;
@@ -138,7 +184,9 @@ function openGroup(groupId) {
         del.append(new Option(candidateLabel(candidate), candidate.id));
       });
     }
-    $('#detail_panel').show()[0].scrollIntoView({behavior:'smooth', block:'start'});
+    $('#detail_panel').show();
+    var focusNode = focusDelete && allowed ? $('#delete_controls')[0] : $('#detail_panel')[0];
+    if (focusNode) focusNode.scrollIntoView({behavior:'smooth', block:'start'});
   });
 }
 
@@ -167,14 +215,247 @@ function previewDelete() {
   });
 }
 
-$('#run_select').on('change', function () { loadGroups(true); });
+function batchValue(object, keys, fallback) {
+  object = object || {};
+  for (var index = 0; index < keys.length; index += 1) {
+    if (object[keys[index]] !== undefined && object[keys[index]] !== null) return object[keys[index]];
+  }
+  return fallback;
+}
+
+function normalizedBatch(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
+  if (data.plan && typeof data.plan === 'object') data = Object.assign({}, data.plan, data);
+  return data;
+}
+
+function batchPlanId(data) {
+  return batchValue(data, ['plan_id', 'batch_id', 'id'], '');
+}
+
+function batchStatus(data) {
+  return String(batchValue(data, ['status', 'state'], 'planned')).toLowerCase();
+}
+
+function batchIsActive(data) {
+  return ['approved', 'queued', 'running', 'executing', 'cancelling'].indexOf(batchStatus(data)) >= 0;
+}
+
+function batchIsTerminal(data) {
+  return ['completed', 'completed_with_warnings', 'completed_with_errors', 'cancelled', 'failed', 'blocked', 'stopped', 'interrupted', 'expired'].indexOf(batchStatus(data)) >= 0;
+}
+
+function batchCandidate(item, kind) {
+  var candidate = batchValue(item, [kind, kind + '_candidate'], {}) || {};
+  var parts = batchValue(candidate, ['parts'], []) || [];
+  var paths = batchValue(candidate, ['paths'], null);
+  if (!Array.isArray(paths)) {
+    paths = parts.map(function (part) { return part && part.file ? part.file : ''; }).filter(Boolean);
+  }
+  if (!paths.length) {
+    var flatPaths = batchValue(item, [kind + '_paths', kind + '_path'], []);
+    paths = Array.isArray(flatPaths) ? flatPaths : (flatPaths ? [flatPaths] : []);
+  }
+  return {
+    mediaId: batchValue(candidate, ['media_id', 'id'], batchValue(item, [kind + '_media_id'], '-')),
+    score: batchValue(candidate, ['score'], batchValue(item, [kind + '_score'], '-')),
+    paths: paths
+  };
+}
+
+function renderBatchItems(items) {
+  if (!items.length) {
+    $('#batch_item_list').html('<div class="pdff-empty">현재 조건에 맞는 삭제 가능 항목이 없습니다.</div>');
+    return;
+  }
+  var html = '';
+  items.forEach(function (item, index) {
+    var keep = batchCandidate(item, 'keep');
+    var del = batchCandidate(item, 'delete');
+    var itemStatus = batchValue(item, ['status', 'state'], 'planned');
+    var title = batchValue(item, ['title'], 'Group #' + batchValue(item, ['group_id'], '-'));
+    var message = batchValue(item, ['message', 'error'], '');
+    html += '<article class="pdff-batch-item">' +
+      '<div class="d-flex flex-wrap justify-content-between align-items-center"><strong>' + PDFF.esc(index + 1) + '. ' + PDFF.esc(title) + '</strong>' + PDFF.badge(itemStatus) + '</div>' +
+      '<div class="pdff-grid mt-2">' +
+      '<div><span class="pdff-kv-label">유지</span><strong>Media #' + PDFF.esc(keep.mediaId) + '</strong> · score ' + PDFF.esc(keep.score) + '<div class="pdff-paths">' + PDFF.esc(keep.paths.join('\n') || '경로 정보 없음') + '</div></div>' +
+      '<div><span class="pdff-kv-label text-danger">삭제</span><strong class="text-danger">Media #' + PDFF.esc(del.mediaId) + '</strong> · score ' + PDFF.esc(del.score) + '<div class="pdff-paths">' + PDFF.esc(del.paths.join('\n') || '경로 정보 없음') + '</div></div>' +
+      '</div>' + (message ? '<div class="small mt-2">' + PDFF.esc(message) + '</div>' : '') + '</article>';
+  });
+  $('#batch_item_list').html(html);
+}
+
+function updateBatchButtons() {
+  var active = batchPlan && batchIsActive(batchPlan);
+  $('#batch_preview_btn').prop('disabled', batchBusy || active || !$('#run_select').val());
+  $('#run_select').prop('disabled', Boolean(active || batchBusy));
+}
+
+function stopBatchPolling() {
+  if (batchPollHandle) window.clearTimeout(batchPollHandle);
+  batchPollHandle = null;
+}
+
+function renderBatchPlan(data) {
+  data = normalizedBatch(data);
+  var previousStatus = batchPlan ? batchStatus(batchPlan) : '';
+  batchPlan = data;
+  var rawItems = batchValue(data, ['items', 'entries'], []);
+  var items = Array.isArray(rawItems) ? rawItems : [];
+  var status = batchStatus(data);
+  var total = Number(batchValue(data, ['total', 'total_items', 'eligible_count'], items.length) || 0);
+  var succeeded = Number(batchValue(data, ['succeeded', 'success_count'], 0) || 0);
+  var failed = Number(batchValue(data, ['failed', 'failed_count'], 0) || 0);
+  var skipped = Number(batchValue(data, ['skipped', 'skipped_count'], 0) || 0);
+  var processed = Number(batchValue(data, ['processed', 'processed_count'], succeeded + failed + skipped) || 0);
+  var settled = Math.max(processed, succeeded + failed + skipped);
+  var progress = total ? Math.min(100, Math.max(0, Math.round(settled * 100 / total))) : 0;
+  var confirmation = String(batchValue(data, ['confirmation', 'confirmation_phrase'], ''));
+
+  $('#batch_empty').hide();
+  $('#batch_plan').show();
+  $('#batch_summary').html('Plan #' + PDFF.esc(batchPlanId(data) || '-') + ' · ' + PDFF.badge(status) + ' · ' + PDFF.esc(total) + '개 항목');
+  renderBatchItems(items);
+  var activeOrTerminal = batchIsActive(data) || batchIsTerminal(data);
+  $('#batch_progress_wrap').toggle(activeOrTerminal);
+  $('#batch_progress_bar').css('width', progress + '%');
+  $('#batch_progress_text').text(settled + ' / ' + total + ' 정리 · 실제 처리 ' + processed + ' · 성공 ' + succeeded + ' · 실패 ' + failed + ' · 건너뜀 ' + skipped + (batchValue(data, ['current_message', 'message'], '') ? ' · ' + batchValue(data, ['current_message', 'message'], '') : '') + (batchValue(data, ['error_summary'], '') ? ' · ' + batchValue(data, ['error_summary'], '') : ''));
+  var approvalState = ['planned', 'preview', 'ready', 'draft'].indexOf(status) >= 0;
+  var hasNonce = Boolean(batchValue(data, ['nonce', 'approval_nonce'], ''));
+  var canApprove = approvalState && hasNonce && Boolean(confirmation) && total > 0;
+  $('#batch_approval').toggle(canApprove);
+  $('#batch_restore_warning').toggle(approvalState && !hasNonce && total > 0);
+  $('#batch_confirmation_phrase').text(confirmation);
+  $('#batch_cancel_btn').toggle(batchIsActive(data)).prop('disabled', status === 'cancelling');
+  updateBatchButtons();
+
+  if (batchIsTerminal(data) && previousStatus && !batchIsTerminal({status: previousStatus})) {
+    loadGroups(false);
+    PDFF.notify('배치 처리가 종료되었습니다. 항목별 상태를 확인하세요.', status === 'completed' && failed === 0 ? 'success' : 'warning');
+  }
+}
+
+function resetBatchPlan() {
+  stopBatchPolling();
+  batchPlan = null;
+  batchBusy = false;
+  $('#batch_plan').hide();
+  $('#batch_empty').show().text('스캔을 선택한 뒤 삭제 계획을 만드세요.');
+  $('#batch_confirmation_input').val('');
+  updateBatchButtons();
+}
+
+function restoreBatchForRun() {
+  var runId = $('#run_select').val();
+  if (!runId) return;
+  stopBatchPolling();
+  batchBusy = true;
+  updateBatchButtons();
+  PDFF.request(packageName, 'scan', 'batch_status', {run_id: runId}, 'GET', function (ret) {
+    if (String($('#run_select').val() || '') !== String(runId)) {
+      batchBusy = false;
+      updateBatchButtons();
+      return;
+    }
+    batchBusy = false;
+    if (ret.ret !== 'success' || !ret.data || !batchPlanId(normalizedBatch(ret.data))) {
+      resetBatchPlan();
+      return;
+    }
+    renderBatchPlan(ret.data);
+    scheduleBatchPoll();
+  });
+}
+
+function scheduleBatchPoll() {
+  stopBatchPolling();
+  if (!batchPlan || !batchIsActive(batchPlan)) return;
+  batchPollHandle = window.setTimeout(pollBatchStatus, 1500);
+}
+
+function pollBatchStatus() {
+  if (!batchPlan || !batchPlanId(batchPlan)) return;
+  PDFF.request(packageName, 'scan', 'batch_status', {plan_id: batchPlanId(batchPlan)}, 'GET', function (ret) {
+    if (ret.ret === 'success') renderBatchPlan(ret.data);
+    if (batchPlan && batchIsActive(batchPlan)) scheduleBatchPoll();
+  });
+}
+
+function previewBatch() {
+  var runId = $('#run_select').val();
+  if (!runId || batchBusy) return;
+  stopBatchPolling();
+  batchBusy = true;
+  updateBatchButtons();
+  PDFF.request(packageName, 'scan', 'batch_preview', {run_id: runId, csrf_token: csrfToken}, 'POST', function (ret) {
+    batchBusy = false;
+    if (ret.ret === 'success') {
+      if (!batchPlanId(normalizedBatch(ret.data))) {
+        PDFF.notify('삭제 계획 응답 형식이 올바르지 않습니다.', 'danger');
+        updateBatchButtons();
+        return;
+      }
+      $('#batch_confirmation_input').val('');
+      renderBatchPlan(ret.data);
+      $('#batch_plan')[0].scrollIntoView({behavior:'smooth', block:'start'});
+    } else updateBatchButtons();
+  });
+}
+
+function approveBatch() {
+  if (!batchPlan || batchBusy) return;
+  var confirmation = String($('#batch_confirmation_input').val() || '');
+  var expected = String(batchValue(batchPlan, ['confirmation', 'confirmation_phrase'], ''));
+  if (confirmation !== expected) {
+    PDFF.notify('확인 문구가 정확히 일치하지 않습니다.', 'warning');
+    return;
+  }
+  if (!window.confirm('검토한 계획을 승인하고 실제 Media 파일 삭제를 순차 시작하시겠습니까?')) return;
+  batchBusy = true;
+  $('#batch_approve_btn').prop('disabled', true);
+  updateBatchButtons();
+  var payload = {
+    plan_id: batchPlanId(batchPlan),
+    nonce: batchValue(batchPlan, ['nonce', 'approval_nonce'], ''),
+    confirmation: confirmation,
+    csrf_token: csrfToken
+  };
+  PDFF.request(packageName, 'scan', 'batch_approve', payload, 'POST', function (ret) {
+    batchBusy = false;
+    $('#batch_approve_btn').prop('disabled', false);
+    if (ret.ret === 'success') {
+      $('#batch_confirmation_input').val('');
+      renderBatchPlan(ret.data);
+      scheduleBatchPoll();
+    } else updateBatchButtons();
+  });
+}
+
+function cancelBatch() {
+  if (!batchPlan || !batchIsActive(batchPlan)) return;
+  if (!window.confirm('현재 처리 중인 항목이 끝난 뒤 남은 배치 항목을 중단하시겠습니까?')) return;
+  $('#batch_cancel_btn').prop('disabled', true);
+  PDFF.request(packageName, 'scan', 'batch_cancel', {plan_id: batchPlanId(batchPlan), csrf_token: csrfToken}, 'POST', function (ret) {
+    if (ret.ret === 'success') {
+      renderBatchPlan(ret.data);
+      scheduleBatchPoll();
+    } else $('#batch_cancel_btn').prop('disabled', false);
+  });
+}
+
+$('#run_select').on('change', function () { resetBatchPlan(); loadGroups(true); restoreBatchForRun(); });
 $('#filter_btn').on('click', applyFilter);
 $('#keyword_filter').on('keydown', function (e) { if (e.key === 'Enter') applyFilter(); });
 $('#prev_page').on('click', function () { if (currentPage > 1) { currentPage -= 1; loadGroups(false); } });
 $('#next_page').on('click', function () { if (currentPage < totalPages) { currentPage += 1; loadGroups(false); } });
-$(document).on('click', '.group-detail', function () { openGroup(Number($(this).data('id'))); });
+$(document).on('click', '.group-detail', function () { openGroup(Number($(this).data('id')), false); });
+$(document).on('click', '.group-delete', function () { openGroup(Number($(this).data('id')), true); });
 $('#close_detail').on('click', function () { $('#detail_panel').hide(); });
 $('#delete_preview_btn').on('click', previewDelete);
+$('#batch_preview_btn').on('click', previewBatch);
+$('#batch_approve_btn').on('click', approveBatch);
+$('#batch_cancel_btn').on('click', cancelBatch);
 $(document).ready(loadRuns);
+$(window).on('beforeunload', stopBatchPolling);
 </script>
 {% endblock %}

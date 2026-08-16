@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Real SQLite/SQLAlchemy lease-CAS integration tests. These versions support
+# both Python 3.8 (FlaskFarm's older deployments) and Python 3.12.
+Flask==2.3.3
+Flask-SQLAlchemy==3.0.5
+SQLAlchemy==1.4.54
+Werkzeug==2.3.8

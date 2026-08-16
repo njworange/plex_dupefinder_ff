@@ -224,6 +224,9 @@ class FlaskFarmSetupCompatibilityTest(unittest.TestCase):
                 "ModelDuplicateGroup": "duplicate_group",
                 "ModelMediaCandidate": "media_candidate",
                 "ModelActionLog": "action_log",
+                "ModelBatchRun": "batch_run",
+                "ModelBatchItem": "batch_item",
+                "ModelDeletionLease": "deletion_lease",
             }
             for attribute, table_name in expected.items():
                 model = getattr(plugin, attribute)
@@ -250,19 +253,40 @@ class FlaskFarmSetupCompatibilityTest(unittest.TestCase):
                 def __init__(self) -> None:
                     self.recovered = False
 
-                def recover_interrupted(self) -> Dict[str, int]:
+                def recover_interrupted(self, exclude_delete_keys=None) -> Dict[str, int]:
                     self.recovered = True
+                    self.excluded = exclude_delete_keys
                     return {"blocked": 0, "unknown": 0}
+
+            class BatchManagerStub:
+                def __init__(self) -> None:
+                    self.recovered = False
+                    self.unloaded = False
+                    self.last_delete_recovery_counts = {"blocked": 0, "unknown": 0}
+
+                def recover_interrupted(self) -> int:
+                    self.recovered = True
+                    return 0
+
+                def live_delete_keys(self):
+                    return {(1, 2, 3)}
+
+                def unload(self) -> None:
+                    self.unloaded = True
 
             manager = ManagerStub()
             delete_service = DeleteServiceStub()
+            batch_manager = BatchManagerStub()
             scan_module.manager = manager
             scan_module.delete_service = delete_service
+            scan_module.batch_manager = batch_manager
             scan_module.plugin_load()
             scan_module.plugin_unload()
             self.assertTrue(manager.recovered)
-            self.assertTrue(delete_service.recovered)
+            self.assertFalse(delete_service.recovered)
+            self.assertTrue(batch_manager.recovered)
             self.assertTrue(manager.unloaded)
+            self.assertTrue(batch_manager.unloaded)
 
     def test_action_log_supports_summary_and_detail_serialization(self) -> None:
         with FlaskFarmImportHarness() as harness:
@@ -305,6 +329,24 @@ class FlaskFarmStaticContractTest(unittest.TestCase):
             if isinstance(target, ast.Name)
         }
         self.assertIn("setting", assignments)
+
+    def test_public_version_values_agree(self) -> None:
+        info = (PROJECT_ROOT / "info.yaml").read_text(encoding="utf-8")
+        manifest = re.search(r'^version:\s*["\']?([^"\'\s]+)', info, re.MULTILINE)
+        package = re.search(
+            r'^__version__\s*=\s*["\']([^"\']+)',
+            (PROJECT_ROOT / "__init__.py").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        gateway = re.search(
+            r'^\s*VERSION\s*=\s*["\']([^"\']+)',
+            (PROJECT_ROOT / "services" / "plex_gateway.py").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(manifest)
+        self.assertIsNotNone(package)
+        self.assertIsNotNone(gateway)
+        self.assertEqual({manifest.group(1), package.group(1), gateway.group(1)}, {"1.1.0"})
 
     def test_menu_routes_have_modules_and_templates(self) -> None:
         with FlaskFarmImportHarness() as harness:
