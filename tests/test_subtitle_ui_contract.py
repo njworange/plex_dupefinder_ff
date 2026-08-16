@@ -55,6 +55,28 @@ class SubtitleUiContractTests(unittest.TestCase):
         self.assertIn("plan_digest: cleanup.planDigest", self.results)
         self.assertNotIn("window.prompt", self.results)
 
+    def test_individual_delete_has_no_second_popup_but_keeps_exact_handshake(self) -> None:
+        execute_delete = self.results.split("function executeDelete()", 1)[1].split(
+            "\nfunction ", 1
+        )[0]
+        self.assertNotIn("window.confirm", execute_delete)
+        self.assertIn("confirmation !== expected", execute_delete)
+        self.assertIn("nonce: pendingDeletePreview.nonce", execute_delete)
+        self.assertIn("confirmation: confirmation", execute_delete)
+        self.assertIn("plan_digest: cleanup.planDigest", execute_delete)
+        self.assertIn("Object.assign({}, pendingDeletePayload", execute_delete)
+
+        preview_delete = self.results.split("function previewDelete()", 1)[1].split(
+            "\nfunction ", 1
+        )[0]
+        self.assertIn("csrf_token: csrfToken", preview_delete)
+        self.assertIn("pendingDeletePayload = payload", preview_delete)
+
+        approve_batch = self.results.split("function approveBatch()", 1)[1].split(
+            "\nfunction ", 1
+        )[0]
+        self.assertIn("window.confirm", approve_batch)
+
     def test_subtitle_paths_and_reasons_are_html_escaped(self) -> None:
         self.assertIn("esc(subtitlePath(entry, true))", self.static)
         self.assertIn("esc(subtitlePath(entry, false))", self.static)
@@ -63,6 +85,27 @@ class SubtitleUiContractTests(unittest.TestCase):
         self.assertIn("위험·모호하여 제외", self.static)
         self.assertIn("영구삭제가 아니라 격리 이동", self.static)
         self.assertIn("격리·휴지통 없이 직접 영구삭제", self.static)
+
+    def test_direct_failure_diagnostics_preserve_message_and_escape_rendering(self) -> None:
+        self.assertIn("message: String(cleanup.message || value.message || '')", self.static)
+        self.assertIn("operationId: String(cleanup.operation_id || value.operation_id || '')", self.static)
+        self.assertIn("recoveryDiagnostics: recoveryDiagnostics", self.static)
+        self.assertIn("cleanup.recovery_diagnostics !== undefined", self.static)
+        self.assertIn("esc(cleanup.message)", self.static)
+        self.assertIn("esc(cleanup.operationId)", self.static)
+        self.assertIn("esc(label)", self.static)
+        self.assertNotIn("+ cleanup.message +", self.static)
+        self.assertNotIn("+ cleanup.operationId +", self.static)
+        for state, label in (
+            ("source_only", "원본 존재"),
+            ("tombstone_only", "임시파일 존재·수동 복구 필요"),
+            ("both_absent", "둘 다 없음·삭제 여부 수동 확인"),
+            ("conflict", "충돌"),
+            ("both_present", "충돌"),
+            ("unreadable", "경로 상태 확인 불가·수동 확인"),
+        ):
+            self.assertIn("%s: '%s'" % (state, label), self.static)
+        self.assertIn("PDFF.subtitleCleanupHtml(detail, 'result')", self.history)
 
     def test_batch_and_history_expose_subtitle_exceptions(self) -> None:
         self.assertIn("PDFF.subtitleCleanupHtml(item", self.results)

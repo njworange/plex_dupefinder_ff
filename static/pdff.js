@@ -128,6 +128,11 @@
     if (!Array.isArray(excluded)) excluded = [];
     var counts = cleanup.counts && typeof cleanup.counts === 'object' ? cleanup.counts : {};
     var backend = String(cleanup.backend || value.backend || '');
+    var recoveryDiagnostics = cleanup.recovery_diagnostics !== undefined
+      ? cleanup.recovery_diagnostics : value.recovery_diagnostics;
+    if (!Array.isArray(recoveryDiagnostics) && (!recoveryDiagnostics || typeof recoveryDiagnostics !== 'object')) {
+      recoveryDiagnostics = [];
+    }
     var detailsPresent = ['eligible', 'excluded', 'included_subtitles', 'excluded_subtitles'].some(function (key) {
       return Object.prototype.hasOwnProperty.call(cleanup, key);
     });
@@ -137,6 +142,9 @@
       enabled: cleanup.enabled === true || backend === 'quarantine' || backend === 'direct',
       backend: backend || 'plex',
       status: String(cleanup.status || ((backend === 'quarantine' || backend === 'direct') ? 'planned' : 'disabled')),
+      message: String(cleanup.message || value.message || ''),
+      operationId: String(cleanup.operation_id || value.operation_id || ''),
+      recoveryDiagnostics: recoveryDiagnostics,
       planDigest: String(cleanup.plan_digest || value.plan_digest || ''),
       quarantineDir: String(cleanup.quarantine_dir || cleanup.quarantine_root || ''),
       eligible: eligible,
@@ -146,6 +154,44 @@
       quarantinedCount: Number(counts.quarantined || 0) || 0,
       deletedCount: Number(counts.deleted || 0) || 0
     };
+  }
+
+  function recoveryDiagnosticStates(value) {
+    var labels = {
+      source_only: '원본 존재',
+      tombstone_only: '임시파일 존재·수동 복구 필요',
+      both_absent: '둘 다 없음·삭제 여부 수동 확인',
+      conflict: '충돌',
+      both_present: '충돌',
+      unreadable: '경로 상태 확인 불가·수동 확인'
+    };
+    var states = [];
+    function add(state) {
+      state = String(state || '');
+      if (Object.prototype.hasOwnProperty.call(labels, state)) states.push(labels[state]);
+    }
+    function visit(node, depth) {
+      if (depth > 8 || node === null || node === undefined) return;
+      if (Array.isArray(node)) {
+        node.forEach(function (entry) { visit(entry, depth + 1); });
+        return;
+      }
+      if (typeof node === 'string') {
+        add(node);
+        return;
+      }
+      if (typeof node !== 'object') return;
+      if (Object.prototype.hasOwnProperty.call(node, 'state')) {
+        add(node.state);
+        return;
+      }
+      Object.keys(node).forEach(function (key) {
+        if (Object.prototype.hasOwnProperty.call(labels, key) && node[key]) add(key);
+        else visit(node[key], depth + 1);
+      });
+    }
+    visit(value, 0);
+    return states;
   }
 
   function subtitlePath(entry, eligible) {
@@ -184,7 +230,8 @@
     var cleanup = subtitleCleanup(value);
     var direct = cleanup.backend === 'direct';
     var quarantine = cleanup.backend === 'quarantine';
-    var isResult = phase === 'result' || cleanup.status === 'quarantined' || cleanup.status === 'deleted' || cleanup.status === 'deleted_pending_scan' || cleanup.status === 'recovery_required';
+    var recoveryRequired = cleanup.status === 'recovery_required' || cleanup.status === 'manual_check_required';
+    var isResult = phase === 'result' || cleanup.status === 'quarantined' || cleanup.status === 'deleted' || cleanup.status === 'deleted_pending_scan' || recoveryRequired;
     var handledCount = isResult
       ? (direct ? cleanup.deletedCount : cleanup.quarantinedCount)
       : cleanup.eligibleCount;
@@ -223,7 +270,21 @@
       });
       html += '</details>';
     }
-    if (cleanup.status === 'recovery_required' || cleanup.status === 'manual_check_required') {
+    if (recoveryRequired) {
+      if (cleanup.message) {
+        html += '<div class="pdff-danger mt-2"><strong>실패 사유:</strong> ' + esc(cleanup.message) + '</div>';
+      }
+      if (cleanup.operationId) {
+        html += '<div class="pdff-muted mt-2"><span class="pdff-kv-label">작업 ID</span><span class="pdff-code">' + esc(cleanup.operationId) + '</span></div>';
+      }
+      var diagnosticStates = recoveryDiagnosticStates(cleanup.recoveryDiagnostics);
+      if (diagnosticStates.length) {
+        html += '<div class="pdff-danger mt-2"><strong>파일 상태 진단</strong><ul class="mb-0">';
+        diagnosticStates.forEach(function (label) {
+          html += '<li>' + esc(label) + '</li>';
+        });
+        html += '</ul></div>';
+      }
       html += '<div class="pdff-danger mt-2"><strong>수동 확인 필요:</strong> 파일 처리 결과가 완결되지 않았습니다. 감사 상세와 실제 파일을 확인하세요.</div>';
     }
     return html;

@@ -83,6 +83,24 @@ class _DirectManager:
         return 0
 
 
+class _FirstHandoffBlockedManager(_DirectManager):
+    def execute(self, *args, **kwargs):
+        self.execute_calls.append((args, kwargs))
+        action_log = kwargs["action_log"]
+        group = kwargs["group"]
+        action_log.status = "blocked"
+        action_log.message = (
+            "stage=rename_video_0; error=OSError; errno=18; "
+            "journal=902; action=%s" % action_log.id
+        )
+        group.safe_to_delete = True
+        group.resolution_status = "open"
+        group.safety_flags_json = "[]"
+        raise RuntimeError(
+            "직접 삭제 전 단계에서 실패했습니다. 원본 삭제는 시작되지 않았습니다."
+        )
+
+
 class _ScanManager:
     def __init__(self, jobs=None) -> None:
         self.jobs = [types.SimpleNamespace(id=701)] if jobs is None else jobs
@@ -168,6 +186,34 @@ class DirectDeleteServiceOrchestrationSafetyTest(unittest.TestCase):
         self.assertEqual(harness.run.deletion_attempts, 1)
         self.assertFalse(harness.candidates[1].deleted)
         self.assertEqual(harness.group.resolution_status, "delete_in_progress")
+
+    def test_first_handoff_blocked_state_survives_outer_catch_without_pms_delete(self) -> None:
+        before = self.item()
+        harness = DeleteServiceHarness(before)
+        self.configure(harness)
+        gateway = _Gateway([before])
+        direct = _FirstHandoffBlockedManager()
+        scans = _ScanManager()
+        service = harness.service_for(gateway, scans)
+        service.direct_delete_manager = direct
+
+        with self.assertRaisesRegex(RuntimeError, "원본 삭제는 시작되지"):
+            service.delete(
+                10,
+                1,
+                2,
+                "DELETE FILES 10 SUBTITLES 1 %s" % ("a" * 12),
+                plan_digest="a" * 64,
+            )
+
+        self.assertEqual(len(direct.execute_calls), 1)
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(scans.calls, [])
+        self.assertEqual(harness.session.logs[-1].status, "blocked")
+        self.assertIn("stage=rename_video_0", harness.session.logs[-1].message)
+        self.assertEqual(harness.group.resolution_status, "open")
+        self.assertTrue(harness.group.safe_to_delete)
+        self.assertEqual(harness.group.safety_flags_json, "[]")
 
     def test_digest_or_confirmation_drift_blocks_before_filesystem_execution(self) -> None:
         for confirmation, expected_digest, fresh_digest in (

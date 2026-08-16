@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -931,6 +932,59 @@ class ModelDirectDeleteJournal(ModelBase):
                 "deleted": self.deleted_count or 0,
             },
         }
+        if self.status == "recovery_required" and isinstance(operations, list):
+            recovery_items: List[Dict[str, Any]] = []
+            recovery_counts = {
+                "source_only": 0,
+                "tombstone_only": 0,
+                "both_absent": 0,
+                "conflict": 0,
+                "unreadable": 0,
+            }
+            for index, raw in enumerate(operations):
+                if not isinstance(raw, dict):
+                    continue
+                source = str(raw.get("source_path") or "")
+                tombstone = str(raw.get("tombstone_path") or "")
+                try:
+                    if not source or not tombstone:
+                        raise ValueError("missing recovery path")
+                    source_exists = bool(source and os.path.lexists(source))
+                    tombstone_exists = bool(
+                        tombstone and os.path.lexists(tombstone)
+                    )
+                    if source_exists and not tombstone_exists:
+                        observed = "source_only"
+                    elif not source_exists and tombstone_exists:
+                        observed = "tombstone_only"
+                    elif not source_exists and not tombstone_exists:
+                        observed = "both_absent"
+                    else:
+                        observed = "conflict"
+                except (OSError, ValueError):
+                    source_exists = False
+                    tombstone_exists = False
+                    observed = "unreadable"
+                recovery_counts[observed] += 1
+                recovery_items.append(
+                    {
+                        "index": index,
+                        "kind": str(raw.get("kind") or "unknown"),
+                        "recorded_state": str(raw.get("state") or "unknown"),
+                        "state": observed,
+                        "source_exists": source_exists,
+                        "handoff_exists": tombstone_exists,
+                    }
+                )
+            value["recovery_diagnostics"] = recovery_items
+            value["recovery_diagnostic_summary"] = {
+                "mode": "read_only",
+                "automatic_action": False,
+                "legacy_layout": bool(
+                    _json_load(self.operation_paths_json, [])
+                ),
+                "counts": recovery_counts,
+            }
         if self.last_error:
             value["message"] = self.last_error
         return value

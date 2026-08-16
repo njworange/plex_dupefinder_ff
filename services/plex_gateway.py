@@ -167,7 +167,7 @@ def parse_metadata(item: Dict[str, Any]) -> MetadataItem:
 
 class PlexGateway:
     PRODUCT = "Plex DupeFinder FF"
-    VERSION = "1.4.0"
+    VERSION = "1.4.1"
 
     def __init__(
         self,

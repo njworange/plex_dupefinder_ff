@@ -230,6 +230,116 @@ class DirectDeleteJournalApiSafetyTest(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, serialized)
 
+    def test_legacy_recovery_diagnostics_are_read_only_and_hide_internal_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pdff-direct-recovery-api-") as root:
+            folder = Path(root)
+            source_only_source = _write(folder / "source-only.mkv", b"source")
+            source_only_handoff = folder / ".pdff-private-source-only"
+            tombstone_only_source = folder / "tombstone-only.mkv"
+            tombstone_only_handoff = _write(
+                folder / ".pdff-private-tombstone-only", b"handoff"
+            )
+            absent_source = folder / "both-absent.mkv"
+            absent_handoff = folder / ".pdff-private-both-absent"
+            conflict_source = _write(folder / "conflict.mkv", b"source-conflict")
+            conflict_handoff = _write(
+                folder / ".pdff-private-conflict", b"handoff-conflict"
+            )
+            operations = [
+                {
+                    "source_path": str(source_only_source),
+                    "tombstone_path": str(source_only_handoff),
+                    "kind": "video",
+                    "state": "pending",
+                },
+                {
+                    "source_path": str(tombstone_only_source),
+                    "tombstone_path": str(tombstone_only_handoff),
+                    "kind": "subtitle",
+                    "state": "tombstoned",
+                },
+                {
+                    "source_path": str(absent_source),
+                    "tombstone_path": str(absent_handoff),
+                    "kind": "subtitle",
+                    "state": "unlink_unjournaled",
+                },
+                {
+                    "source_path": str(conflict_source),
+                    "tombstone_path": str(conflict_handoff),
+                    "kind": "subtitle",
+                    "state": "pending",
+                },
+            ]
+            before = {
+                path.name: path.read_bytes()
+                for path in folder.iterdir()
+                if path.is_file()
+            }
+
+            with FlaskFarmImportHarness() as harness:
+                model = harness.setup_module.P.ModelDirectDeleteJournal
+                journal = model()
+                journal.operation_key = "public-operation-id"
+                journal.status = "recovery_required"
+                journal.plan_digest = "d" * 64
+                journal.eligible_count = 0
+                journal.excluded_count = 0
+                journal.protected_count = 0
+                journal.deleted_count = 0
+                journal.last_error = (
+                    "stage=handoff_proof_video_0; error=DirectDeletePlanError; "
+                    "errno=none; journal=7; action=8"
+                )
+                journal.operation_paths_json = json.dumps(
+                    [{"path": str(folder / ".pdff-private-legacy-child")}]
+                )
+                journal.unlink_json = json.dumps(operations)
+                journal.manifest_json = "{}"
+
+                detail = journal.cleanup_api(include_paths=True)
+
+            after = {
+                path.name: path.read_bytes()
+                for path in folder.iterdir()
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(
+                [value["state"] for value in detail["recovery_diagnostics"]],
+                ["source_only", "tombstone_only", "both_absent", "conflict"],
+            )
+            summary = detail["recovery_diagnostic_summary"]
+            self.assertEqual(summary["mode"], "read_only")
+            self.assertFalse(summary["automatic_action"])
+            self.assertTrue(summary["legacy_layout"])
+            self.assertEqual(
+                summary["counts"],
+                {
+                    "source_only": 1,
+                    "tombstone_only": 1,
+                    "both_absent": 1,
+                    "conflict": 1,
+                    "unreadable": 0,
+                },
+            )
+            serialized_diagnostics = json.dumps(
+                {
+                    "items": detail["recovery_diagnostics"],
+                    "summary": detail["recovery_diagnostic_summary"],
+                    "message": detail["message"],
+                },
+                ensure_ascii=False,
+            )
+            for private_value in (
+                str(source_only_source),
+                str(tombstone_only_handoff),
+                str(absent_handoff),
+                str(conflict_handoff),
+                ".pdff-private-",
+            ):
+                self.assertNotIn(private_value, serialized_diagnostics)
+
 
 if __name__ == "__main__":
     unittest.main()

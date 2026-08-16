@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.1
+
+- Reworked direct deletion to use a randomized same-parent handoff path, avoiding mergerfs cross-branch child-directory renames while keeping every mutation journaled before it starts.
+- Added open-file-descriptor and content proof for mergerfs path-hash inode modes, followed by an immediate path identity recheck before unlinking; this protects normal concurrent replacement without claiming an adversarial zero-race guarantee.
+- Treated explicitly unsupported FUSE directory `fsync` errors as audited best-effort durability limitations while keeping other sync failures fatal.
+- Added mutation-aware failure classification and stage/exception/errno/journal diagnostics: pre-mutation failures remain blocked for a fresh reviewed retry, while post-mutation uncertainty remains `recovery_required` for manual review.
+- Added read-only state diagnostics for legacy `recovery_required` direct-delete journals; legacy source and handoff paths are never automatically deleted or restored.
+- Removed the extra browser confirmation dialog for individual deletion while retaining the server-enforced exact confirmation phrase, one-time nonce, plan digest and CSRF checks.
+
 ## 1.4.0
 
 - Removed the per-scan deletion-attempt cap while retaining the atomic database attempt counter, scan-status guard, global deletion lease and audit history.

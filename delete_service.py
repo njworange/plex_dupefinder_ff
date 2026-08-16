@@ -1576,6 +1576,7 @@ class DeleteService:
                 log = F.db.session.query(ModelActionLog).filter_by(id=log.id).first()
                 if log is not None and log.status not in (
                     "unknown",
+                    "blocked",
                     "verification_failed",
                     "critical",
                     "success",
