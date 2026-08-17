@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.1
+
+- Changed automatic cleanup so a highest-score tie keeps exactly one deterministic version instead of excluding the group. Numeric Plex Media IDs are ordered numerically, with a stable case-insensitive text fallback, and every other safely validated version is processed.
+- Applied the same tie-break rule to scan-time keep recommendations and automatic-plan revalidation, including existing scans whose tied group has no stored recommendation, while retaining all path, subtitle, multipart, lease, nonce and digest safety checks.
+- Exposed the selected tie winner in automatic-cleanup item messages and updated the settings/results guidance to describe the rule.
+
 ## 1.6.0
 
 - Reworked the results workflow around scan/score, one-click selected-version deletion, and an opt-in automatic cleanup started by the user; neither deletion path asks for typed confirmation or a browser confirmation dialog, while server-side CSRF, one-time nonce, fresh plan digest and global lease checks remain mandatory.

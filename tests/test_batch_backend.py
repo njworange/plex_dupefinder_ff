@@ -481,8 +481,8 @@ class BatchBackendTest(unittest.TestCase):
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
             group = _Record(id=1, safe_to_delete=True, resolution_status="open")
-            first = _Record(id=10, score=100.0)
-            second = _Record(id=20, score=50.0)
+            first = _Record(id=10, media_id="20", score=100.0)
+            second = _Record(id=20, media_id="10", score=50.0)
 
             class Candidates:
                 values = [first, second]
@@ -497,15 +497,18 @@ class BatchBackendTest(unittest.TestCase):
             self.assertEqual((pair[0].id, pair[1].id), (10, 20))
 
             second.score = 100.0
-            self.assertIsNone(module.BatchDeleteManager._eligible_pair(group))
+            group.recommended_candidate_id = None
+            tied_pair = module.BatchDeleteManager._eligible_pair(group)
+            self.assertEqual((tied_pair[0].id, tied_pair[1].id), (20, 10))
             second.score = 50.0
-            Candidates.values.append(_Record(id=30, score=1.0))
+            group.recommended_candidate_id = 10
+            Candidates.values.append(_Record(id=30, media_id="30", score=1.0))
             planned = module.BatchDeleteManager._eligible_group(group)
             self.assertEqual(planned[0].id, 10)
             self.assertEqual([value.id for value in planned[1]], [20, 30])
             self.assertIsNone(module.BatchDeleteManager._eligible_pair(group))
 
-    def test_auto_plan_includes_every_lower_version_and_explains_tie(self) -> None:
+    def test_auto_plan_keeps_one_deterministic_version_for_highest_score_tie(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
             eligible = _Record(
@@ -530,13 +533,14 @@ class BatchBackendTest(unittest.TestCase):
             )
             candidates = {
                 1: [
-                    _Record(id=10, score=100.0),
-                    _Record(id=11, score=80.0),
-                    _Record(id=12, score=60.0),
+                    _Record(id=10, media_id="10", score=100.0),
+                    _Record(id=11, media_id="11", score=80.0),
+                    _Record(id=12, media_id="12", score=60.0),
                 ],
                 2: [
-                    _Record(id=20, score=50.0),
-                    _Record(id=21, score=50.0),
+                    _Record(id=20, media_id="42", score=50.0),
+                    _Record(id=21, media_id="7", score=50.0),
+                    _Record(id=22, media_id="99", score=10.0),
                 ],
             }
             module.ModelDuplicateGroup = types.SimpleNamespace(
@@ -550,13 +554,12 @@ class BatchBackendTest(unittest.TestCase):
                 9, set(), "direct"
             )
 
-            self.assertEqual(eligible_count, 1)
+            self.assertEqual(eligible_count, 2)
             self.assertEqual(
-                [(keep.id, target.id) for _group, keep, target in pairs],
-                [(10, 11), (10, 12)],
+                [(_group.id, keep.id, target.id) for _group, keep, target in pairs],
+                [(1, 10, 11), (1, 10, 12), (2, 21, 20), (2, 21, 22)],
             )
-            self.assertEqual(excluded[0]["group_id"], 2)
-            self.assertEqual(excluded[0]["reason"], "highest_score_tie")
+            self.assertEqual(excluded, [])
 
     def test_cross_group_paths_use_remote_case_policy_and_block_both_groups(self) -> None:
         with FlaskFarmImportHarness() as harness:

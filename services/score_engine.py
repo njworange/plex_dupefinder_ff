@@ -46,6 +46,20 @@ DEFAULT_FILENAME_RULES: Tuple[Tuple[str, float], ...] = (
 )
 
 
+def stable_media_id_key(value: object) -> tuple:
+    """Return a deterministic ordering key for Plex Media IDs.
+
+    Plex normally uses decimal identifiers.  Numeric ordering avoids choosing
+    ``"10"`` before ``"2"`` while the text fallback keeps unusual IDs stable.
+    """
+
+    text = str(value or "").strip()
+    try:
+        return (0, int(text), text)
+    except (TypeError, ValueError):
+        return (1, text.casefold(), text)
+
+
 def serialize_score_map(values: Dict[str, float]) -> str:
     return "\n".join(
         "%s=%s" % (key, int(float(value)) if float(value).is_integer() else value)
@@ -207,4 +221,4 @@ class ScoreEngine:
             return ""
         highest = max(score for _, score in scored)
         winners = [media_id for media_id, score in scored if abs(score - highest) < 0.0001]
-        return winners[0] if len(winners) == 1 else ""
+        return str(min(winners, key=stable_media_id_key))

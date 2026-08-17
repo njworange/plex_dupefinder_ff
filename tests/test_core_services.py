@@ -140,14 +140,20 @@ class ScoringTests(unittest.TestCase):
         )
         self.assertEqual(ScoreEngine(config).score(version).breakdown["filename"], 50)
 
-    def test_tie_has_no_recommendation(self):
-        versions = (MediaVersion(media_id="1"), MediaVersion(media_id="2"))
+    def test_tie_keeps_smallest_media_id_independent_of_input_order(self):
+        versions = (
+            MediaVersion(media_id="10"),
+            MediaVersion(media_id="2"),
+            MediaVersion(media_id="alpha"),
+        )
         config = ScoreConfig(
             video_codec_scores={}, audio_codec_scores={}, resolution_scores={},
             filename_rules=(), bitrate_weight=0, duration_weight=0,
             dimension_weight=0, audio_channel_weight=0,
         )
-        self.assertEqual(ScoreEngine(config).recommended_media_id(versions), "")
+        engine = ScoreEngine(config)
+        self.assertEqual(engine.recommended_media_id(versions), "2")
+        self.assertEqual(engine.recommended_media_id(reversed(versions)), "2")
 
 
 class SafetyTests(unittest.TestCase):

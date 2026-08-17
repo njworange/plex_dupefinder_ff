@@ -41,6 +41,8 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("setting_batch_delete_enabled", self.setting)
         self.assertNotIn("setting_batch_max_items", self.setting)
         self.assertIn("항목 수 상한은 없습니다", self.setting)
+        self.assertIn("Plex Media ID가 가장 작은 버전 하나를 유지", self.setting)
+        self.assertIn("Plex Media ID가 가장 작은 버전 하나를 유지", self.results)
         self.assertIn("batchEnabled && !deleteEnabled", self.setting)
 
     def test_post_delete_scan_setting_is_opt_in_and_enum_validated(self) -> None:

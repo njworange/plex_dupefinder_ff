@@ -27,6 +27,7 @@ from .models import (
 )
 from .path_conflicts import candidate_paths, cross_group_path_conflicts
 from .scan_manager import _config_snapshot, current_safety_policy, current_score_config
+from .services.score_engine import stable_media_id_key
 from .setup import P
 
 
@@ -131,23 +132,39 @@ class BatchDeleteManager:
             raise RuntimeError("점수 또는 안전 설정이 스캔 이후 변경되었습니다. 다시 스캔하세요.")
 
     @staticmethod
+    def _winner_key(candidate: ModelMediaCandidate) -> tuple:
+        return (
+            stable_media_id_key(getattr(candidate, "media_id", "")),
+            int(getattr(candidate, "id", 0) or 0),
+        )
+
+    @classmethod
+    def _highest_score_winners(
+        cls, candidates: Sequence[ModelMediaCandidate]
+    ) -> Tuple[ModelMediaCandidate, ...]:
+        highest = max(float(candidate.score or 0) for candidate in candidates)
+        return tuple(
+            candidate
+            for candidate in candidates
+            if abs(float(candidate.score or 0) - highest) < 0.0001
+        )
+
+    @classmethod
     def _eligible_group(
-        group: ModelDuplicateGroup,
+        cls, group: ModelDuplicateGroup,
     ) -> Optional[Tuple[ModelMediaCandidate, Tuple[ModelMediaCandidate, ...]]]:
         if not group.safe_to_delete or group.resolution_status != "open":
             return None
         candidates = ModelMediaCandidate.by_group(group.id, include_deleted=False)
-        if len(candidates) < 2 or group.recommended_candidate_id is None:
+        if len(candidates) < 2:
             return None
-        highest = max(float(candidate.score or 0) for candidate in candidates)
-        winners = [
-            candidate
-            for candidate in candidates
-            if abs(float(candidate.score or 0) - highest) < 0.0001
-        ]
-        if len(winners) != 1 or winners[0].id != group.recommended_candidate_id:
+        winners = cls._highest_score_winners(candidates)
+        keep = min(winners, key=cls._winner_key)
+        stored_recommendation = group.recommended_candidate_id
+        if stored_recommendation is not None and keep.id != stored_recommendation:
             return None
-        keep = winners[0]
+        if len(winners) == 1 and stored_recommendation is None:
+            return None
         targets = tuple(candidate for candidate in candidates if candidate.id != keep.id)
         if not targets:
             return None
@@ -239,28 +256,18 @@ class BatchDeleteManager:
                     )
                 )
                 continue
-            highest = max(float(candidate.score or 0) for candidate in candidates)
-            winners = [
-                candidate
-                for candidate in candidates
-                if abs(float(candidate.score or 0) - highest) < 0.0001
-            ]
-            if len(winners) != 1:
-                excluded.append(
-                    cls._excluded_group(
-                        group,
-                        "highest_score_tie",
-                        "최고 점수가 동률이라 유지 버전을 자동 결정하지 않습니다.",
-                    )
-                )
-                continue
-            keep = winners[0]
-            if keep.id != group.recommended_candidate_id:
+            winners = cls._highest_score_winners(candidates)
+            keep = min(winners, key=cls._winner_key)
+            stored_recommendation = group.recommended_candidate_id
+            if (
+                stored_recommendation is not None
+                and keep.id != stored_recommendation
+            ) or (len(winners) == 1 and stored_recommendation is None):
                 excluded.append(
                     cls._excluded_group(
                         group,
                         "recommendation_mismatch",
-                        "현재 단독 최고 점수와 저장된 유지 추천이 일치하지 않습니다.",
+                        "현재 최고 점수 유지 결정과 저장된 유지 추천이 일치하지 않습니다.",
                     )
                 )
                 continue
@@ -917,6 +924,11 @@ class BatchDeleteManager:
                         )
                 else:
                     batch.confirmation = "BATCH DELETE %s ITEMS %s" % (batch.id, len(pairs))
+                tied_group_ids = {
+                    int(group.id)
+                    for group, keep, target in pairs
+                    if abs(float(keep.score or 0) - float(target.score or 0)) < 0.0001
+                }
                 for index, (group, keep, target) in enumerate(pairs):
                     F.db.session.add(
                         ModelBatchItem(
@@ -927,7 +939,12 @@ class BatchDeleteManager:
                             delete_candidate_id=target.id,
                             created_at=now,
                             status="planned",
-                            message="승인 대기 중",
+                            message=(
+                                "최고 점수 동률 · Plex Media ID가 가장 작은 Media #%s 유지"
+                                % keep.media_id
+                                if int(group.id) in tied_group_ids
+                                else "승인 대기 중"
+                            ),
                             title=group.title or group.grandparent_title or "",
                             media_type=group.media_type or "",
                             keep_media_id=keep.media_id,
