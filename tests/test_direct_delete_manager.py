@@ -1375,6 +1375,88 @@ class HybridDirectDeleteManagerSafetyTest(unittest.TestCase):
         self.assertTrue(self.keep_subtitle.exists())
         self.assertFalse(any(self.data.rglob("*.backup")))
 
+    def test_auto_group_finalizer_does_not_restore_later_deleted_survivor(self):
+        later_video = _write(
+            self.folder / "Film.1440p.mkv", b"later-delete-video"
+        )
+        later_subtitle = _write(
+            self.folder / "Film.1440p.ko.srt", b"later-delete-subtitle"
+        )
+        first_plan = build_direct_delete_plan(
+            (str(self.delete_video),),
+            (str(self.keep_video), str(later_video)),
+            (str(self.media),),
+            (str(self.media),),
+            "web",
+        )
+        first_before = _PlexItem(
+            _MediaVersion("10", self.delete_video),
+            _MediaVersion("20", self.keep_video),
+            _MediaVersion("30", later_video),
+        )
+        first_after = _PlexItem(
+            _MediaVersion("20", self.keep_video),
+            _MediaVersion("30", later_video),
+        )
+        harness, _module, _session, manager, records = self.manager_context()
+        first_gateway = _HybridGateway(
+            first_before,
+            first_after,
+            mutate=lambda: self._unlink(self.delete_video, self.delete_subtitle),
+        )
+        try:
+            first_journal = manager.execute(
+                first_plan,
+                first_plan.plan_digest,
+                gateway=first_gateway,
+                current_item=first_before,
+                **records,
+            )
+            second_plan = build_direct_delete_plan(
+                (str(later_video),),
+                (str(self.keep_video),),
+                (str(self.media),),
+                (str(self.media),),
+                "web",
+            )
+            second_records = dict(records)
+            second_records["candidate"] = _Record(id=6, media_id="30")
+            second_records["action_log"] = _Record(
+                id=7,
+                status="validating",
+                message="",
+                response_status=None,
+                after_json="",
+            )
+            second_gateway = _HybridGateway(
+                first_after,
+                _PlexItem(_MediaVersion("20", self.keep_video)),
+                mutate=lambda: self._unlink(later_video, later_subtitle),
+            )
+            second_journal = manager.execute(
+                second_plan,
+                second_plan.plan_digest,
+                gateway=second_gateway,
+                current_item=first_after,
+                **second_records,
+            )
+            intentional = (str(later_video), str(later_subtitle))
+            first_verified = manager.verify_deleted(
+                first_journal, intentionally_deleted_paths=intentional
+            )
+            second_verified = manager.verify_deleted(
+                second_journal, intentionally_deleted_paths=intentional
+            )
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(first_verified["restored"], 0)
+        self.assertEqual(second_verified["restored"], 0)
+        self.assertFalse(later_video.exists())
+        self.assertFalse(later_subtitle.exists())
+        self.assertTrue(self.keep_video.exists())
+        self.assertTrue(self.keep_subtitle.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

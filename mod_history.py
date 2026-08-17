@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import secrets
 import traceback
 from typing import Any, Dict
 
-from flask import jsonify, render_template
+from flask import jsonify, render_template, session
 from plugin import PluginModuleBase
 
-from .models import ModelActionLog
+from .models import ModelActionLog, ModelPostDeleteScanJob
 from .setup import P
 
 
@@ -22,7 +23,17 @@ class ModuleHistory(PluginModuleBase):
         arg["package_name"] = P.package_name
         arg["module_name"] = self.name
         arg["sub"] = sub
+        if "plex_dupefinder_ff_csrf" not in session:
+            session["plex_dupefinder_ff_csrf"] = secrets.token_urlsafe(32)
+        arg["csrf_token"] = session["plex_dupefinder_ff_csrf"]
         return render_template("%s_%s_list.html" % (P.package_name, self.name), arg=arg)
+
+    @staticmethod
+    def _csrf(req: Any) -> None:
+        expected = session.get("plex_dupefinder_ff_csrf", "")
+        actual = req.form.get("csrf_token", "")
+        if not expected or not actual or not secrets.compare_digest(expected, actual):
+            raise ValueError("보안 토큰이 만료되었습니다. 페이지를 새로고침하세요.")
 
     def process_ajax(self, sub: str, req: Any) -> Any:
         try:
@@ -65,6 +76,39 @@ class ModuleHistory(PluginModuleBase):
                 if item is None:
                     raise ValueError("감사 이력을 찾을 수 없습니다.")
                 return jsonify({"ret": "success", "data": item.as_api(include_snapshots=True)})
+            if sub == "force_delete":
+                if req.method != "POST":
+                    raise ValueError("작업 이력 강제 삭제는 POST만 허용합니다.")
+                self._csrf(req)
+                item_type = str(req.form.get("item_type", "")).strip()
+                if item_type not in ("action", "post_scan"):
+                    raise ValueError("작업 이력 종류가 올바르지 않습니다.")
+                try:
+                    item_id = int(req.form.get("item_id", 0))
+                except (TypeError, ValueError):
+                    item_id = 0
+                if item_id <= 0:
+                    raise ValueError("작업 이력 ID가 올바르지 않습니다.")
+                expected_confirmation = "FORCE DELETE %s %s" % (
+                    "ACTION" if item_type == "action" else "POST_SCAN",
+                    item_id,
+                )
+                confirmation = str(req.form.get("confirmation", ""))
+                if not secrets.compare_digest(expected_confirmation, confirmation):
+                    raise ValueError("작업 이력 강제 삭제 확인값이 일치하지 않습니다.")
+                model = (
+                    ModelActionLog
+                    if item_type == "action"
+                    else ModelPostDeleteScanJob
+                )
+                result = model.force_delete_history(item_id)
+                return jsonify(
+                    {
+                        "ret": "success",
+                        "msg": "DB 작업 이력을 강제로 삭제했습니다. 파일과 Plex에는 명령을 보내지 않았습니다.",
+                        "data": result,
+                    }
+                )
             return jsonify({"ret": "danger", "msg": "지원하지 않는 요청입니다."}), 400
         except Exception as exc:
             P.logger.warning("History request failed: %s", exc.__class__.__name__)

@@ -10,6 +10,8 @@ from services.plex_gateway import (
     PlexDeleteOutcomeUnknown,
     PlexGateway,
     PlexGatewayError,
+    PlexHTTPError,
+    PlexMetadataNotFound,
     parse_metadata,
 )
 
@@ -147,6 +149,26 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(item.media), 2)
         self.assertEqual(item.media[0].parts[0].file, "/media/a.mkv")
         self.assertEqual(item.media[0].audio_tracks[0].channels, 6)
+
+    def test_metadata_not_found_has_local_stale_item_taxonomy(self):
+        for response in (
+            FakeResponse(status=404),
+            FakeResponse(status=410),
+            FakeResponse({"MediaContainer": {}}),
+        ):
+            with self.subTest(status=response.status_code):
+                gateway = PlexGateway(
+                    self.connection(), session=FakeSession([response])
+                )
+                with self.assertRaises(PlexMetadataNotFound):
+                    gateway.get_metadata("100")
+
+        gateway = PlexGateway(
+            self.connection(), session=FakeSession([FakeResponse(status=500)])
+        )
+        with self.assertRaises(PlexHTTPError) as error:
+            gateway.get_metadata("100")
+        self.assertEqual(error.exception.status_code, 500)
 
     def test_xml_fallback_is_supported(self):
         xml = '<MediaContainer machineIdentifier="machine-1" version="1.40"></MediaContainer>'

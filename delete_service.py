@@ -4,7 +4,7 @@ import json
 import secrets
 import threading
 from datetime import datetime
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 from framework import F
 
@@ -29,6 +29,7 @@ from .services.plex_gateway import (
     PlexDeleteOutcomeUnknown,
     PlexGateway,
     PlexGatewayError,
+    PlexMetadataNotFound,
 )
 from .services.plex_mate_provider import PlexMateProvider
 from .services.post_delete_scan_targets import build_scan_targets, validate_scan_target
@@ -176,7 +177,10 @@ class DeleteService:
 
     @staticmethod
     def _quarantine_snapshot_state(
-        before: Dict[str, Any], current: Any, delete_media_id: str
+        before: Dict[str, Any],
+        current: Any,
+        delete_media_id: str,
+        delete_media_ids: Sequence[str] = (),
     ) -> str:
         """Return verified/trash_pending or raise a safe classification."""
 
@@ -197,30 +201,39 @@ class DeleteService:
         if delete_media_id not in expected:
             raise RuntimeError("격리 대상 Media가 이전 snapshot에 없습니다.")
         current_by_id = {str(value.media_id): value for value in current.media}
-        survivor_ids = set(expected) - {delete_media_id}
+        intentional_ids = {str(value) for value in delete_media_ids if str(value)}
+        intentional_ids.add(str(delete_media_id))
+        deleted_in_snapshot = set(expected) & intentional_ids
+        survivor_ids = set(expected) - deleted_in_snapshot
         current_ids = set(current_by_id)
-        if delete_media_id not in current_ids:
+        remaining_deleted = current_ids & deleted_in_snapshot
+        if not remaining_deleted:
             if current_ids != survivor_ids:
                 raise RuntimeError("부분 스캔 후 Media 집합이 예상과 다릅니다.")
             state = "verified"
         else:
-            if current_ids != set(expected):
+            if current_ids != survivor_ids | remaining_deleted:
                 raise RuntimeError("부분 스캔 후 Media 집합이 예상과 다릅니다.")
-            target = current_by_id[delete_media_id]
-            expected_parts = expected[delete_media_id].get("parts", [])
-            expected_paths = {
-                str(value.get("file") or "")
-                for value in expected_parts
-                if isinstance(value, dict) and value.get("file")
-            }
-            current_paths = {str(part.file or "") for part in target.parts if part.file}
-            if current_paths != expected_paths:
-                raise RuntimeError("격리 대상 Part 구성이 예상과 다릅니다.")
-            exists_values = [part.exists for part in target.parts]
-            if not exists_values or any(value is not False for value in exists_values):
-                raise PostDeleteScanRetryable(
-                    "Plex가 격리된 영상 파일을 아직 반영하지 않았습니다."
-                )
+            for target_id in remaining_deleted:
+                target = current_by_id[target_id]
+                expected_parts = expected[target_id].get("parts", [])
+                expected_paths = {
+                    str(value.get("file") or "")
+                    for value in expected_parts
+                    if isinstance(value, dict) and value.get("file")
+                }
+                current_paths = {
+                    str(part.file or "") for part in target.parts if part.file
+                }
+                if current_paths != expected_paths:
+                    raise RuntimeError("격리 대상 Part 구성이 예상과 다릅니다.")
+                exists_values = [part.exists for part in target.parts]
+                if not exists_values or any(
+                    value is not False for value in exists_values
+                ):
+                    raise PostDeleteScanRetryable(
+                        "Plex가 처리된 영상 파일을 아직 반영하지 않았습니다."
+                    )
             state = "trash_pending"
 
         for media_id in survivor_ids:
@@ -282,6 +295,48 @@ class DeleteService:
         if callable(heartbeat):
             heartbeat()
 
+        deleted_ids_by_group: Dict[int, Set[str]] = {}
+        deleted_paths_by_group: Dict[int, Set[str]] = {}
+        for related_action_id in action_ids:
+            related_journal = ModelDirectDeleteJournal.for_action(
+                related_action_id
+            )
+            related_action = ModelActionLog.get(related_action_id)
+            if related_journal is None or related_action is None:
+                continue
+            try:
+                related_manifest = json.loads(
+                    getattr(related_journal, "manifest_json", "") or "{}"
+                )
+            except (TypeError, ValueError):
+                continue
+            related_candidate = ModelMediaCandidate.get(
+                related_journal.candidate_id
+            )
+            if related_candidate is not None:
+                deleted_ids_by_group.setdefault(
+                    int(related_journal.group_id), set()
+                ).add(str(related_candidate.media_id))
+            if isinstance(related_manifest, dict):
+                video = related_manifest.get("video")
+                if isinstance(video, dict) and video.get("path"):
+                    deleted_paths_by_group.setdefault(
+                        int(related_journal.group_id), set()
+                    ).add(str(video["path"]))
+                for decision in related_manifest.get("eligible", []):
+                    if not isinstance(decision, dict):
+                        continue
+                    snapshot = decision.get("snapshot")
+                    path = (
+                        snapshot.get("path")
+                        if isinstance(snapshot, dict)
+                        else decision.get("path")
+                    )
+                    if path:
+                        deleted_paths_by_group.setdefault(
+                            int(related_journal.group_id), set()
+                        ).add(str(path))
+
         retry_needed = False
         critical_found = False
         for action_id in action_ids:
@@ -311,7 +366,9 @@ class DeleteService:
                 if action is not None:
                     action.status = "critical"
                     action.message = message
-                    group = ModelDuplicateGroup.get(job.group_id)
+                    group = ModelDuplicateGroup.get(
+                        getattr(action, "group_id", None) or job.group_id
+                    )
                     if group is not None:
                         group.safe_to_delete = False
                         group.resolution_status = "manual_check_required"
@@ -358,7 +415,11 @@ class DeleteService:
                 except (TypeError, ValueError):
                     raise RuntimeError("직접 삭제 당시 Plex snapshot을 읽을 수 없습니다.") from None
                 filesystem = self.direct_delete_manager.verify_deleted(
-                    journal, heartbeat=heartbeat if callable(heartbeat) else None
+                    journal,
+                    heartbeat=heartbeat if callable(heartbeat) else None,
+                    intentionally_deleted_paths=tuple(
+                        deleted_paths_by_group.get(int(journal.group_id), set())
+                    ),
                 )
                 if int(filesystem.get("restored", 0) or 0):
                     journal.last_error = (
@@ -369,21 +430,31 @@ class DeleteService:
                     F.db.session.commit()
                     raise PostDeleteScanRefreshRequired(journal.last_error)
                 state = self._quarantine_snapshot_state(
-                    before, current, str(candidate.media_id)
+                    before,
+                    current,
+                    str(candidate.media_id),
+                    tuple(
+                        deleted_ids_by_group.get(int(journal.group_id), set())
+                    ),
                 )
                 if not candidate.deleted:
                     candidate.deleted = True
                     candidate.deleted_at = datetime.now()
-                    run.successful_deletions = (run.successful_deletions or 0) + 1
-                group.safe_to_delete = False
-                group.resolution_status = "rescan_required"
-                group.safety_flags_json = _json(
-                    [
-                        "plex_trash_pending_after_direct_delete"
-                        if state == "trash_pending"
-                        else "rescan_required_after_direct_delete"
-                    ]
-                )
+                # This block is reached only for a non-terminal journal. The
+                # journal state and counter commit together, so a retry skips
+                # the terminal journal and cannot increment twice even when a
+                # batch pre-marked the candidate inactive for its next target.
+                run.successful_deletions = (run.successful_deletions or 0) + 1
+                if group.resolution_status != "manual_check_required":
+                    group.safe_to_delete = False
+                    group.resolution_status = "rescan_required"
+                    group.safety_flags_json = _json(
+                        [
+                            "plex_trash_pending_after_direct_delete"
+                            if state == "trash_pending"
+                            else "rescan_required_after_direct_delete"
+                        ]
+                    )
                 journal.status = state
                 journal.finished_at = datetime.now()
                 journal.updated_at = datetime.now()
@@ -579,7 +650,9 @@ class DeleteService:
                 if action is not None:
                     action.status = "critical"
                     action.message = message
-                    group = ModelDuplicateGroup.get(job.group_id)
+                    group = ModelDuplicateGroup.get(
+                        getattr(action, "group_id", None) or job.group_id
+                    )
                     if group is not None:
                         group.safe_to_delete = False
                         group.resolution_status = "manual_check_required"
@@ -647,16 +720,17 @@ class DeleteService:
                 if not candidate.deleted:
                     candidate.deleted = True
                     candidate.deleted_at = datetime.now()
-                    run.successful_deletions = (run.successful_deletions or 0) + 1
-                group.safe_to_delete = False
-                group.resolution_status = "rescan_required"
-                group.safety_flags_json = _json(
-                    [
-                        "plex_trash_pending_after_quarantine"
-                        if state == "trash_pending"
-                        else "rescan_required_after_quarantine"
-                    ]
-                )
+                run.successful_deletions = (run.successful_deletions or 0) + 1
+                if group.resolution_status != "manual_check_required":
+                    group.safe_to_delete = False
+                    group.resolution_status = "rescan_required"
+                    group.safety_flags_json = _json(
+                        [
+                            "plex_trash_pending_after_quarantine"
+                            if state == "trash_pending"
+                            else "rescan_required_after_quarantine"
+                        ]
+                    )
                 journal.status = state
                 journal.finished_at = datetime.now()
                 journal.updated_at = datetime.now()
@@ -844,121 +918,222 @@ class DeleteService:
     ) -> Dict[str, Any]:
         """Perform a mutation-free live preview and bind filesystem state."""
 
-        if not _delete_enabled():
-            raise RuntimeError("설정에서 수동 삭제를 먼저 활성화해야 합니다.")
-        with F.app.app_context():
-            run, group, candidate, keep = self._load(
-                group_id, candidate_id, keep_candidate_id
+        previews, errors = self.preview_many(
+            ((group_id, candidate_id, keep_candidate_id),)
+        )
+        key = (int(group_id), int(candidate_id), int(keep_candidate_id))
+        if key not in previews:
+            raise RuntimeError(
+                errors.get(int(group_id))
+                or "선택한 버전의 삭제 계획을 만들 수 없습니다."
             )
-            if not group.safe_to_delete or group.resolution_status != "open":
-                raise RuntimeError("이 그룹은 안전 삭제 조건을 충족하지 않습니다. 다시 스캔하세요.")
-            if run.status not in ("completed", "completed_with_warnings"):
-                raise RuntimeError("완료된 스캔의 결과만 처리할 수 있습니다.")
+        return previews[key]
+
+    def preview_many(
+        self,
+        requests: Sequence[Tuple[int, int, int]],
+    ) -> Tuple[Dict[Tuple[int, int, int], Dict[str, Any]], Dict[int, str]]:
+        """Preview a run in one Plex context, once per duplicate group.
+
+        Identity and section discovery are run-scoped, while metadata freshness
+        is group-scoped.  Filesystem plans remain target-scoped.  A local
+        safety/filesystem problem excludes its complete group; provider and
+        Plex transport failures propagate immediately so a large automatic
+        plan cannot wait for the same timeout hundreds of times.
+        """
+
+        if not _delete_enabled():
+            raise RuntimeError("설정에서 선택 버전 삭제를 먼저 활성화해야 합니다.")
+        normalized: list = []
+        seen = set()
+        for raw_group_id, raw_candidate_id, raw_keep_id in requests:
+            key = (int(raw_group_id), int(raw_candidate_id), int(raw_keep_id))
+            if key not in seen:
+                normalized.append(key)
+                seen.add(key)
+        if not normalized:
+            return {}, {}
+
+        with F.app.app_context():
+            grouped: Dict[int, list] = {}
+            errors: Dict[int, str] = {}
+            for group_id, candidate_id, keep_candidate_id in normalized:
+                if group_id in errors:
+                    continue
+                try:
+                    run, group, candidate, keep = self._load(
+                        group_id, candidate_id, keep_candidate_id
+                    )
+                    if not group.safe_to_delete or group.resolution_status != "open":
+                        raise RuntimeError(
+                            "이 그룹은 안전 삭제 조건을 충족하지 않습니다. 다시 스캔하세요."
+                        )
+                    if run.status not in ("completed", "completed_with_warnings"):
+                        raise RuntimeError("완료된 스캔의 결과만 처리할 수 있습니다.")
+                    if group_has_cross_path_conflict(run.id, group.id):
+                        raise RuntimeError(
+                            "다른 Plex metadata 그룹과 Part 파일 경로가 겹칩니다."
+                        )
+                    grouped.setdefault(group_id, []).append(
+                        (run, group, candidate, keep)
+                    )
+                except Exception as exc:
+                    errors[group_id] = str(exc) or exc.__class__.__name__
+                    grouped.pop(group_id, None)
+
+            if not grouped:
+                return {}, errors
+            run_by_id = {
+                int(values[0][0].id): values[0][0]
+                for values in grouped.values()
+            }
+            if len(run_by_id) != 1:
+                raise RuntimeError("서로 다른 스캔 결과를 하나의 자동 계획으로 처리할 수 없습니다.")
+            run = next(iter(run_by_id.values()))
             budget = require_delete_attempt_available(run)
-            if group_has_cross_path_conflict(run.id, group.id):
-                raise RuntimeError("다른 Plex metadata 그룹과 Part 파일 경로가 겹칩니다.")
 
             connection = PlexMateProvider().resolve(require_machine_id=True)
             gateway = PlexGateway(connection, timeout=(5, _timeout()))
             identity = gateway.validate_identity(connection.machine_id, require_match=True)
             if identity.machine_id != run.server_machine_id:
                 raise RuntimeError("스캔 당시 Plex 서버와 현재 서버가 다릅니다.")
-            current = gateway.get_metadata(group.rating_key)
-            active_candidates = ModelMediaCandidate.by_group(group.id, include_deleted=False)
-            freshness = validate_fresh_snapshot(
-                current,
-                group.identity_fingerprint,
-                {item.media_id: item.fingerprint for item in active_candidates},
-            )
-            if not freshness.safe:
-                raise RuntimeError("스캔 이후 Plex 항목이 변경되었습니다: %s" % ", ".join(freshness.flags))
-            safety_policy = current_safety_policy()
-            safety = assess_group(current, safety_policy)
-            if not safety.safe:
-                raise RuntimeError("현재 항목이 안전 정책을 통과하지 못했습니다: %s" % ", ".join(safety.flags))
-            current_ids = {version.media_id for version in current.media}
-            if candidate.media_id not in current_ids or keep.media_id not in current_ids:
-                raise RuntimeError("유지 또는 처리할 Media ID가 Plex에 존재하지 않습니다.")
-
             backend = self._delete_backend()
-            plan_digest = ""
-            cleanup: Dict[str, Any]
-            if backend in ("quarantine", "direct"):
-                sections = gateway.list_sections()
-                expected_type = "show" if group.media_type == "episode" else "movie"
-                section = next(
-                    (
-                        item
-                        for item in sections
-                        if item.key == str(group.section_key)
-                        and item.section_type == expected_type
-                    ),
-                    None,
-                )
-                if section is None or not section.locations:
-                    raise RuntimeError("삭제 대상의 Plex library section을 확인할 수 없습니다.")
-                if backend == "quarantine":
-                    all_locations = tuple(
-                        location for item in sections for location in item.locations
-                    )
-                    plan = self.quarantine_manager.preview(
-                        current,
-                        candidate.media_id,
-                        safety_policy.allowed_roots,
-                        all_locations,
-                    )
-                else:
-                    plan = self.direct_delete_manager.preview(
-                        current,
-                        candidate.media_id,
-                        safety_policy.allowed_roots,
-                        tuple(section.locations),
-                    )
-                    _single_surviving_scan_target(
-                        group,
-                        keep,
-                        current,
-                        tuple(section.locations),
-                        tuple(safety_policy.allowed_roots),
-                    )
-                cleanup = plan.public_dict()
-                plan_digest = plan.plan_digest
-                if backend == "quarantine":
-                    confirmation = "QUARANTINE %s SUBTITLES %s %s" % (
-                        candidate.media_id,
-                        len(plan.eligible),
-                        plan.plan_digest[:12],
-                    )
-                else:
-                    confirmation = "DELETE MEDIA %s SUBTITLES %s %s" % (
-                        candidate.media_id,
-                        len(plan.eligible),
-                        plan.plan_digest[:12],
-                    )
-            else:
-                cleanup = {
-                    "enabled": False,
-                    "backend": "plex",
-                    "status": "disabled",
-                    "eligible": [],
-                    "excluded": [],
-                    "counts": {
-                        "eligible": 0,
-                        "excluded": 0,
-                        "protected": 0,
-                        "quarantined": 0,
-                    },
-                }
-                confirmation = "DELETE %s" % candidate.media_id
-            return {
-                "confirmation": confirmation,
-                "delete_media_id": candidate.media_id,
-                "keep_media_id": keep.media_id,
-                "backend": backend,
-                "plan_digest": plan_digest,
-                "subtitle_cleanup": cleanup,
-                "delete_budget": budget,
+            sections = gateway.list_sections() if backend in ("quarantine", "direct") else []
+            section_by_key = {
+                (str(section.key), str(section.section_type)): section
+                for section in sections
             }
+            all_locations = tuple(
+                location for section in sections for location in section.locations
+            )
+            safety_policy = current_safety_policy()
+            previews: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+            for group_id, values in grouped.items():
+                try:
+                    group = values[0][1]
+                    current = gateway.get_metadata(group.rating_key)
+                    active_candidates = ModelMediaCandidate.by_group(
+                        group.id, include_deleted=False
+                    )
+                    freshness = validate_fresh_snapshot(
+                        current,
+                        group.identity_fingerprint,
+                        {
+                            item.media_id: item.fingerprint
+                            for item in active_candidates
+                        },
+                    )
+                    if not freshness.safe:
+                        raise RuntimeError(
+                            "스캔 이후 Plex 항목이 변경되었습니다: %s"
+                            % ", ".join(freshness.flags)
+                        )
+                    safety = assess_group(current, safety_policy)
+                    if not safety.safe:
+                        raise RuntimeError(
+                            "현재 항목이 안전 정책을 통과하지 못했습니다: %s"
+                            % ", ".join(safety.flags)
+                        )
+                    current_ids = {version.media_id for version in current.media}
+                    section = None
+                    if backend in ("quarantine", "direct"):
+                        expected_type = (
+                            "show" if group.media_type == "episode" else "movie"
+                        )
+                        section = section_by_key.get(
+                            (str(group.section_key), expected_type)
+                        )
+                        if section is None or not section.locations:
+                            raise RuntimeError(
+                                "삭제 대상의 Plex library section을 확인할 수 없습니다."
+                            )
+                    if backend == "direct":
+                        _single_surviving_scan_target(
+                            group,
+                            values[0][3],
+                            current,
+                            tuple(section.locations),
+                            tuple(safety_policy.allowed_roots),
+                        )
+
+                    local: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+                    for _run, _group, candidate, keep in values:
+                        if (
+                            candidate.media_id not in current_ids
+                            or keep.media_id not in current_ids
+                        ):
+                            raise RuntimeError(
+                                "유지 또는 처리할 Media ID가 Plex에 존재하지 않습니다."
+                            )
+                        plan_digest = ""
+                        cleanup: Dict[str, Any]
+                        if backend == "quarantine":
+                            plan = self.quarantine_manager.preview(
+                                current,
+                                candidate.media_id,
+                                safety_policy.allowed_roots,
+                                all_locations,
+                            )
+                            cleanup = plan.public_dict()
+                            plan_digest = plan.plan_digest
+                            confirmation = "QUARANTINE %s SUBTITLES %s %s" % (
+                                candidate.media_id,
+                                len(plan.eligible),
+                                plan.plan_digest[:12],
+                            )
+                        elif backend == "direct":
+                            plan = self.direct_delete_manager.preview(
+                                current,
+                                candidate.media_id,
+                                safety_policy.allowed_roots,
+                                tuple(section.locations),
+                            )
+                            cleanup = plan.public_dict()
+                            plan_digest = plan.plan_digest
+                            confirmation = "DELETE MEDIA %s SUBTITLES %s %s" % (
+                                candidate.media_id,
+                                len(plan.eligible),
+                                plan.plan_digest[:12],
+                            )
+                        else:
+                            cleanup = {
+                                "enabled": False,
+                                "backend": "plex",
+                                "status": "disabled",
+                                "eligible": [],
+                                "excluded": [],
+                                "counts": {
+                                    "eligible": 0,
+                                    "excluded": 0,
+                                    "protected": 0,
+                                    "quarantined": 0,
+                                },
+                            }
+                            confirmation = "DELETE %s" % candidate.media_id
+                        key = (int(group.id), int(candidate.id), int(keep.id))
+                        local[key] = {
+                            "confirmation": confirmation,
+                            "delete_media_id": candidate.media_id,
+                            "keep_media_id": keep.media_id,
+                            "backend": backend,
+                            "plan_digest": plan_digest,
+                            "subtitle_cleanup": cleanup,
+                            "delete_budget": budget,
+                        }
+                    previews.update(local)
+                except PlexMetadataNotFound as exc:
+                    errors[group_id] = str(exc) or "Plex metadata 항목 없음"
+                    for key in list(previews):
+                        if key[0] == group_id:
+                            previews.pop(key, None)
+                except PlexGatewayError:
+                    raise
+                except Exception as exc:
+                    errors[group_id] = str(exc) or exc.__class__.__name__
+                    for key in list(previews):
+                        if key[0] == group_id:
+                            previews.pop(key, None)
+            return previews, errors
 
     def _claim_group_and_create_log(
         self,

@@ -92,6 +92,77 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "설정"):
                 manager._fresh_direct_preview(item, journal)
 
+    def test_direct_rebind_rejects_scan_mode_drift_before_preview_or_mutation(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module()
+            harness.setup_module.P.ModelSetting._data.update(
+                {
+                    "setting_delete_backend": "direct",
+                    "setting_post_delete_scan_mode": "binary",
+                    "setting_quarantine_root": "",
+                }
+            )
+            digest = "a" * 64
+            manifest = json.dumps(
+                {
+                    "batch_binding": {
+                        "backend": "direct",
+                        "post_delete_scan_mode": "web",
+                        "quarantine_root": "",
+                    }
+                },
+                sort_keys=True,
+            )
+            journal = _Record(
+                plan_digest=digest,
+                manifest_json=manifest,
+                eligible_count=1,
+                excluded_count=0,
+                protected_count=1,
+                updated_at=None,
+            )
+            item = _Record(group_id=1, delete_candidate_id=2, keep_candidate_id=3)
+            preview_calls = []
+            manager = module.BatchDeleteManager(
+                types.SimpleNamespace(
+                    preview=lambda **kwargs: preview_calls.append(kwargs)
+                )
+            )
+            session = _Session()
+            module.F.db.session = session
+
+            with self.assertRaisesRegex(RuntimeError, "설정"):
+                manager._rebind_direct_preview(item, journal)
+
+            self.assertEqual(preview_calls, [])
+            self.assertEqual(journal.plan_digest, digest)
+            self.assertEqual(journal.manifest_json, manifest)
+            self.assertEqual(session.commits, 0)
+
+            harness.setup_module.P.ModelSetting._data[
+                "setting_post_delete_scan_mode"
+            ] = "web"
+
+            def preview_then_drift(**kwargs):
+                preview_calls.append(kwargs)
+                harness.setup_module.P.ModelSetting._data[
+                    "setting_post_delete_scan_mode"
+                ] = "binary"
+                return {
+                    "backend": "direct",
+                    "plan_digest": "b" * 64,
+                    "subtitle_cleanup": self._cleanup(),
+                }
+
+            manager.delete_service = types.SimpleNamespace(preview=preview_then_drift)
+            with self.assertRaisesRegex(RuntimeError, "재검증 중 변경"):
+                manager._rebind_direct_preview(item, journal)
+
+            self.assertEqual(len(preview_calls), 1)
+            self.assertEqual(journal.plan_digest, digest)
+            self.assertEqual(journal.manifest_json, manifest)
+            self.assertEqual(session.commits, 0)
+
     def test_blocking_direct_preview_cannot_be_reused_for_batch_approval(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module()
@@ -229,9 +300,16 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             manager = module.BatchDeleteManager(types.SimpleNamespace())
             manager._assert_settings_snapshot = lambda run: None
             manager._cross_group_path_conflicts = lambda run_id: set()
-            manager._eligible_pair = lambda group: (
-                _Record(id=3, media_id="30"),
-                _Record(id=2, media_id="20"),
+            manager._plan_groups = lambda run_id, conflicts, backend: (
+                [
+                    (
+                        _Record(id=4),
+                        _Record(id=3, media_id="30"),
+                        _Record(id=2, media_id="20"),
+                    )
+                ],
+                [],
+                1,
             )
             module.ModelScanRun = types.SimpleNamespace(
                 get=lambda run_id: _Record(id=9, status="completed", deletion_attempts=0)
@@ -345,9 +423,11 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             manager._worker_should_stop = lambda batch_id: None
             journal = _Record(plan_digest="a" * 64)
             manager._direct_preview_journal = lambda *args: journal
-            manager._fresh_direct_preview = lambda *args: {
+            manager._rebind_direct_preview = lambda *args: {
                 "confirmation": "DELETE MEDIA 40 SUBTITLES 1 aaaaaaaaaaaa"
             }
+            manager._advance_group_after_success = lambda *args: None
+            manager._close_partially_processed_groups = lambda *args: None
 
             manager._worker(1)
 
@@ -358,6 +438,174 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             self.assertEqual(batch.status, "scan_pending")
             self.assertEqual(batch.succeeded_items, 0)
             self.assertEqual(batch.processed_items, 0)
+
+    def test_worker_binding_drift_skips_same_group_and_continues_unrelated(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module()
+            harness.setup_module.P.ModelSetting._data.update(
+                {
+                    "setting_delete_enabled": "True",
+                    "setting_batch_delete_enabled": "True",
+                    "setting_delete_backend": "direct",
+                    "setting_post_delete_scan_mode": "web",
+                    "setting_quarantine_root": "",
+                }
+            )
+            batch = _Record(
+                id=1,
+                scan_run_id=9,
+                status="queued",
+                total_items=3,
+                processed_items=0,
+                succeeded_items=0,
+                failed_items=0,
+                skipped_items=0,
+                lease_key="global",
+                nonce_hash="",
+                current_message="",
+                error_summary="",
+                finished_at=None,
+                deletion_lease_token="batch-lease",
+                confirmation="BATCH DELETE MEDIA 1 ITEMS 3 SUBTITLES 0 aaaaaaaaaaaa",
+            )
+            items = [
+                _Record(
+                    id=index,
+                    batch_run_id=1,
+                    scan_run_id=9,
+                    group_id=group_id,
+                    delete_candidate_id=100 + index,
+                    keep_candidate_id=200 + group_id,
+                    delete_media_id=str(100 + index),
+                    status="planned",
+                    message="",
+                    action_log_id=None,
+                    started_at=None,
+                    finished_at=None,
+                )
+                for index, group_id in enumerate((10, 10, 20), 1)
+            ]
+
+            class Batches:
+                @classmethod
+                def claim_for_worker(cls, batch_id, now):
+                    batch.status = "running"
+                    return True
+
+                @classmethod
+                def get(cls, batch_id):
+                    return batch
+
+            class Items:
+                @classmethod
+                def by_batch(cls, batch_id):
+                    return items
+
+                @classmethod
+                def get(cls, item_id):
+                    return next(value for value in items if value.id == item_id)
+
+                @classmethod
+                def claim_for_worker(cls, item_id, now):
+                    item = cls.get(item_id)
+                    if item.status != "planned":
+                        return False
+                    item.status = "running"
+                    item.started_at = now
+                    return True
+
+            class Actions:
+                @classmethod
+                def latest_for_delete(cls, run_id, group_id, candidate_id):
+                    return None
+
+            def binding(mode):
+                return json.dumps(
+                    {
+                        "batch_binding": {
+                            "backend": "direct",
+                            "post_delete_scan_mode": mode,
+                            "quarantine_root": "",
+                        }
+                    },
+                    sort_keys=True,
+                )
+
+            journals = {
+                101: _Record(
+                    plan_digest="1" * 64,
+                    manifest_json=binding("binary"),
+                    eligible_count=0,
+                    excluded_count=0,
+                    protected_count=0,
+                    updated_at=None,
+                ),
+                102: _Record(
+                    plan_digest="2" * 64,
+                    manifest_json=binding("web"),
+                    eligible_count=0,
+                    excluded_count=0,
+                    protected_count=0,
+                    updated_at=None,
+                ),
+                103: _Record(
+                    plan_digest="3" * 64,
+                    manifest_json=binding("web"),
+                    eligible_count=0,
+                    excluded_count=0,
+                    protected_count=0,
+                    updated_at=None,
+                ),
+            }
+
+            class Journals:
+                @classmethod
+                def for_batch_candidate(cls, batch_id, candidate_id, status=""):
+                    return journals.get(int(candidate_id))
+
+            class Deletes:
+                def __init__(self):
+                    self.preview_calls = []
+                    self.delete_calls = []
+
+                def preview(self, **kwargs):
+                    self.preview_calls.append(kwargs["group_id"])
+                    return {
+                        "backend": "direct",
+                        "plan_digest": "f" * 64,
+                        "confirmation": "DELETE MEDIA 103 SUBTITLES 0 ffffffffffff",
+                        "subtitle_cleanup": BatchDirectBackendSafetyTest._cleanup(),
+                    }
+
+                def delete(self, **kwargs):
+                    self.delete_calls.append(kwargs["group_id"])
+                    return {"action_id": 77, "verification": "confirmed"}
+
+            module.ModelBatchRun = Batches
+            module.ModelBatchItem = Items
+            module.ModelActionLog = Actions
+            module.ModelDirectDeleteJournal = Journals
+            module.F.db.session = _Session()
+            deletes = Deletes()
+            manager = module.BatchDeleteManager(deletes)
+            manager.lease_service = types.SimpleNamespace(
+                renew=lambda *args: None,
+                release=lambda *args: True,
+            )
+            manager._worker_should_stop = lambda batch_id: None
+            manager._advance_group_after_success = lambda *args: None
+            manager._close_partially_processed_groups = lambda *args: None
+
+            manager._worker(1)
+
+            self.assertEqual(deletes.preview_calls, [20])
+            self.assertEqual(deletes.delete_calls, [20])
+            self.assertEqual(
+                [item.status for item in items], ["failed", "skipped", "success"]
+            )
+            self.assertEqual(batch.status, "completed_with_errors")
+            self.assertEqual(journals[101].plan_digest, "1" * 64)
+            self.assertEqual(journals[101].manifest_json, binding("binary"))
 
     def test_startup_recovery_cannot_skip_direct_journal_before_scan_outbox(self) -> None:
         """Cover the crash gap after unlink commit and before scan-job commit."""

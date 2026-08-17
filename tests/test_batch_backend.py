@@ -49,6 +49,7 @@ class BatchBackendTest(unittest.TestCase):
     def test_batch_serializers_never_expose_nonce_hash_or_global_lease(self) -> None:
         with FlaskFarmImportHarness() as harness:
             batch_type = harness.setup_module.P.ModelBatchRun
+            exclusion_type = harness.setup_module.P.ModelBatchExclusion
             item_type = harness.setup_module.P.ModelBatchItem
             batch = batch_type()
             for key, value in {
@@ -110,6 +111,26 @@ class BatchBackendTest(unittest.TestCase):
             self.assertEqual(item_payload["keep"]["candidate_id"], 5)
             self.assertEqual(item_payload["delete"]["paths"], ["/media/delete.mkv"])
 
+            exclusion = exclusion_type()
+            for key, value in {
+                "group_id": 17,
+                "title": "Unsafe",
+                "media_type": "movie",
+                "reason": "highest_score_tie",
+                "message": "review only",
+            }.items():
+                setattr(exclusion, key, value)
+            self.assertEqual(
+                exclusion.as_api(),
+                {
+                    "group_id": 17,
+                    "title": "Unsafe",
+                    "media_type": "movie",
+                    "reason": "highest_score_tie",
+                    "message": "review only",
+                },
+            )
+
     def test_batch_status_reports_unlimited_attempt_counter(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
@@ -133,6 +154,11 @@ class BatchBackendTest(unittest.TestCase):
                 def by_batch(cls, batch_id):
                     return [item]
 
+            class Exclusions:
+                @classmethod
+                def by_batch(cls, batch_id):
+                    return []
+
             class Runs:
                 @classmethod
                 def get(cls, run_id):
@@ -140,6 +166,7 @@ class BatchBackendTest(unittest.TestCase):
 
             module.ModelBatchRun = Batches
             module.ModelBatchItem = Items
+            module.ModelBatchExclusion = Exclusions
             module.ModelScanRun = Runs
             with mock.patch.dict(
                 harness.setup_module.P.ModelSetting._data,
@@ -182,6 +209,13 @@ class BatchBackendTest(unittest.TestCase):
             manager = module.BatchDeleteManager()
             manager._assert_settings_snapshot = lambda value: None
             manager._cross_group_path_conflicts = lambda run_id: {}
+            manager._persist_exclusion_review = lambda run, backend, excluded: {
+                "plan_id": 44,
+                "status": "completed_with_warnings",
+                "total": 0,
+                "executable": False,
+                "excluded_groups": manager._normalized_exclusions(excluded),
+            }
             with mock.patch.dict(
                 harness.setup_module.P.ModelSetting._data,
                 {
@@ -191,8 +225,13 @@ class BatchBackendTest(unittest.TestCase):
                 },
                 clear=True,
             ):
-                with self.assertRaisesRegex(RuntimeError, "일괄 처리 가능한 그룹"):
-                    manager.preview(run.id)
+                result = manager.preview(run.id)
+                self.assertEqual(result["plan_id"], 44)
+                self.assertEqual(result["total"], 0)
+                self.assertFalse(result["executable"])
+                self.assertEqual(
+                    result["excluded_groups"][0]["reason"], "no_eligible_groups"
+                )
             self.assertEqual(calls, [run.id])
 
     def test_preview_final_lock_rejects_stale_cached_parent_run(self) -> None:
@@ -293,7 +332,11 @@ class BatchBackendTest(unittest.TestCase):
             manager = module.BatchDeleteManager()
             manager._assert_settings_snapshot = lambda value: None
             manager._cross_group_path_conflicts = lambda run_id: set()
-            manager._eligible_pair = lambda value: (keep, target)
+            manager._plan_groups = lambda run_id, conflicts, backend: (
+                [(group, keep, target)],
+                [],
+                1,
+            )
 
             with mock.patch.dict(
                 harness.setup_module.P.ModelSetting._data,
@@ -434,7 +477,7 @@ class BatchBackendTest(unittest.TestCase):
             self.assertEqual(batch.error_summary, "")
             self.assertEqual(batch.current_message, "working")
 
-    def test_plan_requires_exactly_two_active_candidates_and_unique_winner(self) -> None:
+    def test_plan_supports_all_lower_scored_candidates_with_unique_winner(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
             group = _Record(id=1, safe_to_delete=True, resolution_status="open")
@@ -457,7 +500,63 @@ class BatchBackendTest(unittest.TestCase):
             self.assertIsNone(module.BatchDeleteManager._eligible_pair(group))
             second.score = 50.0
             Candidates.values.append(_Record(id=30, score=1.0))
+            planned = module.BatchDeleteManager._eligible_group(group)
+            self.assertEqual(planned[0].id, 10)
+            self.assertEqual([value.id for value in planned[1]], [20, 30])
             self.assertIsNone(module.BatchDeleteManager._eligible_pair(group))
+
+    def test_auto_plan_includes_every_lower_version_and_explains_tie(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            eligible = _Record(
+                id=1,
+                title="Three versions",
+                grandparent_title="",
+                media_type="movie",
+                safe_to_delete=True,
+                resolution_status="open",
+                recommended_candidate_id=10,
+                safety_flags_json="[]",
+            )
+            tied = _Record(
+                id=2,
+                title="Tie",
+                grandparent_title="",
+                media_type="movie",
+                safe_to_delete=True,
+                resolution_status="open",
+                recommended_candidate_id=None,
+                safety_flags_json="[]",
+            )
+            candidates = {
+                1: [
+                    _Record(id=10, score=100.0),
+                    _Record(id=11, score=80.0),
+                    _Record(id=12, score=60.0),
+                ],
+                2: [
+                    _Record(id=20, score=50.0),
+                    _Record(id=21, score=50.0),
+                ],
+            }
+            module.ModelDuplicateGroup = types.SimpleNamespace(
+                all_by_run=lambda run_id: [eligible, tied]
+            )
+            module.ModelMediaCandidate = types.SimpleNamespace(
+                by_group=lambda group_id, include_deleted=False: candidates[int(group_id)]
+            )
+
+            pairs, excluded, eligible_count = module.BatchDeleteManager._plan_groups(
+                9, set(), "direct"
+            )
+
+            self.assertEqual(eligible_count, 1)
+            self.assertEqual(
+                [(keep.id, target.id) for _group, keep, target in pairs],
+                [(10, 11), (10, 12)],
+            )
+            self.assertEqual(excluded[0]["group_id"], 2)
+            self.assertEqual(excluded[0]["reason"], "highest_score_tie")
 
     def test_cross_group_paths_use_remote_case_policy_and_block_both_groups(self) -> None:
         with FlaskFarmImportHarness() as harness:
@@ -545,6 +644,132 @@ class BatchBackendTest(unittest.TestCase):
                         },
                     ]
                 )
+
+    def test_cross_group_subtitle_conflicts_identify_only_related_groups(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            shared = "/media/shared.ko.srt"
+            previews = [
+                {
+                    "subtitle_cleanup": {
+                        "video": {"path": "/media/A.mkv"},
+                        "protected": [{"source_path": shared}],
+                    }
+                },
+                {
+                    "subtitle_cleanup": {
+                        "video": {"path": "/media/B.mkv"},
+                        "excluded": [{"path": shared}],
+                    }
+                },
+                {
+                    "subtitle_cleanup": {
+                        "video": {"path": "/media/C.mkv"},
+                        "eligible": [{"path": "/media/C.ko.srt"}],
+                    }
+                },
+            ]
+
+            self.assertEqual(
+                module.BatchDeleteManager._source_conflict_group_ids(
+                    previews, [1, 2, 3]
+                ),
+                {1, 2},
+            )
+
+    def test_approval_accepts_persisted_cross_group_exclusions_but_not_new_actual_conflict(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            run = _Record(id=9, status="completed")
+            batch = _Record(
+                id=70,
+                scan_run_id=9,
+                total_items=1,
+                confirmation="BATCH DELETE MEDIA 70 ITEMS 1 SUBTITLES 0 abcdefabcdef",
+            )
+            groups = [
+                _Record(id=1),
+                _Record(id=2),
+                _Record(id=3),
+            ]
+            keeps = [
+                _Record(id=11, media_id="keep-a"),
+                _Record(id=21, media_id="keep-b"),
+                _Record(id=31, media_id="keep-c"),
+            ]
+            targets = [
+                _Record(id=12, media_id="delete-a"),
+                _Record(id=22, media_id="delete-b"),
+                _Record(id=32, media_id="delete-c"),
+            ]
+            expected_pairs = list(zip(groups, keeps, targets))
+            item = _Record(
+                group_id=3,
+                keep_candidate_id=31,
+                delete_candidate_id=32,
+                keep_media_id="keep-c",
+                delete_media_id="delete-c",
+            )
+            journal = _Record(plan_digest="c" * 64, manifest_json="{}")
+
+            class Runs:
+                @classmethod
+                def get(cls, run_id):
+                    return run
+
+            class Items:
+                @classmethod
+                def by_batch(cls, batch_id):
+                    return [item]
+
+            class Journals:
+                @classmethod
+                def for_batch_candidate(cls, batch_id, candidate_id, status=""):
+                    return journal
+
+            shared = "/media/shared.ko.srt"
+
+            def preview(path, subtitle):
+                return {
+                    "backend": "direct",
+                    "plan_digest": "c" * 64,
+                    "subtitle_cleanup": {
+                        "video": {"path": path},
+                        "protected": [{"source_path": subtitle}],
+                        "executable": True,
+                    },
+                }
+
+            fresh = {
+                (1, 12, 11): preview("/media/A.mkv", shared),
+                (2, 22, 21): preview("/media/B.mkv", shared),
+                (3, 32, 31): preview("/media/C.mkv", "/media/C.ko.srt"),
+            }
+            module.ModelScanRun = Runs
+            module.ModelBatchItem = Items
+            module.ModelDirectDeleteJournal = Journals
+            manager = module.BatchDeleteManager(types.SimpleNamespace())
+            manager._assert_settings_snapshot = lambda value: None
+            manager._cross_group_path_conflicts = lambda run_id: set()
+            manager._plan_groups = lambda run_id, conflicts, backend: (
+                expected_pairs,
+                [],
+                3,
+            )
+            manager._preview_pairs = lambda pairs: (fresh, {})
+            manager._validate_direct_preview = (
+                lambda current_item, current_journal, current_preview: current_preview
+            )
+            with mock.patch.dict(
+                harness.setup_module.P.ModelSetting._data,
+                {"setting_delete_backend": "direct"},
+                clear=True,
+            ):
+                self.assertIs(manager._validate_plan_unchanged(batch), run)
+
+                fresh[(3, 32, 31)] = preview("/media/C.mkv", shared)
+                with self.assertRaisesRegex(RuntimeError, "공유 경로|충돌"):
+                    manager._validate_plan_unchanged(batch)
 
     def test_quarantine_preview_cannot_be_approved_after_backend_switch_to_plex(self) -> None:
         with FlaskFarmImportHarness() as harness:
@@ -634,6 +859,11 @@ class BatchBackendTest(unittest.TestCase):
             )
             manager._assert_settings_snapshot = lambda value: None
             manager._cross_group_path_conflicts = lambda run_id: set()
+            manager._plan_groups = lambda run_id, conflicts, backend: (
+                [(group, keep, target)],
+                [],
+                1,
+            )
 
             with self.assertRaisesRegex(RuntimeError, "변경|사전확인|격리"):
                 manager._validate_plan_unchanged(batch)
@@ -711,14 +941,14 @@ class BatchBackendTest(unittest.TestCase):
             self.assertNotIn("params=", formatted)
             self.assertEqual(session.rollbacks, 1)
 
-    def test_worker_stops_after_first_failure_and_skips_remaining_items(self) -> None:
+    def test_worker_isolates_failure_and_continues_unrelated_groups(self) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module(harness)
             batch = _Record(
                 id=1,
                 scan_run_id=9,
                 status="queued",
-                total_items=3,
+                total_items=4,
                 processed_items=0,
                 succeeded_items=0,
                 failed_items=0,
@@ -730,12 +960,13 @@ class BatchBackendTest(unittest.TestCase):
                 finished_at=None,
                 deletion_lease_token="batch-lease",
             )
+            group_ids = (1, 2, 2, 3)
             items = [
                 _Record(
                     id=index,
                     batch_run_id=1,
                     scan_run_id=9,
-                    group_id=index,
+                    group_id=group_id,
                     delete_candidate_id=100 + index,
                     keep_candidate_id=200 + index,
                     delete_media_id=str(100 + index),
@@ -745,7 +976,7 @@ class BatchBackendTest(unittest.TestCase):
                     started_at=None,
                     finished_at=None,
                 )
-                for index in (1, 2, 3)
+                for index, group_id in enumerate(group_ids, 1)
             ]
 
             class Batches:
@@ -800,6 +1031,31 @@ class BatchBackendTest(unittest.TestCase):
             module.ModelBatchItem = Items
             module.ModelActionLog = Actions
             module.ModelQuarantineJournal = Journals
+            candidates = {
+                101: _Record(id=101, deleted=False, deleted_at=None),
+                102: _Record(id=102, deleted=False, deleted_at=None),
+                103: _Record(id=103, deleted=False, deleted_at=None),
+                104: _Record(id=104, deleted=False, deleted_at=None),
+            }
+            groups = {
+                index: _Record(
+                    id=index,
+                    safe_to_delete=False,
+                    resolution_status="delete_in_progress",
+                    safety_flags_json="[]",
+                )
+                for index in (1, 2, 3)
+            }
+            run = _Record(id=9, successful_deletions=0)
+            module.ModelMediaCandidate = types.SimpleNamespace(
+                get=lambda candidate_id: candidates.get(int(candidate_id))
+            )
+            module.ModelDuplicateGroup = types.SimpleNamespace(
+                get=lambda group_id: groups.get(int(group_id))
+            )
+            module.ModelScanRun = types.SimpleNamespace(
+                get=lambda run_id: run if int(run_id) == 9 else None
+            )
             session = _Session()
             module.F.db.session = session
             deletes = Deletes()
@@ -811,11 +1067,14 @@ class BatchBackendTest(unittest.TestCase):
             manager._worker_should_stop = lambda batch_id: None
             manager._worker(1)
 
-            self.assertEqual(deletes.calls, [1, 2])
-            self.assertEqual([item.status for item in items], ["success", "blocked", "skipped"])
-            self.assertEqual(batch.status, "stopped")
+            self.assertEqual(deletes.calls, [1, 2, 3])
+            self.assertEqual(
+                [item.status for item in items],
+                ["success", "blocked", "skipped", "success"],
+            )
+            self.assertEqual(batch.status, "completed_with_errors")
             self.assertIsNone(batch.lease_key)
-            self.assertEqual(batch.processed_items, 2)
+            self.assertEqual(batch.processed_items, 3)
             self.assertEqual(batch.skipped_items, 1)
             self.assertEqual(session.removes, 1)
 
@@ -915,7 +1174,7 @@ class BatchBackendTest(unittest.TestCase):
 
             self.assertEqual(deletes.calls, [])
             self.assertEqual(item.status, "failed")
-            self.assertEqual(batch.status, "stopped")
+            self.assertEqual(batch.status, "completed_with_errors")
 
     def test_restart_running_item_uses_unknown_audit_and_never_looks_skipped(self) -> None:
         with FlaskFarmImportHarness() as harness:

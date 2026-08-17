@@ -22,6 +22,10 @@ class BatchUiContractTests(unittest.TestCase):
         self.history = (
             ROOT / "templates" / "plex_dupefinder_ff_history_list.html"
         ).read_text(encoding="utf-8")
+        self.scan_module = (ROOT / "mod_scan.py").read_text(encoding="utf-8")
+        self.batch_module = (ROOT / "batch_delete_manager.py").read_text(
+            encoding="utf-8"
+        )
 
     def test_library_select_buttons_start_disabled_and_update_scan_state(self) -> None:
         for element_id in ("select_all_libraries_btn", "clear_all_libraries_btn"):
@@ -33,10 +37,10 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("$('.pdff-section').prop('checked', false)", self.scan_list)
         self.assertIn("selected === 0", self.scan_list)
 
-    def test_batch_settings_are_opt_in_and_bounded(self) -> None:
+    def test_auto_cleanup_setting_is_opt_in_without_item_cap(self) -> None:
         self.assertIn("setting_batch_delete_enabled", self.setting)
-        self.assertIn("setting_batch_max_items", self.setting)
-        self.assertRegex(self.setting, r"setting_batch_max_items[^\n]+min=1, max=100")
+        self.assertNotIn("setting_batch_max_items", self.setting)
+        self.assertIn("항목 수 상한은 없습니다", self.setting)
         self.assertIn("batchEnabled && !deleteEnabled", self.setting)
 
     def test_post_delete_scan_setting_is_opt_in_and_enum_validated(self) -> None:
@@ -61,7 +65,7 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn('id="post_scan_refresh_btn"', self.history)
         self.assertRegex(
             self.history,
-            r"PDFF\.request\(packageName, 'scan', 'post_delete_scan_status', \{\}, 'GET'",
+            r"PDFF\.request\(packageName, 'scan', 'post_delete_scan_status', \{page: postScanPage, page_size: postScanPageSize\}, 'GET'",
         )
         self.assertIn("PDFF.badge(item.status || 'unknown')", self.history)
         for field in (
@@ -72,7 +76,18 @@ class BatchUiContractTests(unittest.TestCase):
             "links",
         ):
             self.assertIn("PDFF.esc(%s)" % field, self.history)
-        self.assertIn("Array.isArray(ret.data.items)", self.history)
+        self.assertIn("Array.isArray(result.items)", self.history)
+        for element_id in (
+            "post_scan_prev_btn",
+            "post_scan_next_btn",
+            "post_scan_page_label",
+            "post_scan_summary",
+        ):
+            self.assertIn('id="%s"' % element_id, self.history)
+        self.assertIn("postScanPage = Math.max", self.history)
+        self.assertIn("postScanTotalPages = Math.max", self.history)
+        self.assertIn("loadPostDeleteScans(false)", self.history)
+        self.assertIn("전체 작업을 최신순으로 페이지 조회", self.history)
 
     def test_post_delete_scan_retry_statuses_have_warning_badges(self) -> None:
         static = (ROOT / "static" / "pdff.js").read_text(encoding="utf-8")
@@ -97,13 +112,66 @@ class BatchUiContractTests(unittest.TestCase):
             r"PDFF\.request\(packageName, 'scan', 'batch_status'.*?'GET'",
         )
 
-    def test_batch_requires_exact_confirmation_and_escapes_plan_fields(self) -> None:
-        self.assertIn("confirmation !== expected", self.results)
-        self.assertIn("batch_confirmation_phrase').text(confirmation)", self.results)
+    def test_auto_cleanup_has_no_typed_or_popup_confirmation_and_escapes_fields(self) -> None:
+        approve = self.results.split("function approveBatch()", 1)[1].split(
+            "\nfunction ", 1
+        )[0]
+        self.assertNotIn("window.confirm", approve)
+        self.assertNotIn("confirmation_input", self.results)
+        self.assertIn("confirmation: confirmation", approve)
+        self.assertIn("nonce:", approve)
+        self.assertIn("csrf_token: csrfToken", approve)
         for expression in ("title", "keep.mediaId", "del.mediaId", "message"):
             self.assertIn("PDFF.esc(%s)" % expression, self.results)
         self.assertIn("PDFF.esc(keep.paths.join", self.results)
         self.assertIn("PDFF.esc(del.paths.join", self.results)
+
+    def test_auto_cleanup_is_one_click_preview_then_approve(self) -> None:
+        self.assertIn(
+            '>최고 점수만 남기고 자동 정리 시작</button>', self.results
+        )
+        self.assertNotIn('id="batch_approve_btn"', self.results)
+        preview = self.results.split("function previewBatch()", 1)[1].split(
+            "\nfunction ", 1
+        )[0]
+        self.assertIn("'batch_preview'", preview)
+        self.assertIn("var canApprove = renderBatchPlan(previewData)", preview)
+        self.assertIn("if (canApprove)", preview)
+        self.assertIn("approveBatch();", preview)
+        self.assertIn("previewExclusions", preview)
+        self.assertIn(
+            "!batchPlanId(previewData) && !previewExclusions.length", preview
+        )
+        self.assertNotIn("window.confirm", preview)
+        self.assertIn("$('#batch_preview_btn').on('click', previewBatch)", self.results)
+        self.assertNotIn("$('#batch_approve_btn').on", self.results)
+
+    def test_excluded_only_preview_is_visible_but_never_approvable(self) -> None:
+        self.assertIn("_persist_exclusion_review", self.batch_module)
+        self.assertIn("ModelBatchExclusion", self.batch_module)
+        self.assertIn('status="completed_with_warnings"', self.batch_module)
+        self.assertIn('"executable": False', self.batch_module)
+        self.assertIn('payload["excluded_groups"]', self.batch_module)
+        self.assertIn(
+            'session.pop("plex_dupefinder_ff_batch_preview", None)',
+            self.scan_module,
+        )
+        self.assertIn(
+            'if data.get("plan_id") and data.get("nonce")', self.scan_module
+        )
+        self.assertIn("previewExclusions.length", self.results)
+        self.assertIn("canApprove = approvalState && hasNonce", self.results)
+
+    def test_initial_and_approval_previews_use_shared_plex_context(self) -> None:
+        preview = self.batch_module.split("def preview(self, run_id", 1)[1].split(
+            "\n    def _validate_plan_unchanged", 1
+        )[0]
+        validation = self.batch_module.split(
+            "def _validate_plan_unchanged", 1
+        )[1].split("\n    def approve", 1)[0]
+        self.assertIn("self._preview_pairs(pairs)", preview)
+        self.assertIn("self._preview_pairs(expected_pairs)", validation)
+        self.assertNotIn("self.delete_service.preview(", validation)
 
     def test_safe_result_rows_offer_individual_delete_entry(self) -> None:
         self.assertIn("group.safe_to_delete && group.resolution_status === 'open'", self.results)
@@ -124,7 +192,7 @@ class BatchUiContractTests(unittest.TestCase):
         )
         self.assertIn("function canDeleteScan(run)", self.scan_list)
         self.assertIn("if (!current && canDeleteScan(run))", self.scan_list)
-        self.assertIn('class="btn btn-sm btn-outline-danger delete-scan"', self.scan_list)
+        self.assertIn('class="btn btn-sm btn-danger force-delete-scan"', self.scan_list)
         self.assertIn("isScanDeletePending(run.id)", self.scan_list)
         self.assertIn("deletePending ? ' disabled'", self.scan_list)
         self.assertNotRegex(
@@ -132,29 +200,24 @@ class BatchUiContractTests(unittest.TestCase):
             r"scanDeleteStatuses\s*=\s*\[[^\]]*['\"](?:queued|running|cancelling)['\"]",
         )
 
-    def test_scan_database_delete_is_confirmed_post_csrf_and_reload(self) -> None:
+    def test_scan_database_force_delete_is_explicit_post_csrf_and_reload(self) -> None:
+        self.assertNotIn('class="btn btn-sm btn-outline-danger delete-scan"', self.scan_list)
         handler = self.scan_list.split(
-            "$(document).on('click', '.delete-scan'", 1
+            "$(document).on('click', '.force-delete-scan'", 1
         )[1].split("$('#refresh_runs_btn')", 1)[0]
-        self.assertIn("window.confirm(", handler)
-        self.assertIn("중복 그룹·후보 결과 DB 행을 삭제", handler)
-        self.assertIn("Run ID 재사용 방지용 최소 tombstone", handler)
-        self.assertIn("최근 스캔과 결과 API에서 숨겨집니다", handler)
-        self.assertIn("미디어·자막 파일", handler)
-        self.assertIn("Plex 항목", handler)
-        self.assertIn("삭제·감사 작업 이력은 삭제되지 않습니다", handler)
+        self.assertIn("window.confirm", handler)
+        self.assertIn("recovery_required", handler)
+        self.assertIn("미디어·자막 파일과 Plex에는 아무 명령도 보내지 않으며", handler)
         self.assertIn("'delete_scan'", handler)
-        self.assertIn("{run_id: runId, csrf_token: csrfToken}", handler)
+        self.assertIn("force: '1'", handler)
+        self.assertIn("confirmation: 'FORCE DELETE SCAN ' + String(runId)", handler)
+        self.assertIn("csrf_token: csrfToken", handler)
         self.assertIn("'POST'", handler)
-        self.assertIn("button.prop('disabled', true)", handler)
-        self.assertIn("button.prop('disabled', false).text('스캔 결과 삭제')", handler)
         self.assertIn("scanDeletePending[String(runId)] = true", handler)
         self.assertIn("delete scanDeletePending[String(runId)]", handler)
-        self.assertIn("if (!ret.msg) PDFF.notify", handler)
         self.assertIn("button.closest('.pdff-row').remove()", handler)
         self.assertIn("loadRuns()", handler)
         self.assertIn("loadStatus()", handler)
-        self.assertIn("PDFF.notify(ret.msg", handler)
 
     def test_delete_attempt_counter_is_visible_but_never_disables_mutations(self) -> None:
         static = (ROOT / "static" / "pdff.js").read_text(encoding="utf-8")
@@ -178,10 +241,10 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("applyDeleteBudget(data.delete_budget)", render_batch)
         self.assertIn("한도</strong> 없음", self.results)
 
-    def test_per_scan_limit_setting_is_removed_and_batch_size_remains_bounded(self) -> None:
+    def test_per_scan_and_batch_item_limits_are_removed(self) -> None:
         self.assertNotIn("setting_max_delete_per_run", self.setting)
-        self.assertIn("setting_batch_max_items", self.setting)
-        self.assertIn("한 배치 계획에 포함할 항목 수만 제한", self.setting)
+        self.assertNotIn("setting_batch_max_items", self.setting)
+        self.assertIn("항목 수 상한은 없습니다", self.setting)
 
     def test_direct_backend_requires_exact_review_and_hides_quarantine_root(self) -> None:
         self.assertIn("['direct', 'Plex Media DELETE + 외부 자막 정리']", self.setting)
@@ -190,7 +253,7 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("deleteBackend === 'direct'", self.setting)
         self.assertIn("영상은 PMS의 Media DELETE로 삭제", self.setting)
         self.assertIn("보호본을 위한 FlaskFarm data 쓰기 권한", self.setting)
-        self.assertIn("confirmation !== expected", self.results)
+        self.assertNotIn("confirmation !== expected", self.results)
         self.assertIn("cleanup.backend === 'direct'", self.results)
 
     def test_legacy_direct_batch_preview_requires_a_fresh_plan(self) -> None:
@@ -198,7 +261,7 @@ class BatchUiContractTests(unittest.TestCase):
         self.assertIn("confirmation.indexOf('BATCH DELETE MEDIA ') === 0", self.results)
         self.assertIn("legacyDirectPlan = confirmation.indexOf('BATCH DELETE FILES ') === 0", self.results)
         self.assertIn("!missingSubtitlePlan && !legacyDirectPlan", self.results)
-        self.assertIn("새 삭제 계획을 만드세요", self.results)
+        self.assertIn("다시 자동 정리를 시작하세요", self.results)
 
     def test_latest_plan_is_restored_by_run_id(self) -> None:
         self.assertIn("function restoreBatchForRun()", self.results)

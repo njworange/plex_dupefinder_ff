@@ -1262,6 +1262,7 @@ class DirectDeleteManager:
         journal: ModelDirectDeleteJournal,
         include_target: bool,
         heartbeat: Optional[Any] = None,
+        skip_source_paths: Sequence[str] = (),
     ) -> Dict[str, int]:
         try:
             records = json.loads(journal.operation_paths_json or "[]")
@@ -1277,6 +1278,11 @@ class DirectDeleteManager:
                 _verify_directory_record(raw)
 
         roles = {"protected", "target"} if include_target else {"protected"}
+        skipped = {
+            os.path.normcase(os.path.abspath(str(path)))
+            for path in skip_source_paths
+            if str(path or "")
+        }
         verified = 0
         restored = 0
         for raw in _backup_entries(records):
@@ -1290,6 +1296,11 @@ class DirectDeleteManager:
                 raise DirectDeletePlanError("자막 보호 snapshot 기록이 없습니다.")
             source = _snapshot_from_dict(source_raw)
             backup = _snapshot_from_dict(backup_raw)
+            if os.path.normcase(os.path.abspath(source.path)) in skipped:
+                # A later item in the same approved auto group intentionally
+                # removed this former survivor. Its own journal is the proof;
+                # restoring this older protection copy would resurrect it.
+                continue
             restored_snapshot = (
                 _snapshot_from_dict(raw["restored_snapshot"])
                 if isinstance(raw.get("restored_snapshot"), dict)
@@ -2501,7 +2512,10 @@ class DirectDeleteManager:
         return {"verified": verified, "videos": video_count}
 
     def verify_deleted(
-        self, journal: ModelDirectDeleteJournal, heartbeat: Optional[Any] = None
+        self,
+        journal: ModelDirectDeleteJournal,
+        heartbeat: Optional[Any] = None,
+        intentionally_deleted_paths: Sequence[str] = (),
     ) -> Dict[str, int]:
         """Verify hybrid video/sidecar absence and restore survivor subtitles."""
 
@@ -2546,13 +2560,24 @@ class DirectDeleteManager:
             if not _path_proven_absent(str(raw.get("source_path") or "")):
                 raise DirectDeletePlanError("정리 대상 자막 경로에 파일이 다시 생겼습니다.")
             verified += 1
+        intentional = {
+            os.path.normcase(os.path.abspath(str(path)))
+            for path in intentionally_deleted_paths
+            if str(path or "")
+        }
         for raw in manifest.get("survivors", []):
             if callable(heartbeat):
                 heartbeat()
-            if not snapshot_matches(_snapshot_from_dict(raw), verify_hash=False):
+            survivor = _snapshot_from_dict(raw)
+            if os.path.normcase(os.path.abspath(survivor.path)) in intentional:
+                continue
+            if not snapshot_matches(survivor, verify_hash=False):
                 raise DirectDeletePlanError("유지 영상이 PMS DELETE 당시와 달라졌습니다.")
         protected = self._restore_hybrid_backups(
-            journal, include_target=False, heartbeat=heartbeat
+            journal,
+            include_target=False,
+            heartbeat=heartbeat,
+            skip_source_paths=intentionally_deleted_paths,
         )
         return {
             "verified": verified,

@@ -13,7 +13,12 @@ from plugin import PluginModuleBase
 from .batch_delete_manager import BatchDeleteManager
 from .delete_budget import delete_attempt_budget
 from .delete_service import DeleteService
-from .models import ModelDuplicateGroup, ModelMediaCandidate, ModelScanRun
+from .models import (
+    ModelDuplicateGroup,
+    ModelMediaCandidate,
+    ModelPostDeleteScanJob,
+    ModelScanRun,
+)
 from .post_delete_scan import PostDeleteScanManager
 from .scan_manager import ScanManager
 from .services.plex_gateway import PlexGateway
@@ -133,36 +138,53 @@ class ModuleScan(PluginModuleBase):
 
     def process_ajax(self, sub: str, req: Any) -> Any:
         try:
-            if sub in {
-                "batch_preview",
-                "batch_approve",
-                "batch_status",
-                "batch_cancel",
-                "delete_preview",
-                "delete_media",
-            }:
-                # Opportunistically recover an expired DB lease. A valid lease
-                # always belongs to another live web worker and is untouched.
-                self.batch_manager.recover_interrupted()
             if sub == "libraries":
                 return jsonify({"ret": "success", "data": self._libraries()})
 
             if sub == "post_delete_scan_status":
                 if req.method != "GET":
                     raise ValueError("삭제 후 스캔 상태 조회는 GET만 허용합니다.")
+                page = max(1, int(req.args.get("page", 1)))
+                page_size = max(
+                    10, min(100, int(req.args.get("page_size", 50)))
+                )
                 action_raw = req.args.get("action_id", "")
                 batch_raw = req.args.get("batch_id", "")
                 action_id = _positive_int(action_raw, "action_id") if action_raw else None
                 batch_id = _positive_int(batch_raw, "batch_id") if batch_raw else None
+                if action_id is None and batch_id is None:
+                    result = ModelPostDeleteScanJob.search(
+                        page=page, page_size=page_size
+                    )
+                    items = [item.as_api() for item in result["items"]]
+                    data = {
+                        "items": items,
+                        "total": result["total"],
+                        "page": result["page"],
+                        "page_size": result["page_size"],
+                        "pages": result["pages"],
+                    }
+                else:
+                    filtered = self.post_delete_scan_manager.status(
+                        action_id=action_id,
+                        batch_id=batch_id,
+                        limit=500,
+                    )
+                    total = len(filtered)
+                    pages = max(1, (total + page_size - 1) // page_size)
+                    page = min(page, pages)
+                    start = (page - 1) * page_size
+                    data = {
+                        "items": filtered[start : start + page_size],
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size,
+                        "pages": pages,
+                    }
                 return jsonify(
                     {
                         "ret": "success",
-                        "data": {
-                            "items": self.post_delete_scan_manager.status(
-                                action_id=action_id,
-                                batch_id=batch_id,
-                            )
-                        },
+                        "data": data,
                     }
                 )
 
@@ -189,13 +211,30 @@ class ModuleScan(PluginModuleBase):
                     raise ValueError("스캔 결과 삭제는 POST만 허용합니다.")
                 self._csrf(req)
                 run_id = _positive_int(req.form.get("run_id"), "run_id")
-                data = self.manager.delete_run(run_id)
+                force_value = str(req.form.get("force") or "").strip()
+                if force_value not in ("", "0", "1"):
+                    raise ValueError("강제 삭제 요청 값이 올바르지 않습니다.")
+                force = force_value == "1"
+                if force:
+                    expected = "FORCE DELETE SCAN %s" % run_id
+                    confirmation = str(req.form.get("confirmation") or "")
+                    if not secrets.compare_digest(confirmation, expected):
+                        raise ValueError("강제 삭제 확인 문구가 올바르지 않습니다.")
+                data = (
+                    self.manager.delete_run(run_id, force=True)
+                    if force
+                    else self.manager.delete_run(run_id)
+                )
                 return jsonify(
                     {
                         "ret": "success",
                         "msg": (
-                            "최근 스캔 결과를 DB에서 삭제했습니다. "
-                            "삭제 작업 이력과 파일 처리 journal은 보존했습니다."
+                            (
+                                "최근 스캔 결과를 DB에서 강제로 삭제했습니다. "
+                                if force
+                                else "최근 스캔 결과를 DB에서 삭제했습니다. "
+                            )
+                            + "삭제 작업 이력과 파일 처리 journal은 보존했습니다."
                         ),
                         "data": data,
                     }
@@ -246,13 +285,20 @@ class ModuleScan(PluginModuleBase):
                 if req.method != "POST":
                     raise ValueError("일괄 삭제 사전확인은 POST만 허용합니다.")
                 self._csrf(req)
+                # Recovery can update DB audit state and restore or clean up
+                # protected filesystem artifacts.  It must therefore run only
+                # after this mutating request passes both method and CSRF
+                # validation; read-only status requests never trigger it.
+                self.batch_manager.recover_interrupted()
                 run_id = _positive_int(req.form.get("run_id"), "run_id")
                 data = self.batch_manager.preview(run_id)
-                session["plex_dupefinder_ff_batch_preview"] = {
-                    "plan_id": data["plan_id"],
-                    "nonce": data["nonce"],
-                    "expires_at": data["expires_at"],
-                }
+                session.pop("plex_dupefinder_ff_batch_preview", None)
+                if data.get("plan_id") and data.get("nonce"):
+                    session["plex_dupefinder_ff_batch_preview"] = {
+                        "plan_id": data["plan_id"],
+                        "nonce": data["nonce"],
+                        "expires_at": data["expires_at"],
+                    }
                 return jsonify(
                     {
                         "ret": "success",
@@ -265,6 +311,7 @@ class ModuleScan(PluginModuleBase):
                 if req.method != "POST":
                     raise ValueError("일괄 삭제 승인은 POST만 허용합니다.")
                 self._csrf(req)
+                self.batch_manager.recover_interrupted()
                 preview = session.pop("plex_dupefinder_ff_batch_preview", None)
                 if not preview or int(preview.get("expires_at", 0)) < int(time.time()):
                     raise ValueError("일괄 삭제 사전확인이 만료되었습니다. 다시 확인하세요.")
@@ -299,6 +346,7 @@ class ModuleScan(PluginModuleBase):
                 if req.method != "POST":
                     raise ValueError("일괄 삭제 취소는 POST만 허용합니다.")
                 self._csrf(req)
+                self.batch_manager.recover_interrupted()
                 plan_id = _positive_int(req.form.get("plan_id"), "plan_id")
                 data = self.batch_manager.cancel(plan_id)
                 return jsonify(
@@ -334,6 +382,7 @@ class ModuleScan(PluginModuleBase):
                 if req.method != "POST":
                     raise ValueError("삭제 사전확인은 POST만 허용합니다.")
                 self._csrf(req)
+                self.batch_manager.recover_interrupted()
                 group_id = _positive_int(req.form.get("group_id"), "group_id")
                 candidate_id = _positive_int(req.form.get("candidate_id"), "candidate_id")
                 keep_candidate_id = _positive_int(
@@ -379,6 +428,7 @@ class ModuleScan(PluginModuleBase):
                 if req.method != "POST":
                     raise ValueError("삭제 요청은 POST만 허용합니다.")
                 self._csrf(req)
+                self.batch_manager.recover_interrupted()
                 preview = session.pop("plex_dupefinder_ff_delete_preview", None)
                 if not preview or preview.get("expires_at", 0) < int(time.time()):
                     raise ValueError("삭제 사전확인이 만료되었습니다. 다시 확인하세요.")

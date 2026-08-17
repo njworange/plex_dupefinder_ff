@@ -39,28 +39,27 @@ class SubtitleUiContractTests(unittest.TestCase):
         self.assertIn("PMS DB 반영과 유지본 사후 검증", self.setting)
         self.assertIn("격리는 영구삭제가 아닙니다", self.setting)
 
-    def test_manual_preview_requires_inline_review_before_execute(self) -> None:
+    def test_selected_delete_is_one_click_with_inline_verified_plan(self) -> None:
         for element_id in (
             "delete_preview_panel",
             "delete_subtitle_preview",
-            "delete_confirmation_phrase",
-            "delete_confirmation_input",
-            "delete_execute_btn",
             "delete_result_panel",
         ):
             self.assertIn('id="%s"' % element_id, self.results)
+        self.assertIn(">선택 버전 삭제</button>", self.results)
+        self.assertNotIn('id="delete_execute_btn"', self.results)
         self.assertIn("PDFF.subtitleCleanupHtml(preview, 'preview')", self.results)
         self.assertIn("PDFF.subtitleCleanupHtml(result, 'result')", self.results)
-        self.assertIn("confirmation !== expected", self.results)
+        self.assertNotIn("delete_confirmation_input", self.results)
         self.assertIn("plan_digest: cleanup.planDigest", self.results)
         self.assertNotIn("window.prompt", self.results)
 
-    def test_individual_delete_has_no_second_popup_but_keeps_exact_handshake(self) -> None:
+    def test_delete_buttons_have_no_popup_or_typed_phrase_but_keep_handshake(self) -> None:
         execute_delete = self.results.split("function executeDelete()", 1)[1].split(
             "\nfunction ", 1
         )[0]
         self.assertNotIn("window.confirm", execute_delete)
-        self.assertIn("confirmation !== expected", execute_delete)
+        self.assertNotIn("confirmation_input", execute_delete)
         self.assertIn("nonce: pendingDeletePreview.nonce", execute_delete)
         self.assertIn("confirmation: confirmation", execute_delete)
         self.assertIn("plan_digest: cleanup.planDigest", execute_delete)
@@ -71,11 +70,16 @@ class SubtitleUiContractTests(unittest.TestCase):
         )[0]
         self.assertIn("csrf_token: csrfToken", preview_delete)
         self.assertIn("pendingDeletePayload = payload", preview_delete)
+        self.assertIn("executeDelete();", preview_delete)
+        self.assertNotIn("window.confirm", preview_delete)
+        self.assertIn("$('#delete_preview_btn').on('click', previewDelete)", self.results)
+        self.assertNotIn("$('#delete_execute_btn').on", self.results)
 
         approve_batch = self.results.split("function approveBatch()", 1)[1].split(
             "\nfunction ", 1
         )[0]
-        self.assertIn("window.confirm", approve_batch)
+        self.assertNotIn("window.confirm", approve_batch)
+        self.assertIn("confirmation: confirmation", approve_batch)
 
     def test_subtitle_paths_and_reasons_are_html_escaped(self) -> None:
         self.assertIn("esc(subtitlePath(entry, true))", self.static)

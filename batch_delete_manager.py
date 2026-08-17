@@ -16,6 +16,7 @@ from .delete_service import DeleteService
 from .deletion_lease import DeletionLeaseLost, DeletionLeaseService
 from .models import (
     ModelActionLog,
+    ModelBatchExclusion,
     ModelBatchItem,
     ModelBatchRun,
     ModelDirectDeleteJournal,
@@ -32,6 +33,8 @@ from .setup import P
 _PREVIEW_SECONDS = 120
 _TERMINAL_STATUSES = {
     "completed",
+    "completed_with_errors",
+    "completed_with_warnings",
     "cancelled",
     "stopped",
     "interrupted",
@@ -59,23 +62,12 @@ def _json_load(value: Any, fallback: Any) -> Any:
         return fallback
 
 
-def _setting_int(key: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        return max(minimum, min(maximum, int(P.ModelSetting.get(key) or str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
 def _delete_enabled() -> bool:
     return P.ModelSetting.get("setting_delete_enabled") == "True"
 
 
 def _batch_enabled() -> bool:
     return P.ModelSetting.get("setting_batch_delete_enabled") == "True"
-
-
-def _batch_max_items() -> int:
-    return _setting_int("setting_batch_max_items", 10, 1, 100)
 
 
 def _delete_backend() -> str:
@@ -101,7 +93,7 @@ def _expire_session() -> None:
 
 
 class BatchDeleteManager:
-    """Persisted, explicitly-approved sequential deletion coordinator.
+    """Persisted, server-validated sequential deletion coordinator.
 
     The manager never stores a Plex token, never retries DELETE, and delegates
     every mutation and its fresh Plex validation to :class:`DeleteService`.
@@ -125,9 +117,9 @@ class BatchDeleteManager:
     @staticmethod
     def _require_enabled() -> None:
         if not _delete_enabled():
-            raise RuntimeError("설정에서 수동 삭제를 먼저 활성화해야 합니다.")
+            raise RuntimeError("설정에서 선택 버전 삭제를 먼저 활성화해야 합니다.")
         if not _batch_enabled():
-            raise RuntimeError("설정에서 일괄 승인 삭제를 먼저 활성화해야 합니다.")
+            raise RuntimeError("설정에서 중복 자동 정리를 먼저 활성화해야 합니다.")
 
     @staticmethod
     def _assert_settings_snapshot(run: ModelScanRun) -> None:
@@ -139,13 +131,13 @@ class BatchDeleteManager:
             raise RuntimeError("점수 또는 안전 설정이 스캔 이후 변경되었습니다. 다시 스캔하세요.")
 
     @staticmethod
-    def _eligible_pair(
+    def _eligible_group(
         group: ModelDuplicateGroup,
-    ) -> Optional[Tuple[ModelMediaCandidate, ModelMediaCandidate]]:
+    ) -> Optional[Tuple[ModelMediaCandidate, Tuple[ModelMediaCandidate, ...]]]:
         if not group.safe_to_delete or group.resolution_status != "open":
             return None
         candidates = ModelMediaCandidate.by_group(group.id, include_deleted=False)
-        if len(candidates) != 2 or group.recommended_candidate_id is None:
+        if len(candidates) < 2 or group.recommended_candidate_id is None:
             return None
         highest = max(float(candidate.score or 0) for candidate in candidates)
         winners = [
@@ -156,10 +148,138 @@ class BatchDeleteManager:
         if len(winners) != 1 or winners[0].id != group.recommended_candidate_id:
             return None
         keep = winners[0]
-        targets = [candidate for candidate in candidates if candidate.id != keep.id]
-        if len(targets) != 1:
+        targets = tuple(candidate for candidate in candidates if candidate.id != keep.id)
+        if not targets:
             return None
-        return keep, targets[0]
+        return keep, targets
+
+    @classmethod
+    def _eligible_pair(
+        cls, group: ModelDuplicateGroup
+    ) -> Optional[Tuple[ModelMediaCandidate, ModelMediaCandidate]]:
+        """Compatibility helper for legacy callers that require one target."""
+
+        planned = cls._eligible_group(group)
+        if planned is None or len(planned[1]) != 1:
+            return None
+        return planned[0], planned[1][0]
+
+    @staticmethod
+    def _excluded_group(
+        group: ModelDuplicateGroup, reason: str, message: str
+    ) -> Dict[str, Any]:
+        return {
+            "group_id": int(group.id),
+            "title": str(group.title or group.grandparent_title or ""),
+            "media_type": str(group.media_type or ""),
+            "reason": str(reason),
+            "message": str(message),
+        }
+
+    @classmethod
+    def _plan_groups(
+        cls,
+        run_id: int,
+        conflicts: set,
+        backend: str,
+    ) -> Tuple[
+        List[Tuple[ModelDuplicateGroup, ModelMediaCandidate, ModelMediaCandidate]],
+        List[Dict[str, Any]],
+        int,
+    ]:
+        """Plan every unambiguous target and explain every excluded group."""
+
+        loader = getattr(ModelDuplicateGroup, "all_by_run", None)
+        groups = (
+            loader(run_id)
+            if callable(loader)
+            else ModelDuplicateGroup.safe_open_by_run(run_id)
+        )
+        pairs: List[
+            Tuple[ModelDuplicateGroup, ModelMediaCandidate, ModelMediaCandidate]
+        ] = []
+        excluded: List[Dict[str, Any]] = []
+        eligible_groups = 0
+        for group in groups:
+            if group.id in conflicts:
+                excluded.append(
+                    cls._excluded_group(
+                        group,
+                        "cross_group_path_conflict",
+                        "다른 Plex 항목과 영상 경로를 공유하여 자동 정리하지 않습니다.",
+                    )
+                )
+                continue
+            if not group.safe_to_delete:
+                flags = _json_load(getattr(group, "safety_flags_json", "[]"), [])
+                suffix = " · ".join(str(value) for value in flags) if flags else "안전 조건 불충족"
+                excluded.append(
+                    cls._excluded_group(group, "unsafe_group", suffix)
+                )
+                continue
+            if group.resolution_status != "open":
+                excluded.append(
+                    cls._excluded_group(
+                        group,
+                        "not_open",
+                        "현재 상태(%s)는 자동 정리 대상이 아닙니다."
+                        % (group.resolution_status or "unknown"),
+                    )
+                )
+                continue
+            candidates = ModelMediaCandidate.by_group(
+                group.id, include_deleted=False
+            )
+            if len(candidates) < 2:
+                excluded.append(
+                    cls._excluded_group(
+                        group,
+                        "less_than_two_versions",
+                        "현재 Media 버전이 2개 미만입니다.",
+                    )
+                )
+                continue
+            highest = max(float(candidate.score or 0) for candidate in candidates)
+            winners = [
+                candidate
+                for candidate in candidates
+                if abs(float(candidate.score or 0) - highest) < 0.0001
+            ]
+            if len(winners) != 1:
+                excluded.append(
+                    cls._excluded_group(
+                        group,
+                        "highest_score_tie",
+                        "최고 점수가 동률이라 유지 버전을 자동 결정하지 않습니다.",
+                    )
+                )
+                continue
+            keep = winners[0]
+            if keep.id != group.recommended_candidate_id:
+                excluded.append(
+                    cls._excluded_group(
+                        group,
+                        "recommendation_mismatch",
+                        "현재 단독 최고 점수와 저장된 유지 추천이 일치하지 않습니다.",
+                    )
+                )
+                continue
+            targets = tuple(
+                candidate for candidate in candidates if candidate.id != keep.id
+            )
+            if backend == "quarantine" and len(targets) > 1:
+                excluded.append(
+                    cls._excluded_group(
+                        group,
+                        "quarantine_multi_version_requires_rescan",
+                        "안전 격리는 각 이동 뒤 Plex 반영이 필요하여 3개 이상 버전 그룹을 "
+                        "한 자동 작업에서 처리하지 않습니다.",
+                    )
+                )
+                continue
+            eligible_groups += 1
+            pairs.extend((group, keep, target) for target in targets)
+        return pairs, excluded, eligible_groups
 
     @staticmethod
     def _cross_group_path_conflicts(run_id: int) -> set:
@@ -179,6 +299,12 @@ class BatchDeleteManager:
     @staticmethod
     def _planned_backend(batch: ModelBatchRun) -> str:
         confirmation = str(getattr(batch, "confirmation", "") or "")
+        if confirmation.startswith("BATCH REVIEW QUARANTINE"):
+            return "quarantine"
+        if confirmation.startswith("BATCH REVIEW DIRECT"):
+            return "direct"
+        if confirmation.startswith("BATCH REVIEW PLEX"):
+            return "plex"
         if confirmation.startswith("BATCH QUARANTINE "):
             return "quarantine"
         if confirmation.startswith("BATCH DELETE MEDIA "):
@@ -226,9 +352,35 @@ class BatchDeleteManager:
         }
 
     @staticmethod
-    def _assert_source_sets_disjoint(previews: Sequence[Dict[str, Any]]) -> None:
+    def _assert_source_sets_disjoint(
+        previews: Sequence[Dict[str, Any]],
+        group_ids: Optional[Sequence[int]] = None,
+    ) -> None:
+        conflicts = BatchDeleteManager._source_conflict_group_ids(
+            previews, group_ids
+        )
+        if conflicts:
+            raise RuntimeError(
+                "일괄 파일 처리 항목들이 같은 영상 또는 자막 파일을 공유합니다. "
+                "개별 사전확인으로 처리하세요."
+            )
+
+    @staticmethod
+    def _source_conflict_group_ids(
+        previews: Sequence[Dict[str, Any]],
+        group_ids: Optional[Sequence[int]] = None,
+    ) -> set:
+        """Return every group sharing a video/subtitle/protection source.
+
+        The caller can safely remove all owners of a conflicting source while
+        retaining unrelated groups.  Same-group repetitions are expected for
+        multi-version direct plans and are intentionally not conflicts.
+        """
+
         owners: Dict[str, int] = {}
+        conflicts: set = set()
         for index, preview in enumerate(previews):
+            group_id = int(group_ids[index]) if group_ids is not None else index
             cleanup = preview.get("subtitle_cleanup") or {}
             paths: List[str] = []
             video = cleanup.get("video") or {}
@@ -251,12 +403,12 @@ class BatchDeleteManager:
             for path in paths:
                 key = os.path.normcase(os.path.realpath(os.path.abspath(path)))
                 previous = owners.get(key)
-                if previous is not None and previous != index:
-                    raise RuntimeError(
-                        "일괄 파일 처리 항목들이 같은 영상 또는 자막 파일을 공유합니다. "
-                        "개별 사전확인으로 처리하세요."
-                    )
-                owners[key] = index
+                if previous is not None and previous != group_id:
+                    conflicts.add(int(previous))
+                    conflicts.add(group_id)
+                else:
+                    owners[key] = group_id
+        return conflicts
 
     @staticmethod
     def _preview_journal(batch_id: int, candidate_id: int) -> ModelQuarantineJournal:
@@ -279,6 +431,22 @@ class BatchDeleteManager:
             candidate_id=item.delete_candidate_id,
             keep_candidate_id=item.keep_candidate_id,
         )
+        return self._validate_quarantine_preview(item, journal, preview)
+
+    def _validate_quarantine_preview(
+        self,
+        item: ModelBatchItem,
+        journal: ModelQuarantineJournal,
+        preview: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manifest = _json_load(journal.manifest_json, {})
+        stored_binding = (
+            manifest.get("batch_binding") if isinstance(manifest, dict) else None
+        )
+        if stored_binding != self._batch_binding():
+            raise RuntimeError(
+                "격리 또는 부분 스캔 설정이 승인 이후 변경되었습니다. 다시 사전확인하세요."
+            )
         if preview.get("backend") != "quarantine" or not secrets.compare_digest(
             str(preview.get("plan_digest") or ""), str(journal.plan_digest or "")
         ):
@@ -308,12 +476,228 @@ class BatchDeleteManager:
             candidate_id=item.delete_candidate_id,
             keep_candidate_id=item.keep_candidate_id,
         )
+        return self._validate_direct_preview(item, journal, preview)
+
+    def _validate_direct_preview(
+        self,
+        item: ModelBatchItem,
+        journal: ModelDirectDeleteJournal,
+        preview: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        manifest = _json_load(journal.manifest_json, {})
+        stored_binding = (
+            manifest.get("batch_binding") if isinstance(manifest, dict) else None
+        )
+        if stored_binding != self._batch_binding():
+            raise RuntimeError("직접 삭제 또는 부분 스캔 설정이 승인 이후 변경되었습니다.")
         if preview.get("backend") != "direct" or not secrets.compare_digest(
             str(preview.get("plan_digest") or ""), str(journal.plan_digest or "")
         ):
             raise RuntimeError("직접 삭제할 영상·자막 계획이 승인 이후 변경되었습니다.")
         if (preview.get("subtitle_cleanup") or {}).get("executable") is False:
             raise RuntimeError("보호할 수 없는 관련 자막이 있어 새 사전확인이 필요합니다.")
+        return preview
+
+    def _preview_pairs(
+        self,
+        pairs: Sequence[
+            Tuple[ModelDuplicateGroup, ModelMediaCandidate, ModelMediaCandidate]
+        ],
+    ) -> Tuple[Dict[Tuple[int, int, int], Dict[str, Any]], Dict[int, str]]:
+        """Build live previews with the service's shared Plex context when available."""
+
+        requests = tuple(
+            (int(group.id), int(target.id), int(keep.id))
+            for group, keep, target in pairs
+        )
+        preview_many = getattr(self.delete_service, "preview_many", None)
+        if callable(preview_many):
+            return preview_many(requests)
+
+        # Compatibility for tests and rolling deployments whose DeleteService
+        # predates the shared-context API.  Production always takes the path
+        # above, where fatal provider/Plex errors abort once rather than being
+        # converted into one exclusion per group.
+        previews: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        errors: Dict[int, str] = {}
+        grouped: Dict[int, list] = {}
+        for pair in pairs:
+            grouped.setdefault(int(pair[0].id), []).append(pair)
+        for group_id, group_pairs in grouped.items():
+            local: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+            try:
+                for group, keep, target in group_pairs:
+                    key = (int(group.id), int(target.id), int(keep.id))
+                    local[key] = self.delete_service.preview(
+                        group.id, target.id, keep.id
+                    )
+                previews.update(local)
+            except Exception as exc:
+                errors[group_id] = str(exc) or exc.__class__.__name__
+        return previews, errors
+
+    @staticmethod
+    def _normalized_exclusions(
+        excluded_groups: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Normalize public review fields and keep one reason per group."""
+
+        values = list(excluded_groups) or [
+            {
+                "group_id": 0,
+                "title": "자동 처리 대상 없음",
+                "media_type": "",
+                "reason": "no_eligible_groups",
+                "message": "현재 스캔에 안전하게 자동 정리할 중복 그룹이 없습니다.",
+            }
+        ]
+        result: List[Dict[str, Any]] = []
+        seen = set()
+        for raw in values:
+            try:
+                group_id = max(0, int(raw.get("group_id", 0)))
+            except (TypeError, ValueError):
+                group_id = 0
+            if group_id in seen:
+                continue
+            seen.add(group_id)
+            result.append(
+                {
+                    "group_id": group_id,
+                    "title": str(raw.get("title") or "")[:512],
+                    "media_type": str(raw.get("media_type") or "")[:32],
+                    "reason": str(raw.get("reason") or "excluded")[:64],
+                    "message": str(raw.get("message") or "자동 처리 제외"),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _add_exclusion_rows(
+        batch_id: int,
+        run_id: int,
+        excluded_groups: Sequence[Dict[str, Any]],
+        now: datetime,
+    ) -> None:
+        for item in excluded_groups:
+            F.db.session.add(
+                ModelBatchExclusion(
+                    batch_run_id=int(batch_id),
+                    scan_run_id=int(run_id),
+                    group_id=int(item["group_id"]),
+                    created_at=now,
+                    title=item["title"],
+                    media_type=item["media_type"],
+                    reason=item["reason"],
+                    message=item["message"],
+                )
+            )
+
+    def _persist_exclusion_review(
+        self,
+        run: ModelScanRun,
+        backend: str,
+        excluded_groups: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Persist a terminal, non-approvable review when nothing may run."""
+
+        exclusions = self._normalized_exclusions(excluded_groups)
+        now = datetime.now()
+        batch = ModelBatchRun(
+            scan_run_id=run.id,
+            created_at=now,
+            finished_at=now,
+            expires_at=now,
+            status="completed_with_warnings",
+            confirmation="BATCH REVIEW %s" % str(backend).upper(),
+            nonce_hash="",
+            total_items=0,
+            current_message="자동 처리 대상 없음 · 제외 사유 확인",
+        )
+        try:
+            locked_run = (
+                F.db.session.query(ModelScanRun)
+                .filter(
+                    ModelScanRun.id == int(run.id),
+                    ModelScanRun.status.in_(
+                        ("completed", "completed_with_warnings")
+                    ),
+                )
+                .populate_existing()
+                .with_for_update()
+                .first()
+            )
+            if locked_run is None:
+                raise RuntimeError(
+                    "원본 스캔 상태가 변경되어 자동 제외 검토를 저장하지 않습니다."
+                )
+            self._assert_settings_snapshot(locked_run)
+            F.db.session.add(batch)
+            F.db.session.flush()
+            self._add_exclusion_rows(batch.id, run.id, exclusions, now)
+            F.db.session.commit()
+        except Exception:
+            F.db.session.rollback()
+            raise
+        payload = self._status_locked(batch.id)
+        payload.update(
+            {
+                "backend": backend,
+                "eligible_groups": 0,
+                "planned_deletions": 0,
+                "executable": False,
+            }
+        )
+        return payload
+
+    def _rebind_direct_preview(
+        self, item: ModelBatchItem, journal: ModelDirectDeleteJournal
+    ) -> Dict[str, Any]:
+        """Bind the next exact plan after earlier targets in this group moved.
+
+        The short-lived batch nonce approves the immutable keep/delete policy.
+        A group with three or more versions necessarily has a different set of
+        survivors after its first deletion, so each later filesystem manifest
+        is recalculated, persisted, and then checked once more by DeleteService
+        immediately before PMS DELETE.
+        """
+
+        manifest = _json_load(journal.manifest_json, {})
+        stored_binding = (
+            manifest.get("batch_binding") if isinstance(manifest, dict) else None
+        )
+        current_binding = self._batch_binding()
+        if stored_binding != current_binding:
+            raise RuntimeError(
+                "직접 삭제 또는 부분 스캔 설정이 승인 이후 변경되었습니다."
+            )
+
+        preview = self.delete_service.preview(
+            group_id=item.group_id,
+            candidate_id=item.delete_candidate_id,
+            keep_candidate_id=item.keep_candidate_id,
+        )
+        cleanup = preview.get("subtitle_cleanup") or {}
+        if preview.get("backend") != "direct":
+            raise RuntimeError("직접 삭제 방식이 계획 이후 변경되었습니다.")
+        if cleanup.get("executable") is False:
+            raise RuntimeError("보호할 수 없는 관련 자막이 있어 이 항목을 자동 정리하지 않습니다.")
+        if self._batch_binding() != stored_binding:
+            raise RuntimeError(
+                "직접 삭제 또는 부분 스캔 설정이 재검증 중 변경되었습니다."
+            )
+        counts = cleanup.get("counts") or {}
+        journal.plan_digest = str(preview.get("plan_digest") or "")
+        if len(journal.plan_digest) != 64:
+            raise RuntimeError("직접 삭제의 새 plan digest를 만들 수 없습니다.")
+        journal.manifest_json = _json(
+            self._preview_manifest(cleanup, stored_binding)
+        )
+        journal.eligible_count = int(counts.get("eligible", 0))
+        journal.excluded_count = int(counts.get("excluded", 0))
+        journal.protected_count = int(counts.get("protected", 0))
+        journal.updated_at = datetime.now()
+        F.db.session.commit()
         return preview
 
     def preview(self, run_id: int) -> Dict[str, Any]:
@@ -326,46 +710,145 @@ class BatchDeleteManager:
                 raise RuntimeError("완료된 스캔 결과만 일괄 계획에 사용할 수 있습니다.")
             self._assert_settings_snapshot(run)
 
-            plan_limit = _batch_max_items()
-
             conflicts = self._cross_group_path_conflicts(run.id)
-            pairs: List[Tuple[ModelDuplicateGroup, ModelMediaCandidate, ModelMediaCandidate]] = []
-            for group in ModelDuplicateGroup.safe_open_by_run(run.id):
-                if group.id in conflicts:
-                    continue
-                pair = self._eligible_pair(group)
-                if pair is None:
-                    continue
-                pairs.append((group, pair[0], pair[1]))
-                if len(pairs) >= plan_limit:
-                    break
+            backend = _delete_backend()
+            pairs, excluded_groups, eligible_group_count = self._plan_groups(
+                run.id, conflicts, backend
+            )
             if not pairs:
-                raise RuntimeError(
-                    "일괄 처리 가능한 그룹이 없습니다. 안전·미처리·2개 버전·단독 유지 추천 조건을 확인하세요."
+                return self._persist_exclusion_review(
+                    run, backend, excluded_groups
                 )
 
-            backend = _delete_backend()
             binding = self._batch_binding()
             previews: List[Dict[str, Any]] = []
             if backend in ("quarantine", "direct"):
                 if binding["post_delete_scan_mode"] not in ("binary", "web"):
                     raise RuntimeError("파일 처리는 Binary 또는 Web 부분 스캔이 필수입니다.")
+                executable_pairs: List[
+                    Tuple[
+                        ModelDuplicateGroup,
+                        ModelMediaCandidate,
+                        ModelMediaCandidate,
+                    ]
+                ] = []
+                executable_previews: List[Dict[str, Any]] = []
+                preview_by_key, preview_errors = self._preview_pairs(pairs)
+                grouped: Dict[int, List[Tuple[Any, Any, Any]]] = {}
                 for group, keep, target in pairs:
-                    item_preview = self.delete_service.preview(
-                        group.id, target.id, keep.id
+                    grouped.setdefault(int(group.id), []).append(
+                        (group, keep, target)
                     )
-                    if backend == "direct" and (
-                        item_preview.get("subtitle_cleanup") or {}
-                    ).get("executable") is False:
-                        raise RuntimeError(
-                            "보호본을 만들 수 없는 관련 자막이 있어 일괄 계획을 "
-                            "생성하지 않습니다. 개별 결과에서 예외를 확인하세요."
+                for group_pairs in grouped.values():
+                    local_previews: List[Dict[str, Any]] = []
+                    try:
+                        group_id = int(group_pairs[0][0].id)
+                        if group_id in preview_errors:
+                            raise RuntimeError(preview_errors[group_id])
+                        for group, keep, target in group_pairs:
+                            key = (int(group.id), int(target.id), int(keep.id))
+                            item_preview = preview_by_key.get(key)
+                            if item_preview is None:
+                                raise RuntimeError(
+                                    "서버가 이 항목의 파일 계획을 반환하지 않았습니다."
+                                )
+                            if str(item_preview.get("backend") or "") != backend:
+                                raise RuntimeError(
+                                    "파일 처리 방식이 계획 중 변경되었습니다."
+                                )
+                            if len(str(item_preview.get("plan_digest") or "")) != 64:
+                                raise RuntimeError(
+                                    "영상·자막 계획 digest가 올바르지 않습니다."
+                                )
+                            if backend == "direct" and (
+                                item_preview.get("subtitle_cleanup") or {}
+                            ).get("executable") is False:
+                                raise RuntimeError(
+                                    "보호할 수 없는 관련 자막이 있습니다."
+                                )
+                            local_previews.append(item_preview)
+                        self._assert_source_sets_disjoint(
+                            local_previews,
+                            [group_pairs[0][0].id] * len(local_previews),
                         )
-                    previews.append(item_preview)
-                self._assert_source_sets_disjoint(previews)
+                    except Exception as exc:
+                        excluded_groups.append(
+                            self._excluded_group(
+                                group_pairs[0][0],
+                                "filesystem_plan_blocked",
+                                "영상·자막 안전 계획을 만들 수 없어 제외했습니다: %s"
+                                % (str(exc) or exc.__class__.__name__),
+                            )
+                        )
+                        continue
+                    executable_pairs.extend(group_pairs)
+                    executable_previews.extend(local_previews)
+                pairs = executable_pairs
+                previews = executable_previews
+                eligible_group_count = len({int(group.id) for group, _keep, _target in pairs})
+                if not pairs:
+                    return self._persist_exclusion_review(
+                        run, backend, excluded_groups
+                    )
+                try:
+                    conflict_group_ids = self._source_conflict_group_ids(
+                        previews,
+                        [group.id for group, _keep, _target in pairs],
+                    )
+                except Exception as exc:
+                    # If source identity itself cannot be classified, no item
+                    # from this filesystem plan is allowed to execute.  Keep a
+                    # durable structured review instead of returning an opaque
+                    # request error with no exclusions.
+                    conflict_group_ids = {
+                        int(group.id) for group, _keep, _target in pairs
+                    }
+                    conflict_message = (
+                        "영상·자막 공유 경로의 귀속을 확인할 수 없어 전체 파일 계획을 "
+                        "제외했습니다: %s"
+                        % (str(exc) or exc.__class__.__name__)
+                    )
+                else:
+                    conflict_message = (
+                        "다른 자동 정리 그룹과 영상·자막 또는 보호 대상 경로를 "
+                        "공유하여 제외했습니다."
+                    )
+                if conflict_group_ids:
+                    groups_by_id = {
+                        int(group.id): group for group, _keep, _target in pairs
+                    }
+                    for group_id in sorted(conflict_group_ids):
+                        group = groups_by_id.get(int(group_id))
+                        if group is not None:
+                            excluded_groups.append(
+                                self._excluded_group(
+                                    group,
+                                    "cross_group_path_conflict",
+                                    conflict_message,
+                                )
+                            )
+                    kept = [
+                        (pair, preview)
+                        for pair, preview in zip(pairs, previews)
+                        if int(pair[0].id) not in conflict_group_ids
+                    ]
+                    pairs = [value[0] for value in kept]
+                    previews = [value[1] for value in kept]
+                    eligible_group_count = len(
+                        {int(group.id) for group, _keep, _target in pairs}
+                    )
+                    if not pairs:
+                        return self._persist_exclusion_review(
+                            run, backend, excluded_groups
+                        )
+                if self._batch_binding() != binding:
+                    raise RuntimeError(
+                        "파일 처리 또는 부분 스캔 설정이 계획 중 변경되었습니다."
+                    )
 
             nonce = secrets.token_urlsafe(32)
             now = datetime.now()
+            excluded_groups = self._normalized_exclusions(excluded_groups)
             expires = now + timedelta(seconds=_PREVIEW_SECONDS)
             batch = ModelBatchRun(
                 scan_run_id=run.id,
@@ -374,7 +857,7 @@ class BatchDeleteManager:
                 status="preview",
                 nonce_hash=_nonce_hash(nonce),
                 total_items=len(pairs),
-                current_message="사용자 일괄 승인 대기 중",
+                current_message="자동 정리 실행 준비 중",
             )
             try:
                 # Serialize the final preview materialization with scan-result
@@ -402,6 +885,9 @@ class BatchDeleteManager:
                 self._assert_settings_snapshot(locked_run)
                 F.db.session.add(batch)
                 F.db.session.flush()
+                self._add_exclusion_rows(
+                    batch.id, run.id, excluded_groups, now
+                )
                 if backend in ("quarantine", "direct"):
                     aggregate_payload = [
                         {
@@ -505,6 +991,9 @@ class BatchDeleteManager:
                     "nonce": nonce,
                     "confirmation": batch.confirmation,
                     "expires_at": int(time.time()) + _PREVIEW_SECONDS,
+                    "eligible_groups": eligible_group_count,
+                    "planned_deletions": len(pairs),
+                    "excluded_groups": excluded_groups,
                 }
             )
             return payload
@@ -516,22 +1005,8 @@ class BatchDeleteManager:
         self._assert_settings_snapshot(run)
         items = ModelBatchItem.by_batch(batch.id)
         conflicts = self._cross_group_path_conflicts(run.id)
-        current_limit = _batch_max_items()
-        if not items or len(items) != int(batch.total_items or 0) or len(items) > current_limit:
+        if not items or len(items) != int(batch.total_items or 0):
             raise RuntimeError("삭제 가능 수가 계획 이후 변경되었습니다. 다시 사전확인하세요.")
-        for item in items:
-            group = ModelDuplicateGroup.get(item.group_id)
-            if group is None or group.run_id != run.id or group.id in conflicts:
-                raise RuntimeError("계획의 중복 그룹을 다시 확인할 수 없습니다.")
-            pair = self._eligible_pair(group)
-            if (
-                pair is None
-                or pair[0].id != item.keep_candidate_id
-                or pair[1].id != item.delete_candidate_id
-                or pair[0].media_id != item.keep_media_id
-                or pair[1].media_id != item.delete_media_id
-            ):
-                raise RuntimeError("계획 항목이 변경되었습니다. 다시 스캔하고 사전확인하세요.")
         planned_backend = self._planned_backend(batch)
         if not str(getattr(batch, "confirmation", "") or ""):
             # Compatibility for an already-persisted preview created while a
@@ -553,6 +1028,105 @@ class BatchDeleteManager:
                 for item in items
             ):
                 planned_backend = "direct"
+        expected_pairs, _excluded, _eligible_groups = self._plan_groups(
+            run.id, conflicts, planned_backend
+        )
+        expected = {
+            (
+                int(group.id),
+                int(keep.id),
+                int(target.id),
+                str(keep.media_id),
+                str(target.media_id),
+            )
+            for group, keep, target in expected_pairs
+        }
+        actual = {
+            (
+                int(item.group_id),
+                int(item.keep_candidate_id),
+                int(item.delete_candidate_id),
+                str(item.keep_media_id),
+                str(item.delete_media_id),
+            )
+            for item in items
+        }
+        if not actual.issubset(expected) or len(actual) != len(items):
+            raise RuntimeError(
+                "자동 정리 대상 전체가 계획 이후 변경되었습니다. 다시 계획을 만드세요."
+            )
+        expected_by_group: Dict[int, set] = {}
+        actual_by_group: Dict[int, set] = {}
+        for value in expected:
+            expected_by_group.setdefault(value[0], set()).add(value)
+        for value in actual:
+            actual_by_group.setdefault(value[0], set()).add(value)
+        if any(
+            actual_by_group[group_id] != expected_by_group.get(group_id, set())
+            for group_id in actual_by_group
+        ):
+            raise RuntimeError(
+                "한 그룹의 자동 정리 대상 일부가 계획에서 누락되었습니다. 다시 계획을 만드세요."
+            )
+        if planned_backend in ("quarantine", "direct") and _delete_backend() != planned_backend:
+            raise RuntimeError(
+                "사전확인 이후 파일 처리 방식이 변경되었습니다. Plex 삭제로 전환하지 않습니다."
+            )
+        fresh_by_key: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        fresh_errors: Dict[int, str] = {}
+        fresh_conflict_group_ids: set = set()
+        if planned_backend in ("quarantine", "direct"):
+            fresh_by_key, fresh_errors = self._preview_pairs(expected_pairs)
+            fresh_preview_values: List[Dict[str, Any]] = []
+            fresh_preview_group_ids: List[int] = []
+            for group, keep, target in expected_pairs:
+                key = (int(group.id), int(target.id), int(keep.id))
+                preview = fresh_by_key.get(key)
+                if preview is not None:
+                    fresh_preview_values.append(preview)
+                    fresh_preview_group_ids.append(int(group.id))
+            fresh_conflict_group_ids = self._source_conflict_group_ids(
+                fresh_preview_values, fresh_preview_group_ids
+            )
+            if fresh_conflict_group_ids.intersection(actual_by_group):
+                raise RuntimeError(
+                    "승인 직전 영상·자막 공유 경로가 계획된 그룹과 충돌합니다. "
+                    "다시 계획을 만드세요."
+                )
+        missing_group_ids = set(expected_by_group) - set(actual_by_group)
+        if missing_group_ids:
+            if planned_backend not in ("quarantine", "direct"):
+                raise RuntimeError(
+                    "자동 정리 가능한 그룹이 계획에서 누락되었습니다. 다시 계획을 만드세요."
+                )
+            expected_objects: Dict[int, List[Tuple[Any, Any, Any]]] = {}
+            for group, keep, target in expected_pairs:
+                expected_objects.setdefault(int(group.id), []).append(
+                    (group, keep, target)
+                )
+            for group_id in missing_group_ids:
+                still_blocked = (
+                    group_id in fresh_errors
+                    or group_id in fresh_conflict_group_ids
+                )
+                if not still_blocked:
+                    for group, keep, target in expected_objects[group_id]:
+                        omitted_preview = fresh_by_key.get(
+                            (int(group.id), int(target.id), int(keep.id))
+                        )
+                        if omitted_preview is None or (
+                            planned_backend == "direct"
+                            and (omitted_preview.get("subtitle_cleanup") or {}).get(
+                                "executable"
+                            )
+                            is False
+                        ):
+                            still_blocked = True
+                            break
+                if not still_blocked:
+                    raise RuntimeError(
+                        "이전에 제외된 그룹이 이제 자동 정리 가능해졌습니다. 다시 계획을 만드세요."
+                    )
         if planned_backend == "quarantine":
             if _delete_backend() != "quarantine":
                 raise RuntimeError(
@@ -561,8 +1135,24 @@ class BatchDeleteManager:
             fresh_previews: List[Dict[str, Any]] = []
             for item in items:
                 journal = self._preview_journal(batch.id, item.delete_candidate_id)
-                fresh_previews.append(self._fresh_quarantine_preview(item, journal))
-            self._assert_source_sets_disjoint(fresh_previews)
+                key = (
+                    int(item.group_id),
+                    int(item.delete_candidate_id),
+                    int(item.keep_candidate_id),
+                )
+                if int(item.group_id) in fresh_errors or key not in fresh_by_key:
+                    raise RuntimeError(
+                        "격리할 영상·자막 계획이 승인 직전 변경되었습니다: %s"
+                        % fresh_errors.get(int(item.group_id), "계획 없음")
+                    )
+                fresh_previews.append(
+                    self._validate_quarantine_preview(
+                        item, journal, fresh_by_key[key]
+                    )
+                )
+            self._assert_source_sets_disjoint(
+                fresh_previews, [item.group_id for item in items]
+            )
         elif planned_backend == "legacy_direct":
             raise RuntimeError(
                 "이 사전확인은 이전 파일 직접 삭제 방식으로 생성되었습니다. "
@@ -578,8 +1168,22 @@ class BatchDeleteManager:
                 journal = self._direct_preview_journal(
                     batch.id, item.delete_candidate_id
                 )
-                fresh_previews.append(self._fresh_direct_preview(item, journal))
-            self._assert_source_sets_disjoint(fresh_previews)
+                key = (
+                    int(item.group_id),
+                    int(item.delete_candidate_id),
+                    int(item.keep_candidate_id),
+                )
+                if int(item.group_id) in fresh_errors or key not in fresh_by_key:
+                    raise RuntimeError(
+                        "직접 삭제할 영상·자막 계획이 승인 직전 변경되었습니다: %s"
+                        % fresh_errors.get(int(item.group_id), "계획 없음")
+                    )
+                fresh_previews.append(
+                    self._validate_direct_preview(item, journal, fresh_by_key[key])
+                )
+            self._assert_source_sets_disjoint(
+                fresh_previews, [item.group_id for item in items]
+            )
         elif _delete_backend() != planned_backend:
             raise RuntimeError(
                 "사전확인 이후 파일 처리 방식이 변경되었습니다. 다시 사전확인하세요."
@@ -673,6 +1277,55 @@ class BatchDeleteManager:
         batch.processed_items = batch.succeeded_items + batch.failed_items
 
     @staticmethod
+    def _advance_group_after_success(
+        batch_id: int, item: ModelBatchItem
+    ) -> None:
+        """Make the next target in one group eligible without a rescan gap."""
+
+        candidate = ModelMediaCandidate.get(item.delete_candidate_id)
+        group = ModelDuplicateGroup.get(item.group_id)
+        run = ModelScanRun.get(item.scan_run_id)
+        if candidate is None or group is None or run is None:
+            raise RuntimeError("자동 정리 완료 상태를 DB에 반영할 수 없습니다.")
+        if not candidate.deleted:
+            candidate.deleted = True
+            candidate.deleted_at = datetime.now()
+        remaining = any(
+            other.id != item.id
+            and other.group_id == item.group_id
+            and other.status == "planned"
+            for other in ModelBatchItem.by_batch(batch_id)
+        )
+        group.safe_to_delete = bool(remaining)
+        group.resolution_status = "open" if remaining else "rescan_required"
+        group.safety_flags_json = _json(
+            ["batch_auto_delete_in_progress"]
+            if remaining
+            else ["rescan_required_after_delete"]
+        )
+
+    @staticmethod
+    def _close_partially_processed_groups(batch_id: int) -> None:
+        """Do not leave a cancelled/stopped auto group open after mutation."""
+
+        items = ModelBatchItem.by_batch(batch_id)
+        touched = {
+            int(item.group_id)
+            for item in items
+            if item.status
+            in (
+                "success",
+                "scan_pending",
+            )
+        }
+        for group_id in touched:
+            group = ModelDuplicateGroup.get(group_id)
+            if group is not None and group.resolution_status == "open":
+                group.safe_to_delete = False
+                group.resolution_status = "rescan_required"
+                group.safety_flags_json = _json(["rescan_required_after_delete"])
+
+    @staticmethod
     def _mark_remaining(batch_id: int, status: str, message: str) -> None:
         now = datetime.now()
         for item in ModelBatchItem.by_batch(batch_id):
@@ -702,6 +1355,7 @@ class BatchDeleteManager:
         batch.nonce_hash = ""
         batch.lease_key = None
         batch.deletion_lease_token = ""
+        self._close_partially_processed_groups(batch_id)
         F.db.session.commit()
         try:
             if release_deletion_lease and deletion_lease_token:
@@ -767,6 +1421,11 @@ class BatchDeleteManager:
                         self._finish_batch(batch_id, terminal, message)
                         return
 
+                    _expire_session()
+                    queued_item = ModelBatchItem.get(item_id)
+                    if queued_item is None or queued_item.status != "planned":
+                        continue
+
                     if not ModelBatchItem.claim_for_worker(item_id, datetime.now()):
                         F.db.session.rollback()
                         self._mark_remaining(
@@ -814,7 +1473,7 @@ class BatchDeleteManager:
                             preview_journal = self._direct_preview_journal(
                                 batch.id, item.delete_candidate_id
                             )
-                            fresh_preview = self._fresh_direct_preview(
+                            fresh_preview = self._rebind_direct_preview(
                                 item, preview_journal
                             )
                             plan_digest = str(preview_journal.plan_digest)
@@ -854,19 +1513,18 @@ class BatchDeleteManager:
                             log.message if log is not None else str(exc)
                         )[:2000]
                         item.finished_at = datetime.now()
-                        self._mark_remaining(
-                            batch_id,
-                            "skipped",
-                            "이전 항목 실패로 실행하지 않음",
-                        )
+                        for remaining in ModelBatchItem.by_batch(batch_id):
+                            if (
+                                remaining.group_id == item.group_id
+                                and remaining.status == "planned"
+                            ):
+                                remaining.status = "skipped"
+                                remaining.message = (
+                                    "같은 그룹의 이전 항목 실패로 자동 정리하지 않음"
+                                )
+                                remaining.finished_at = datetime.now()
                         F.db.session.commit()
-                        self._finish_batch(
-                            batch_id,
-                            "stopped",
-                            "항목 실패로 즉시 중단됨",
-                            str(exc),
-                        )
-                        return
+                        continue
 
                     _expire_session()
                     item = ModelBatchItem.get(item_id)
@@ -885,6 +1543,7 @@ class BatchDeleteManager:
                     )
                     item.action_log_id = result.get("action_id")
                     item.finished_at = None if pending_scan else datetime.now()
+                    self._advance_group_after_success(batch_id, item)
                     items = ModelBatchItem.by_batch(batch_id)
                     self._refresh_counts(batch, items)
                     batch.current_message = "Group #%s 완료" % item.group_id
@@ -898,7 +1557,21 @@ class BatchDeleteManager:
                         "파일 처리 완료 · Plex 부분 스캔 검증 대기",
                     )
                 else:
-                    self._finish_batch(batch_id, "completed", "일괄 승인 삭제 완료")
+                    failed = any(
+                        item.status in _FAILURE_ITEM_STATUSES for item in items
+                    )
+                    skipped = any(
+                        item.status in _SKIPPED_ITEM_STATUSES for item in items
+                    )
+                    self._finish_batch(
+                        batch_id,
+                        "completed_with_errors"
+                        if failed
+                        else ("completed_with_warnings" if skipped else "completed"),
+                        "자동 정리 완료 · 일부 항목은 확인 필요"
+                        if failed or skipped
+                        else "자동 정리 완료",
+                    )
         except DeletionLeaseLost:
             P.logger.warning(
                 "Batch worker could not renew DB deletion lease; recovery owner will finalize plan %s",
@@ -929,6 +1602,9 @@ class BatchDeleteManager:
         payload = batch.as_api()
         payload["backend"] = self._planned_backend(batch)
         payload["items"] = [item.as_api() for item in ModelBatchItem.by_batch(batch.id)]
+        payload["excluded_groups"] = [
+            item.as_api() for item in ModelBatchExclusion.by_batch(batch.id)
+        ]
         run = ModelScanRun.get(batch.scan_run_id)
         if run is not None:
             payload["delete_budget"] = delete_attempt_budget(run)

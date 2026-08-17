@@ -32,6 +32,10 @@ class PlexAuthenticationError(PlexGatewayError):
     pass
 
 
+class PlexMetadataNotFound(PlexGatewayError):
+    """The requested metadata item no longer exists on an otherwise live PMS."""
+
+
 class PlexDeleteOutcomeUnknown(PlexGatewayError):
     """A timeout occurred after sending DELETE. The caller must re-read state."""
 
@@ -167,7 +171,7 @@ def parse_metadata(item: Dict[str, Any]) -> MetadataItem:
 
 class PlexGateway:
     PRODUCT = "Plex DupeFinder FF"
-    VERSION = "1.5.1"
+    VERSION = "1.6.0"
 
     def __init__(
         self,
@@ -333,12 +337,20 @@ class PlexGateway:
         if not str(rating_key).isdigit():
             raise PlexGatewayError("잘못된 Plex ratingKey입니다.")
         params = {"includeGuids": "1", "includeMedia": "1"}
-        container = _decode_container(
-            self._request("GET", "/library/metadata/%s" % rating_key, params=params)
-        )
+        try:
+            response = self._request(
+                "GET", "/library/metadata/%s" % rating_key, params=params
+            )
+        except PlexHTTPError as exc:
+            if exc.status_code in (404, 410):
+                raise PlexMetadataNotFound(
+                    "Plex metadata 항목이 더 이상 존재하지 않습니다."
+                ) from exc
+            raise
+        container = _decode_container(response)
         items = _as_list(container.get("Metadata")) + _as_list(container.get("Video"))
         if not items or not isinstance(items[0], dict):
-            raise PlexGatewayError("Plex metadata를 찾을 수 없습니다.")
+            raise PlexMetadataNotFound("Plex metadata를 찾을 수 없습니다.")
         return parse_metadata(items[0])
 
     def delete_media(self, rating_key: str, media_id: str) -> int:

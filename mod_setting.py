@@ -83,7 +83,6 @@ class ModuleSetting(PluginModuleBase):
         "setting_db_version": "1",
         "setting_delete_enabled": "False",
         "setting_batch_delete_enabled": "False",
-        "setting_batch_max_items": "10",
         "setting_allowed_roots": "",
         "setting_delete_backend": "plex",
         "setting_quarantine_root": "",

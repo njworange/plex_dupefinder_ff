@@ -48,6 +48,7 @@ try:
     # Models must be imported before FlaskFarm calls db.create_all().
     from .models import (
         ModelActionLog,
+        ModelBatchExclusion,
         ModelBatchItem,
         ModelBatchRun,
         ModelDeletionLease,
@@ -67,6 +68,7 @@ try:
     P.ModelMediaCandidate = ModelMediaCandidate
     P.ModelActionLog = ModelActionLog
     P.ModelBatchRun = ModelBatchRun
+    P.ModelBatchExclusion = ModelBatchExclusion
     P.ModelBatchItem = ModelBatchItem
     P.ModelDeletionLease = ModelDeletionLease
     P.ModelDirectDeleteJournal = ModelDirectDeleteJournal

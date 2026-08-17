@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.0
+
+- Reworked the results workflow around scan/score, one-click selected-version deletion, and an opt-in automatic cleanup started by the user; neither deletion path asks for typed confirmation or a browser confirmation dialog, while server-side CSRF, one-time nonce, fresh plan digest and global lease checks remain mandatory.
+- Automatic cleanup now retains the single unique highest-score Media in every eligible group and processes every lower-score Media without a plan-size cap. Highest-score ties, unsafe groups (including multipart under the default policy), cross-group shared paths, ambiguous file/subtitle plans and quarantine groups with 3+ active Media are excluded with reasons.
+- Changed automatic execution isolation so a failed item skips only the remaining items in its group and independent eligible groups continue. Direct mode can safely finalize multiple intentional deletions from a 3+ Media group against their combined expected survivor set.
+- Added explicit DB-only force cleanup for terminal scan results that are otherwise retained by `critical`/`recovery_required` journals; files, Plex items, journals and protection/recovery data remain untouched, while live workers and valid leases still block cleanup.
+- Added per-row DB force-delete controls for ActionLog and post-delete scan history. Hidden rows become scrubbed `history_deleted` tombstones so numeric IDs are not reused; connected recovery journals remain intact and no file/PMS operation is invoked.
+- Preserved scrubbed `scan_run`, `duplicate_group`, and `media_candidate` tombstones during scan-result cleanup so SQLite cannot reuse any referenced audit ID; normal result APIs hide all three tombstone types.
+- Persisted every automatic-cleanup exclusion in a dedicated `batch_exclusion` audit table, including all-excluded reviews and cross-group subtitle/path conflicts, so reasons remain visible after refresh or reconnect without entering the worker queue.
+- Added independent pagination for post-delete scan history so every terminal Job remains reachable for DB-only force deletion instead of disappearing beyond the previous 100-row window.
+
 ## 1.5.1
 
 - Changed hybrid direct-delete partial scans to target the user-selected surviving Media folder (or TV show root) instead of the deleted candidate folder, so a normally removed empty candidate directory no longer produces a false terminal `blocked` result.

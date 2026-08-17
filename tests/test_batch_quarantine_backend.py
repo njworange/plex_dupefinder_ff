@@ -176,9 +176,16 @@ class BatchQuarantineBackendTest(unittest.TestCase):
             manager = module.BatchDeleteManager(types.SimpleNamespace())
             manager._assert_settings_snapshot = lambda run: None
             manager._cross_group_path_conflicts = lambda run_id: set()
-            manager._eligible_pair = lambda group: (
-                _Record(id=3, media_id="30"),
-                _Record(id=2, media_id="20"),
+            manager._plan_groups = lambda run_id, conflicts, backend: (
+                [
+                    (
+                        _Record(id=4),
+                        _Record(id=3, media_id="30"),
+                        _Record(id=2, media_id="20"),
+                    )
+                ],
+                [],
+                1,
             )
             module.ModelScanRun = types.SimpleNamespace(
                 get=lambda run_id: _Record(
@@ -297,6 +304,8 @@ class BatchQuarantineBackendTest(unittest.TestCase):
             manager._fresh_quarantine_preview = lambda *args: {
                 "confirmation": "QUARANTINE 40 SUBTITLES 1 aaaaaaaaaaaa"
             }
+            manager._advance_group_after_success = lambda *args: None
+            manager._close_partially_processed_groups = lambda *args: None
 
             manager._worker(1)
 

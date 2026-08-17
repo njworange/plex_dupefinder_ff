@@ -10,7 +10,7 @@
     <div class="col-md-3"><label class="small text-muted">외부 자막</label><select id="subtitle_filter" class="form-control form-control-sm"><option value="">전체</option><option value="excluded">보호·제외 대상 있음</option><option value="quarantined">함께 격리됨</option><option value="deleted">전용 자막 정리됨</option></select></div>
     <div class="col-md-2 d-flex align-items-end"><button id="history_filter_btn" class="btn btn-sm btn-primary">검색</button></div>
   </div>
-  <div class="pdff-muted mt-3">검증 차단과 timeout 후 확인 불가 결과도 보존됩니다. 안전 격리에서 제외된 자막과 Plex DELETE 전에 보호한 유지본·공유·모호 자막은 경로와 사유를 감사 상세에서 확인할 수 있습니다. 플러그인 UI에서는 감사 이력을 삭제하지 않습니다.</div>
+  <div class="pdff-muted mt-3">검증 차단과 timeout 후 확인 불가 결과도 보존됩니다. 안전 격리에서 제외된 자막과 Plex DELETE 전에 보호한 유지본·공유·모호 자막은 경로와 사유를 감사 상세에서 확인할 수 있습니다. 각 삭제 버튼은 선택한 DB 작업 이력만 강제로 숨깁니다. 연결된 복구 journal과 보호 정보는 안전을 위해 보존하며, 미디어·자막·격리·보호 파일을 삭제·복구하거나 Plex에 명령을 보내지 않습니다. 실행 중이거나 잠긴 작업은 거부합니다.</div>
 </section>
 
 <section class="pdff-panel">
@@ -18,8 +18,10 @@
     <h3 class="pdff-title" style="margin:0">삭제 후 부분 스캔 작업</h3>
     <button id="post_scan_refresh_btn" type="button" class="btn btn-sm btn-outline-secondary">새로고침</button>
   </div>
-  <div class="pdff-muted mb-2">최근 100개 작업입니다. Plex DELETE는 확인 결과와 관계없이 자동 재실행하지 않습니다. 안전 격리와 Plex DELETE + 외부 자막 정리는 부분 스캔과 유지본 재검증까지 성공해야 완료되며, 최종 실패하면 수동 확인 상태로 남습니다.</div>
+  <div class="pdff-muted mb-2">전체 작업을 최신순으로 페이지 조회합니다. Plex DELETE는 확인 결과와 관계없이 자동 재실행하지 않습니다. 안전 격리와 Plex DELETE + 외부 자막 정리는 부분 스캔과 유지본 재검증까지 성공해야 완료되며, 최종 실패하면 수동 확인 상태로 남습니다.</div>
+  <div id="post_scan_summary" class="pdff-muted mb-2"></div>
   <div id="post_scan_list" class="pdff-empty">부분 스캔 작업을 조회하는 중입니다.</div>
+  <div class="pdff-toolbar justify-content-center mt-3"><button id="post_scan_prev_btn" type="button" class="btn btn-sm btn-outline-secondary">이전</button><span id="post_scan_page_label" class="pdff-muted"></span><button id="post_scan_next_btn" type="button" class="btn btn-sm btn-outline-secondary">다음</button></div>
 </section>
 
 <section class="pdff-panel">
@@ -38,11 +40,15 @@
 <script>
 'use strict';
 var packageName = {{ arg['package_name']|tojson }};
+var csrfToken = {{ arg['csrf_token']|tojson }};
 var actionRows = [];
 var currentPage = 1;
 var totalPages = 1;
 var pageSize = 50;
 var postDeleteScanRows = [];
+var postScanPage = 1;
+var postScanTotalPages = 1;
+var postScanPageSize = 50;
 
 function renderPostDeleteScans() {
   if (!postDeleteScanRows.length) {
@@ -64,21 +70,29 @@ function renderPostDeleteScans() {
       '<div class="col-md-2"><span class="pdff-kv-label">방식 / 섹션</span>' + PDFF.esc(mode) + ' / ' + PDFF.esc(item.section_key || '-') + '<div class="pdff-muted">' + PDFF.esc(item.media_type || '-') + '</div></div>' +
       '<div class="col-md-4"><span class="pdff-kv-label">대상 경로</span><div class="pdff-code" style="word-break:break-all">' + PDFF.esc(item.target_path || '-') + '</div>' + result + '</div>' +
       '<div class="col-md-2"><span class="pdff-kv-label">시도</span>' + PDFF.esc(attempts) + '<div class="pdff-muted">HTTP ' + PDFF.esc(item.response_status || '-') + '</div></div>' +
-      '<div class="col-md-2"><span class="pdff-kv-label">연결된 감사</span>' + PDFF.esc(links) + '</div>' +
+      '<div class="col-md-2"><span class="pdff-kv-label">연결된 감사</span>' + PDFF.esc(links) + '<div class="mt-2"><button type="button" class="btn btn-sm btn-outline-danger history-force-delete" data-type="post_scan" data-id="' + PDFF.esc(item.id) + '">DB 강제삭제</button></div></div>' +
       '</div></article>';
   });
   $('#post_scan_list').removeClass('pdff-empty').html(html);
 }
 
-function loadPostDeleteScans() {
+function loadPostDeleteScans(resetPage) {
+  if (resetPage) postScanPage = 1;
   $('#post_scan_refresh_btn').prop('disabled', true);
-  PDFF.request(packageName, 'scan', 'post_delete_scan_status', {}, 'GET', function (ret) {
+  PDFF.request(packageName, 'scan', 'post_delete_scan_status', {page: postScanPage, page_size: postScanPageSize}, 'GET', function (ret) {
     $('#post_scan_refresh_btn').prop('disabled', false);
     if (ret.ret !== 'success') {
       $('#post_scan_list').addClass('pdff-empty').text('부분 스캔 작업 조회에 실패했습니다.');
       return;
     }
-    postDeleteScanRows = (ret.data && Array.isArray(ret.data.items)) ? ret.data.items : [];
+    var result = ret.data || {};
+    postDeleteScanRows = Array.isArray(result.items) ? result.items : [];
+    postScanPage = Math.max(1, Number(result.page || 1));
+    postScanTotalPages = Math.max(1, Number(result.pages || 1));
+    $('#post_scan_summary').text(Number(result.total || 0) + '개 부분 스캔 작업');
+    $('#post_scan_page_label').text(postScanPage + ' / ' + postScanTotalPages);
+    $('#post_scan_prev_btn').prop('disabled', postScanPage <= 1);
+    $('#post_scan_next_btn').prop('disabled', postScanPage >= postScanTotalPages);
     renderPostDeleteScans();
   });
 }
@@ -109,7 +123,7 @@ function renderHistory() {
       subtitleSummary = '<div class="small mt-1">외부 자막 · ' + handled + ' · ' + reviewLabel + '</div>';
       if (cleanup.excludedCount > 0 || cleanup.protectedCount > 0) subtitleSummary += '<span class="pdff-badge pdff-warning-badge">자막 보호·예외 확인</span>';
     }
-    html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-2"><strong>#' + PDFF.esc(item.id) + '</strong><br>' + PDFF.badge(item.status) + subtitleSummary + '</div><div class="col-md-4"><strong>' + PDFF.esc(item.action) + '</strong><div class="pdff-muted">Run #' + PDFF.esc(item.run_id) + ' · Group #' + PDFF.esc(item.group_id) + '</div><div class="small">' + PDFF.esc(item.message || '') + '</div></div><div class="col-md-3"><span class="pdff-kv-label">유지 / 삭제 후보</span>#' + PDFF.esc(item.keep_candidate_id || '-') + ' / #' + PDFF.esc(item.candidate_id || '-') + '</div><div class="col-md-2"><span class="pdff-kv-label">시각</span>' + PDFF.esc(PDFF.date(item.created_at)) + '</div><div class="col-md-1"><button class="btn btn-sm btn-outline-secondary action-detail" data-id="' + PDFF.esc(item.id) + '">상세</button></div></div></article>';
+    html += '<article class="pdff-row"><div class="row align-items-center"><div class="col-md-2"><strong>#' + PDFF.esc(item.id) + '</strong><br>' + PDFF.badge(item.status) + subtitleSummary + '</div><div class="col-md-4"><strong>' + PDFF.esc(item.action) + '</strong><div class="pdff-muted">Run #' + PDFF.esc(item.run_id) + ' · Group #' + PDFF.esc(item.group_id) + '</div><div class="small">' + PDFF.esc(item.message || '') + '</div></div><div class="col-md-2"><span class="pdff-kv-label">유지 / 삭제 후보</span>#' + PDFF.esc(item.keep_candidate_id || '-') + ' / #' + PDFF.esc(item.candidate_id || '-') + '</div><div class="col-md-2"><span class="pdff-kv-label">시각</span>' + PDFF.esc(PDFF.date(item.created_at)) + '</div><div class="col-md-2"><div class="btn-group-vertical btn-group-sm"><button type="button" class="btn btn-outline-secondary action-detail" data-id="' + PDFF.esc(item.id) + '">상세</button><button type="button" class="btn btn-outline-danger history-force-delete" data-type="action" data-id="' + PDFF.esc(item.id) + '">DB 강제삭제</button></div></div></div></article>';
   });
   $('#history_list').removeClass('pdff-empty').html(html);
 }
@@ -134,7 +148,9 @@ function loadHistory(resetPage) {
 }
 
 $('#history_filter_btn').on('click', function () { loadHistory(true); });
-$('#post_scan_refresh_btn').on('click', loadPostDeleteScans);
+$('#post_scan_refresh_btn').on('click', function () { loadPostDeleteScans(true); });
+$('#post_scan_prev_btn').on('click', function () { if (postScanPage > 1) { postScanPage -= 1; loadPostDeleteScans(false); } });
+$('#post_scan_next_btn').on('click', function () { if (postScanPage < postScanTotalPages) { postScanPage += 1; loadPostDeleteScans(false); } });
 $('#run_filter').on('keydown', function (e) { if (e.key === 'Enter') loadHistory(true); });
 $('#history_prev_btn').on('click', function () { if (currentPage > 1) { currentPage -= 1; loadHistory(false); } });
 $('#history_next_btn').on('click', function () { if (currentPage < totalPages) { currentPage += 1; loadHistory(false); } });
@@ -151,6 +167,33 @@ $(document).on('click', '.action-detail', function () {
   });
 });
 $('#history_close_btn').on('click', function () { $('#history_detail').hide(); });
-$(document).ready(function () { loadPostDeleteScans(); loadHistory(true); });
+$(document).on('click', '.history-force-delete', function () {
+  var button = $(this);
+  var itemType = String(button.data('type') || '');
+  var itemId = Number(button.data('id'));
+  if ((itemType !== 'action' && itemType !== 'post_scan') || !Number.isInteger(itemId) || itemId <= 0) return;
+  var typeLabel = itemType === 'action' ? '삭제 감사 Action' : '삭제 후 부분 스캔 Job';
+  var warning = typeLabel + ' #' + itemId + '을(를) DB에서 강제로 삭제하시겠습니까?\n\n' +
+    '목록에서 숨기고 ID 재사용 방지용 tombstone만 남깁니다. 연결된 복구 journal과 보호 정보는 보존합니다. 미디어·자막·격리·보호 파일은 삭제하거나 복구하지 않고 Plex에도 명령을 보내지 않습니다.';
+  if (!window.confirm(warning)) return;
+  var confirmation = 'FORCE DELETE ' + (itemType === 'action' ? 'ACTION' : 'POST_SCAN') + ' ' + itemId;
+  button.prop('disabled', true).text('삭제 중');
+  PDFF.request(packageName, 'history', 'force_delete', {
+    item_type: itemType,
+    item_id: itemId,
+    confirmation: confirmation,
+    csrf_token: csrfToken
+  }, 'POST', function (ret) {
+    if (ret.ret !== 'success') {
+      button.prop('disabled', false).text('DB 강제삭제');
+      return;
+    }
+    $('#history_detail').hide();
+    PDFF.notify(ret.msg || 'DB 작업 이력을 강제로 삭제했습니다.', 'success');
+    loadPostDeleteScans();
+    loadHistory(false);
+  });
+});
+$(document).ready(function () { loadPostDeleteScans(true); loadHistory(true); });
 </script>
 {% endblock %}
