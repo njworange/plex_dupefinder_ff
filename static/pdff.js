@@ -99,13 +99,14 @@
       delete_postcheck_snapshot_changed: '삭제 후 남은 Media 정보 변경',
       delete_precheck_blocked: '삭제 전 재검증 차단', restart_delete_validation_interrupted: '재시작으로 삭제 검증 중단',
       restart_delete_outcome_unknown: '재시작 후 삭제 결과 확인 필요',
-      direct_delete_recovery_required: '직접 영구삭제 결과 수동 확인 필요'
+      direct_delete_recovery_required: 'Plex DELETE + 자막 정리 결과 수동 확인 필요'
     };
     return labels[flag] || flag;
   }
 
   function redact(value, key) {
     if (key && /(token|password|secret|authorization|cookie)/i.test(String(key))) return '[REDACTED]';
+    if (key && /(backup|protection)/i.test(String(key))) return '[REDACTED]';
     if (Array.isArray(value)) return value.map(function (item) { return redact(item); });
     if (value && typeof value === 'object') {
       var clean = {};
@@ -124,8 +125,10 @@
       ? value.subtitle_cleanup : value;
     var eligible = cleanup.eligible || cleanup.included_subtitles || [];
     var excluded = cleanup.excluded || cleanup.excluded_subtitles || [];
+    var protectedEntries = cleanup.protected || cleanup.protected_subtitles || [];
     if (!Array.isArray(eligible)) eligible = [];
     if (!Array.isArray(excluded)) excluded = [];
+    if (!Array.isArray(protectedEntries)) protectedEntries = [];
     var counts = cleanup.counts && typeof cleanup.counts === 'object' ? cleanup.counts : {};
     var backend = String(cleanup.backend || value.backend || '');
     var recoveryDiagnostics = cleanup.recovery_diagnostics !== undefined
@@ -136,10 +139,15 @@
     var detailsPresent = ['eligible', 'excluded', 'included_subtitles', 'excluded_subtitles'].some(function (key) {
       return Object.prototype.hasOwnProperty.call(cleanup, key);
     });
+    var protectedDetailsPresent = ['protected', 'protected_subtitles'].some(function (key) {
+      return Object.prototype.hasOwnProperty.call(cleanup, key);
+    });
     return {
-      present: Boolean(value.subtitle_cleanup || cleanup.included_subtitles || cleanup.excluded_subtitles || cleanup.eligible || cleanup.excluded || backend),
+      present: Boolean(value.subtitle_cleanup || cleanup.included_subtitles || cleanup.excluded_subtitles || cleanup.protected_subtitles || cleanup.eligible || cleanup.excluded || cleanup.protected || backend),
       detailsPresent: detailsPresent,
+      protectedDetailsPresent: protectedDetailsPresent,
       enabled: cleanup.enabled === true || backend === 'quarantine' || backend === 'direct',
+      executable: cleanup.executable !== false,
       backend: backend || 'plex',
       status: String(cleanup.status || ((backend === 'quarantine' || backend === 'direct') ? 'planned' : 'disabled')),
       message: String(cleanup.message || value.message || ''),
@@ -149,8 +157,11 @@
       quarantineDir: String(cleanup.quarantine_dir || cleanup.quarantine_root || ''),
       eligible: eligible,
       excluded: excluded,
+      protected: protectedEntries,
       eligibleCount: Number(counts.eligible !== undefined ? counts.eligible : eligible.length) || 0,
       excludedCount: Number(counts.excluded !== undefined ? counts.excluded : excluded.length) || 0,
+      protectedCount: Number(counts.protected !== undefined ? counts.protected : protectedEntries.length) || 0,
+      blockingCount: Number(counts.blocking || 0) || 0,
       quarantinedCount: Number(counts.quarantined || 0) || 0,
       deletedCount: Number(counts.deleted || 0) || 0
     };
@@ -221,8 +232,13 @@
       file_state_unverifiable: '파일 identity를 안전하게 확인할 수 없음',
       different_filesystem: '영상과 다른 파일시스템이라 원자 격리를 보장할 수 없음',
       subtitle_directory_reparse_point: '자막 폴더가 링크 또는 reparse 경로임',
-      protected_for_surviving_video: '유지할 영상의 보호 대상 자막'
+      protected_for_surviving_video: '유지할 영상의 보호 대상 자막',
+      protected_survivor_directory_sidecar: '유지 영상이 있는 폴더의 보호 대상 외부 자막'
     };
+    if (value.indexOf('required_backup_unavailable:') === 0) {
+      var cause = value.slice('required_backup_unavailable:'.length);
+      return '필수 보호본을 안전하게 만들 수 없어 PMS DELETE 차단 (' + (labels[cause] || cause) + ')';
+    }
     return labels[value] || value || fallback;
   }
 
@@ -235,16 +251,28 @@
     var handledCount = isResult
       ? (direct ? cleanup.deletedCount : cleanup.quarantinedCount)
       : cleanup.eligibleCount;
-    var handledLabel = direct ? '함께 영구삭제 ' : '함께 격리 ';
+    var handledLabel = direct ? (isResult ? '전용 자막 정리 ' : '전용 자막 정리 예정 ') : '함께 격리 ';
+    var backendLabel = direct ? 'Plex DELETE + 자막 정리' : cleanup.backend;
+    var protectedPaths = {};
+    cleanup.protected.forEach(function (entry) {
+      protectedPaths[subtitlePath(entry, false)] = true;
+    });
+    var reviewEntries = direct ? cleanup.excluded.filter(function (entry) {
+      return !protectedPaths[subtitlePath(entry, false)];
+    }) : cleanup.excluded;
+    var reviewLabel = direct
+      ? '보호 ' + cleanup.protectedCount + ' · 기타·차단 검토 '
+      : '위험 예외 ';
+    var reviewCount = direct ? Math.max(cleanup.blockingCount, reviewEntries.length) : cleanup.excludedCount;
     var html = '<div class="pdff-subtitle-summary"><strong>외부 자막 안전 처리</strong> ' +
-      badge(cleanup.status) + '<span class="pdff-muted ml-2">방식 ' + esc(cleanup.backend) +
+      badge(cleanup.status) + '<span class="pdff-muted ml-2">방식 ' + esc(backendLabel) +
       ' · ' + handledLabel + esc(handledCount) +
-      ' · 위험 예외 ' + esc(cleanup.excludedCount) + '</span></div>';
+      ' · ' + reviewLabel + esc(reviewCount) + '</span></div>';
     if ((!quarantine && !direct) || !cleanup.enabled) {
       return html + '<div class="pdff-danger mt-2">Plex Media DELETE 방식에서는 자막을 직접 선별·격리하지 않으며, PMS가 외부 자막을 어떻게 처리할지 이 플러그인이 보장할 수 없습니다.</div>';
     }
     html += direct
-      ? '<div class="pdff-danger mt-2"><strong>복구 불가:</strong> 승인한 영상과 전용 외부 자막을 격리·휴지통 없이 직접 영구삭제합니다. 실행 직전 목록과 파일 상태가 달라지면 삭제하지 않으며, 모호한 자막은 보존합니다.</div>'
+      ? '<div class="pdff-danger mt-2"><strong>Plex DELETE + 자막 정리:</strong> 영상 삭제는 PMS에 한 번만 요청합니다. 그 전에 유지본·공유·모호 자막을 FlaskFarm data에 전체 SHA-256으로 보호하고, PMS 처리 뒤 삭제 대상 전용 자막만 남아 있으면 영구삭제합니다. 보호 대상이 누락되면 SHA-256을 검증해 원래 경로에 덮어쓰기 없이 복원하며, 보호할 수 없는 관련 파일이 있으면 PMS DELETE 전에 차단합니다. 보호본은 부분 스캔과 사후 검증 성공 뒤 정리됩니다.</div>'
       : '<div class="pdff-muted mt-2">영구삭제가 아니라 격리 이동입니다. 승인한 목록과 파일 상태를 실행 직전에 정확히 재검증하며, 달라지면 아무 파일도 이동하지 않고 새 사전확인을 요구합니다. 모호한 자막은 이동하지 않습니다.</div>';
     if (quarantine && cleanup.quarantineDir) {
       html += '<div class="mt-2"><span class="pdff-kv-label">격리 위치</span><div class="pdff-code">' + esc(cleanup.quarantineDir) + '</div></div>';
@@ -260,15 +288,28 @@
       });
       html += '</details>';
     } else {
-      html += '<div class="pdff-muted mt-2">함께 ' + (direct ? '영구삭제할' : '격리할') + ' 전용 외부 자막이 없습니다.</div>';
+      html += '<div class="pdff-muted mt-2">' + (direct ? 'PMS 처리 뒤 별도로 정리할' : '함께 격리할') + ' 전용 외부 자막이 없습니다.</div>';
     }
-    if (cleanup.excluded.length) {
-      html += '<details class="pdff-subtitle-details pdff-subtitle-exceptions mt-2" open><summary>위험·모호하여 제외 ' + esc(cleanup.excluded.length) + '개</summary>';
-      cleanup.excluded.forEach(function (entry) {
-        html += '<div class="pdff-subtitle-entry pdff-subtitle-excluded"><div class="pdff-code">' + esc(subtitlePath(entry, false)) + '</div>' +
-          '<div class="small"><strong>보존 사유:</strong> ' + esc(subtitleReason(entry, '유지본과의 관계를 안전하게 확정할 수 없음')) + '</div></div>';
+    if (direct && cleanup.protected.length) {
+      html += '<details class="pdff-subtitle-details mt-2" open><summary>PMS DELETE 전 SHA-256 보호·복원 대상 ' + esc(cleanup.protected.length) + '개</summary>';
+      cleanup.protected.forEach(function (entry) {
+        html += '<div class="pdff-subtitle-entry pdff-subtitle-eligible"><div class="pdff-code">' + esc(subtitlePath(entry, false)) + '</div>' +
+          '<div class="small"><strong>보호 사유:</strong> ' + esc(subtitleReason(entry, '유지본 자막 보호 대상')) + '</div></div>';
       });
       html += '</details>';
+    } else if (direct && cleanup.protectedCount > 0) {
+      html += '<div class="pdff-danger mt-2">보호 대상 경로 세부정보가 없어 실행하면 안 됩니다. 새 사전확인을 만드세요.</div>';
+    }
+    if (reviewEntries.length) {
+      html += '<details class="pdff-subtitle-details pdff-subtitle-exceptions mt-2" open><summary>' + (direct ? '기타·차단 검토 대상 ' : '위험·모호하여 제외 ') + esc(reviewEntries.length) + '개</summary>';
+      reviewEntries.forEach(function (entry) {
+        html += '<div class="pdff-subtitle-entry pdff-subtitle-excluded"><div class="pdff-code">' + esc(subtitlePath(entry, false)) + '</div>' +
+          '<div class="small"><strong>' + (direct ? '검토 사유:' : '보존 사유:') + '</strong> ' + esc(subtitleReason(entry, '유지본과의 관계를 안전하게 확정할 수 없음')) + '</div></div>';
+      });
+      html += '</details>';
+    }
+    if (direct && (!cleanup.executable || cleanup.blockingCount > 0)) {
+      html += '<div class="pdff-danger mt-2"><strong>PMS DELETE 전 차단:</strong> 필수 보호본을 만들 수 없는 관련 자막이 있어 이 계획을 실행할 수 없습니다. 파일 상태를 정리한 뒤 새 사전확인을 만드세요.</div>';
     }
     if (recoveryRequired) {
       if (cleanup.message) {
@@ -285,7 +326,7 @@
         });
         html += '</ul></div>';
       }
-      html += '<div class="pdff-danger mt-2"><strong>수동 확인 필요:</strong> 파일 처리 결과가 완결되지 않았습니다. 감사 상세와 실제 파일을 확인하세요.</div>';
+      html += '<div class="pdff-danger mt-2"><strong>수동 확인 필요:</strong> Plex 및 외부 자막 처리 결과가 완결되지 않았습니다. 감사 상세, 실제 파일과 보호본 상태를 확인하세요.</div>';
     }
     return html;
   }

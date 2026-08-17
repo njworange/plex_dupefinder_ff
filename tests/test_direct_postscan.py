@@ -138,6 +138,7 @@ class DirectDeletePostScanSafetyTest(unittest.TestCase):
             32: _Record(id=32, successful_deletions=0),
         }
         verified = []
+        cleaned = []
         metadata_reads = []
         delete_calls = []
         heartbeats = []
@@ -185,11 +186,20 @@ class DirectDeletePostScanSafetyTest(unittest.TestCase):
                 get=lambda run_id: runs.get(int(run_id))
             )
             service = module.DeleteService()
+            def verify_deleted(journal, heartbeat=None):
+                if callable(heartbeat):
+                    heartbeat()
+                verified.append(int(journal.id))
+                return {"verified": 2, "videos": 1, "restored": 0}
+
+            def cleanup_backups(journal, heartbeat=None):
+                # Cleanup must run only after final success is durable.
+                cleaned.append((int(journal.id), str(journal.status)))
+                return {"removed": 2}
+
             service.direct_delete_manager = types.SimpleNamespace(
-                verify_deleted=lambda journal, heartbeat=None: (
-                    heartbeat() if callable(heartbeat) else None,
-                    verified.append(int(journal.id)),
-                )
+                verify_deleted=verify_deleted,
+                cleanup_backups=cleanup_backups,
             )
             job = _Record(
                 action_ids_json="[1, 2]",
@@ -202,6 +212,7 @@ class DirectDeletePostScanSafetyTest(unittest.TestCase):
             service.finalize_quarantine_scan(job)
 
             self.assertEqual(verified, [11, 12])
+            self.assertEqual(cleaned, [(11, "verified"), (12, "verified")])
             self.assertEqual(metadata_reads, ["100", "200"])
             self.assertEqual(delete_calls, [])
             self.assertGreaterEqual(len(heartbeats), 6)

@@ -165,6 +165,7 @@ class DirectDeleteJournalApiSafetyTest(unittest.TestCase):
         with FlaskFarmImportHarness() as harness:
             model = harness.setup_module.P.ModelDirectDeleteJournal
             journal = model()
+            journal.id = 7
             journal.operation_key = "public-operation-id"
             journal.status = "deleted_pending_scan"
             journal.plan_digest = "a" * 64
@@ -215,6 +216,7 @@ class DirectDeleteJournalApiSafetyTest(unittest.TestCase):
             serialized = json.dumps(detail, ensure_ascii=False).lower()
 
             self.assertEqual(detail["backend"], "direct")
+            self.assertNotEqual(detail["operation_id"], journal.operation_key)
             self.assertEqual(detail["counts"]["deleted"], 2)
             self.assertTrue(detail["eligible"][0]["deleted"])
             self.assertEqual(summary["eligible"], [])

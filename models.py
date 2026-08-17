@@ -15,6 +15,62 @@ from .setup import P
 db = F.db
 
 
+# Deleting a row from Recent Scans is deliberately narrower than deleting an
+# audit history entry.  Only states produced by ScanManager as terminal states
+# are eligible; every unknown/future state fails closed.
+SCAN_RESULT_DELETE_ALLOWED_STATUSES = frozenset(
+    [
+        "completed",
+        "completed_with_warnings",
+        "cancelled",
+        "failed",
+        "interrupted",
+    ]
+)
+_SCAN_RESULT_DELETE_CLAIM_STATUS = "deleting_results"
+_SCAN_RESULT_TOMBSTONE_STATUS = "results_deleted"
+
+_SAFE_ACTION_TERMINAL_STATUSES = frozenset(
+    [
+        "success",
+        "blocked",
+        "unknown",
+        "verification_failed",
+        "critical",
+    ]
+)
+_SAFE_BATCH_ITEM_TERMINAL_STATUSES = frozenset(
+    [
+        "success",
+        "failed",
+        "blocked",
+        "unknown",
+        "verification_failed",
+        "critical",
+        "skipped",
+        "cancelled",
+        "interrupted",
+    ]
+)
+_SAFE_POST_SCAN_TERMINAL_STATUSES = frozenset(
+    ["success", "blocked", "unverified", "failed"]
+)
+_SAFE_BATCH_TERMINAL_STATUSES = frozenset(
+    [
+        "completed",
+        "completed_with_warnings",
+        "completed_with_errors",
+        "cancelled",
+        "stopped",
+        "interrupted",
+        "expired",
+    ]
+)
+_SAFE_JOURNAL_TERMINAL_STATUSES = frozenset(
+    ["batch_preview", "failed_no_mutation", "verified", "trash_pending"]
+)
+
+
 def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat(timespec="seconds") if value else None
 
@@ -56,6 +112,15 @@ class ModelScanRun(ModelBase):
     error_summary = db.Column(db.Text, default="")
 
     def as_api(self) -> Dict[str, Any]:
+        if self.status == _SCAN_RESULT_TOMBSTONE_STATUS:
+            # Tombstones reserve primary keys for immutable audit references.
+            # They are excluded from normal lookups, and even an explicit raw
+            # serialization cannot recover the scrubbed scan snapshot.
+            return {
+                "id": self.id,
+                "status": _SCAN_RESULT_TOMBSTONE_STATUS,
+                "results_deleted": True,
+            }
         value = {
             "id": self.id,
             "created_at": _iso(self.created_at),
@@ -84,8 +149,13 @@ class ModelScanRun(ModelBase):
         return value
 
     @classmethod
-    def get(cls, run_id: Any) -> Optional["ModelScanRun"]:
-        return db.session.query(cls).filter_by(id=int(run_id)).first()
+    def get(
+        cls, run_id: Any, include_results_deleted: bool = False
+    ) -> Optional["ModelScanRun"]:
+        query = db.session.query(cls).filter_by(id=int(run_id))
+        if not include_results_deleted:
+            query = query.filter(cls.status != _SCAN_RESULT_TOMBSTONE_STATUS)
+        return query.first()
 
     @classmethod
     def active(cls) -> Optional["ModelScanRun"]:
@@ -98,7 +168,13 @@ class ModelScanRun(ModelBase):
 
     @classmethod
     def recent(cls, limit: int = 30) -> List["ModelScanRun"]:
-        return db.session.query(cls).order_by(cls.id.desc()).limit(max(1, min(limit, 100))).all()
+        return (
+            db.session.query(cls)
+            .filter(cls.status != _SCAN_RESULT_TOMBSTONE_STATUS)
+            .order_by(cls.id.desc())
+            .limit(max(1, min(limit, 100)))
+            .all()
+        )
 
     @classmethod
     def claim_deletion_slot(cls, run_id: Any, limit: Any = None) -> bool:
@@ -120,6 +196,264 @@ class ModelScanRun(ModelBase):
             )
         )
         return updated == 1
+
+    @classmethod
+    def delete_results(cls, run_id: Any) -> Dict[str, Any]:
+        """Remove one terminal duplicate-scan result while preserving audits.
+
+        The scan row is first claimed with a compare-and-swap transition.  The
+        uncommitted update serializes manual DELETE claims against this cleanup,
+        while ``FOR UPDATE`` range reads guard batch-plan inserts on databases
+        that support row/gap locks.  SQLite's writer transaction provides the
+        equivalent serialization there.
+
+        This method physically removes only ``duplicate_group`` and
+        ``media_candidate``.  ``scan_run`` becomes a scrubbed logical tombstone
+        so SQLite/MySQL cannot reuse its primary key for a future scan.  That
+        keeps raw audit references unambiguous while hiding the run from every
+        normal scan lookup.  Destructive action logs, batch plans/items,
+        post-delete scan jobs, and filesystem journals are immutable audit
+        evidence and are counted but never removed.
+        """
+
+        target_id = int(run_id)
+        session = db.session
+        try:
+            run = session.query(cls).filter(cls.id == target_id).first()
+            if run is None:
+                raise ValueError("스캔 이력을 찾을 수 없습니다.")
+            original_status = str(run.status or "")
+            if original_status not in SCAN_RESULT_DELETE_ALLOWED_STATUSES:
+                raise RuntimeError(
+                    "완료되거나 중단된 스캔 결과만 삭제할 수 있습니다. "
+                    "(현재 상태: %s)" % (original_status or "unknown")
+                )
+
+            claimed = (
+                session.query(cls)
+                .filter(cls.id == target_id, cls.status == original_status)
+                .update(
+                    {cls.status: _SCAN_RESULT_DELETE_CLAIM_STATUS},
+                    synchronize_session=False,
+                )
+            )
+            if claimed != 1:
+                raise RuntimeError("다른 작업이 이 스캔 결과의 상태를 변경했습니다.")
+            session.flush()
+
+            now = datetime.now()
+
+            # Lock the complete target ranges before classifying them.  This is
+            # also a gap/range guard for a concurrent batch preview on MySQL.
+            batches = (
+                session.query(ModelBatchRun)
+                .filter(ModelBatchRun.scan_run_id == target_id)
+                .with_for_update()
+                .all()
+            )
+            for batch in batches:
+                status = str(batch.status or "")
+                expired_preview = bool(
+                    status == "preview"
+                    and batch.expires_at is not None
+                    and batch.expires_at < now
+                )
+                if status not in _SAFE_BATCH_TERMINAL_STATUSES and not expired_preview:
+                    raise RuntimeError(
+                        "활성 또는 확인이 필요한 일괄 삭제 계획이 있어 스캔 결과를 "
+                        "삭제할 수 없습니다. (plan=%s, status=%s)"
+                        % (batch.id, status or "unknown")
+                    )
+
+            nonterminal_items = (
+                session.query(ModelBatchItem)
+                .filter(
+                    ModelBatchItem.scan_run_id == target_id,
+                    ~ModelBatchItem.status.in_(_SAFE_BATCH_ITEM_TERMINAL_STATUSES),
+                )
+                .with_for_update()
+                .order_by(ModelBatchItem.id.asc())
+                .all()
+            )
+            batch_by_id = {int(batch.id): batch for batch in batches}
+            active_item = None
+            for item in nonterminal_items:
+                parent = batch_by_id.get(int(item.batch_run_id))
+                expired_preview = bool(
+                    parent is not None
+                    and str(parent.status or "") == "preview"
+                    and parent.expires_at is not None
+                    and parent.expires_at < now
+                )
+                expired_plan = bool(
+                    parent is not None and str(parent.status or "") == "expired"
+                )
+                # A preview cannot ever be approved after its deadline.  Its
+                # planned items are immutable audit snapshots, not active work.
+                # Explicitly expired plans have the same property.  Every
+                # other current or future item state fails closed.
+                if not (
+                    str(item.status or "") == "planned"
+                    and (expired_preview or expired_plan)
+                ):
+                    active_item = item
+                    break
+            if active_item is not None:
+                raise RuntimeError(
+                    "처리 중인 일괄 삭제 항목이 있어 스캔 결과를 삭제할 수 없습니다. "
+                    "(item=%s, status=%s)"
+                    % (active_item.id, active_item.status)
+                )
+
+            active_action = (
+                session.query(ModelActionLog)
+                .filter(
+                    ModelActionLog.run_id == target_id,
+                    ~ModelActionLog.status.in_(_SAFE_ACTION_TERMINAL_STATUSES),
+                )
+                .with_for_update()
+                .order_by(ModelActionLog.id.asc())
+                .first()
+            )
+            if active_action is not None:
+                raise RuntimeError(
+                    "진행 중이거나 알 수 없는 삭제 작업이 있어 스캔 결과를 "
+                    "삭제할 수 없습니다. "
+                    "(action=%s, status=%s)"
+                    % (active_action.id, active_action.status)
+                )
+
+            active_post_scan = (
+                session.query(ModelPostDeleteScanJob)
+                .filter(
+                    ModelPostDeleteScanJob.run_id == target_id,
+                    ~ModelPostDeleteScanJob.status.in_(
+                        _SAFE_POST_SCAN_TERMINAL_STATUSES
+                    ),
+                )
+                .with_for_update()
+                .order_by(ModelPostDeleteScanJob.id.asc())
+                .first()
+            )
+            if active_post_scan is not None:
+                raise RuntimeError(
+                    "삭제 후 Plex 부분 스캔이 진행 중이거나 상태를 알 수 없어 "
+                    "결과를 삭제할 수 없습니다. "
+                    "(job=%s, status=%s)"
+                    % (active_post_scan.id, active_post_scan.status)
+                )
+
+            for journal_type, label in (
+                (ModelQuarantineJournal, "격리"),
+                (ModelDirectDeleteJournal, "직접 삭제"),
+            ):
+                unfinished = (
+                    session.query(journal_type)
+                    .filter(
+                        journal_type.run_id == target_id,
+                        ~journal_type.status.in_(_SAFE_JOURNAL_TERMINAL_STATUSES),
+                    )
+                    .with_for_update()
+                    .order_by(journal_type.id.asc())
+                    .first()
+                )
+                if unfinished is not None:
+                    raise RuntimeError(
+                        "%s 작업 이력이 아직 완결되지 않아 스캔 결과를 삭제할 수 "
+                        "없습니다. (journal=%s, status=%s)"
+                        % (label, unfinished.id, unfinished.status or "unknown")
+                    )
+
+            preserved = {
+                "action_logs": session.query(ModelActionLog)
+                .filter(ModelActionLog.run_id == target_id)
+                .count(),
+                "batch_runs": session.query(ModelBatchRun)
+                .filter(ModelBatchRun.scan_run_id == target_id)
+                .count(),
+                "batch_items": session.query(ModelBatchItem)
+                .filter(ModelBatchItem.scan_run_id == target_id)
+                .count(),
+                "post_delete_scan_jobs": session.query(ModelPostDeleteScanJob)
+                .filter(ModelPostDeleteScanJob.run_id == target_id)
+                .count(),
+                "quarantine_journals": session.query(ModelQuarantineJournal)
+                .filter(ModelQuarantineJournal.run_id == target_id)
+                .count(),
+                "direct_delete_journals": session.query(ModelDirectDeleteJournal)
+                .filter(ModelDirectDeleteJournal.run_id == target_id)
+                .count(),
+            }
+
+            group_ids = session.query(ModelDuplicateGroup.id).filter(
+                ModelDuplicateGroup.run_id == target_id
+            )
+            candidate_query = session.query(ModelMediaCandidate).filter(
+                ModelMediaCandidate.group_id.in_(group_ids)
+            )
+            candidate_count = candidate_query.count()
+            group_count = (
+                session.query(ModelDuplicateGroup)
+                .filter(ModelDuplicateGroup.run_id == target_id)
+                .count()
+            )
+
+            candidate_query.delete(synchronize_session=False)
+            session.query(ModelDuplicateGroup).filter(
+                ModelDuplicateGroup.run_id == target_id
+            ).delete(synchronize_session=False)
+            tombstoned_run = (
+                session.query(cls)
+                .filter(
+                    cls.id == target_id,
+                    cls.status == _SCAN_RESULT_DELETE_CLAIM_STATUS,
+                )
+                .update(
+                    {
+                        cls.started_at: None,
+                        cls.finished_at: now,
+                        cls.status: _SCAN_RESULT_TOMBSTONE_STATUS,
+                        cls.progress: 0,
+                        cls.status_message: "",
+                        cls.section_ids_json: "[]",
+                        cls.settings_snapshot_json: "{}",
+                        cls.server_machine_id: "",
+                        cls.server_version: "",
+                        cls.total_sections: 0,
+                        cls.completed_sections: 0,
+                        cls.total_groups: 0,
+                        cls.safe_groups: 0,
+                        cls.unsafe_groups: 0,
+                        cls.successful_deletions: 0,
+                        cls.deletion_attempts: 0,
+                        cls.cancellation_requested: False,
+                        cls.error_summary: "",
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if tombstoned_run != 1:
+                raise RuntimeError("스캔 결과 삭제 소유권을 확인할 수 없습니다.")
+            expire = getattr(session, "expire", None)
+            if callable(expire):
+                # Bulk CAS updates intentionally skip session synchronization;
+                # expire the originally loaded row so this worker cannot later
+                # serialize the pre-tombstone snapshot from its identity map.
+                expire(run)
+            session.commit()
+            return {
+                "run_id": target_id,
+                "deleted": {
+                    "run": 1,
+                    "run_tombstone": 1,
+                    "groups": group_count,
+                    "candidates": candidate_count,
+                },
+                "preserved": preserved,
+            }
+        except Exception:
+            session.rollback()
+            raise
 
 
 class ModelDuplicateGroup(ModelBase):
@@ -891,12 +1225,25 @@ class ModelDirectDeleteJournal(ModelBase):
         operations = _json_load(self.unlink_json, [])
         eligible = manifest.get("eligible", []) if isinstance(manifest, dict) else []
         excluded = manifest.get("excluded", []) if isinstance(manifest, dict) else []
+        protected = manifest.get("protected", []) if isinstance(manifest, dict) else []
+        blocking = [
+            raw
+            for raw in excluded
+            if isinstance(raw, dict)
+            and str(raw.get("reason") or "").startswith(
+                "required_backup_unavailable:"
+            )
+        ] if isinstance(excluded, list) else []
         deleted_paths = {
             str(raw.get("source_path") or "")
             for raw in operations
             if isinstance(raw, dict)
             and raw.get("kind") == "subtitle"
-            and raw.get("state") == "deleted"
+            and raw.get("state") in (
+                "deleted",
+                "removed_by_plex",
+                "deleted_by_plugin",
+            )
         } if isinstance(operations, list) else set()
 
         def public_entries(values: Any, included: bool) -> List[Dict[str, Any]]:
@@ -921,15 +1268,25 @@ class ModelDirectDeleteJournal(ModelBase):
             "enabled": True,
             "backend": "direct",
             "status": self.status or "",
-            "operation_id": self.operation_key,
+            "executable": not bool(blocking),
+            # The random operation key is also part of the private backup
+            # directory name.  Expose the journal row id instead so API/history
+            # responses never disclose internal protection paths or tokens.
+            "operation_id": self.id,
             "plan_digest": str(self.plan_digest or ""),
             "eligible": public_entries(eligible, True) if include_paths else [],
             "excluded": public_entries(excluded, False) if include_paths else [],
+            "protected": public_entries(protected, False) if include_paths else [],
+            "protected_subtitles": (
+                public_entries(protected, False) if include_paths else []
+            ),
+            "blocking": public_entries(blocking, False) if include_paths else [],
             "counts": {
                 "eligible": self.eligible_count or 0,
                 "excluded": self.excluded_count or 0,
                 "protected": self.protected_count or 0,
                 "deleted": self.deleted_count or 0,
+                "blocking": len(blocking),
             },
         }
         if self.status == "recovery_required" and isinstance(operations, list):
@@ -1045,6 +1402,23 @@ class ModelDirectDeleteJournal(ModelBase):
                 )
             )
             .order_by(cls.id.asc())
+            .all()
+        )
+
+    @classmethod
+    def completed_with_backups(
+        cls, limit: int = 100
+    ) -> List["ModelDirectDeleteJournal"]:
+        """Return verified hybrid journals whose private copies may need cleanup."""
+
+        return (
+            db.session.query(cls)
+            .filter(
+                cls.status.in_(("verified", "trash_pending")),
+                cls.operation_paths_json != "[]",
+            )
+            .order_by(cls.id.asc())
+            .limit(max(1, min(int(limit), 500)))
             .all()
         )
 

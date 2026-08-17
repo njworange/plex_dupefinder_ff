@@ -1,13 +1,13 @@
 # Plex DupeFinder FF
 
-현재 버전: `1.4.1`
+현재 버전: `1.5.0`
 
 `plex_dupefinder_ff`는 FlaskFarm에서 동작하는 Plex 중복 검사, **그룹별 수동 처리**, **일괄 승인형 반자동 처리** 플러그인입니다.
 
-Plex 연결정보는 별도로 저장하지 않고, 작업을 시작할 때마다 [`plex_mate`](https://github.com/flaskfarm/plex_mate)의 `base_url`, `base_token`, `base_machine`을 읽습니다. 기본 `plex` 방식은 PMS에 Media 삭제를 요청합니다. `quarantine` 방식은 영상과 안전하게 귀속된 외부 자막을 격리 폴더로 이동하고, 명시적으로 선택하는 `direct` 방식은 같은 안전 판정 목록을 FlaskFarm에서 직접 영구삭제합니다. Plex SQLite DB를 직접 수정하지 않습니다.
+Plex 연결정보는 별도로 저장하지 않고, 작업을 시작할 때마다 [`plex_mate`](https://github.com/flaskfarm/plex_mate)의 `base_url`, `base_token`, `base_machine`을 읽습니다. 기본 `plex` 방식은 PMS에 Media 삭제를 요청합니다. `quarantine` 방식은 영상과 안전하게 귀속된 외부 자막을 격리 폴더로 이동합니다. 호환성을 위해 설정 키를 `direct`로 유지하는 **Plex Media DELETE + 외부 자막 정리** 방식은 영상 삭제를 PMS에 맡기고, 유지본 자막을 임시 보호한 뒤 삭제 대상에만 귀속된 외부 자막을 별도로 정리합니다. Plex SQLite DB를 직접 수정하지 않습니다.
 
 > [!CAUTION]
-> Plex 방식은 해당 Media 버전의 실제 Part 파일과 연관 파일을 삭제할 수 있습니다. 안전 격리는 실제 파일을 이동하며, 직접 영구삭제는 승인한 영상과 전용 자막을 격리·휴지통 없이 삭제해 복구할 수 없습니다. 올바른 경로·권한과 백업이 필요합니다. 그룹별 처리와 일괄 승인형 처리는 모두 기본적으로 꺼져 있으며, 사용자 검토 없이 실행되는 완전 자동 처리는 제공하지 않습니다.
+> Plex Media DELETE는 해당 Media 버전의 실제 Part 파일과 연관 파일을 삭제할 수 있습니다. 안전 격리는 실제 파일을 이동합니다. 외부 자막 정리 방식도 영상을 PMS로 영구삭제하고 전용 자막을 정리하므로, 올바른 경로·권한과 별도 백업이 필요합니다. 이 방식의 FlaskFarm data 보호본은 PMS가 유지본 자막까지 지웠을 때 되돌리기 위한 트랜잭션용 임시본이며, 성공 후 사용자가 복구할 백업이나 격리본이 아닙니다. 그룹별 처리와 일괄 승인형 처리는 모두 기본적으로 꺼져 있으며, 사용자 검토 없이 실행되는 완전 자동 처리는 제공하지 않습니다.
 
 ## 주요 기능
 
@@ -21,12 +21,14 @@ Plex 연결정보는 별도로 저장하지 않고, 작업을 시작할 때마�
 - 라이브러리 전체 선택 및 전체 선택 해제
 - 안전한 2개 버전 그룹을 계획으로 묶어 한 번 승인한 뒤 순차 처리
 - 선택형 안전 격리: 삭제 영상과 그 영상에만 대응하는 일반 외부 자막을 함께 격리
-- 선택형 직접 영구삭제: 격리 루트 없이 삭제 영상과 안전 판정된 전용 외부 자막을 함께 삭제
-- 유지본과 공유될 가능성이 있거나 판별이 모호한 자막을 자동 제외하고 전체 경로·사유 표시
-- 결과와 감사 이력에서 함께 격리·영구삭제된 자막 및 위험 예외 확인·필터
+- 선택형 Plex Media DELETE + 외부 자막 정리: PMS로 영상을 삭제하고 대상 전용 자막만 별도 영구 정리
+- PMS DELETE 전에 유지본·공유·모호 자막을 SHA-256 보호하고, 누락되면 원래 경로에 검증 복원
+- 보호할 수 없는 링크·특수 자막을 PMS DELETE 전에 차단하고 전체 경로·사유 표시
+- 결과와 감사 이력에서 함께 격리되거나 정리된 자막 및 보호·제외 대상 확인·필터
 - 삭제 전후 Plex 재조회와 감사 로그
 - 확인된 삭제 성공 후 선택 가능한 Plex 부분 스캔(`none`/Binary/Web, 기본 `none`)
 - 작업 이력 화면에서 사후 부분 스캔의 상태·시도 횟수·대상 경로·오류 확인
+- 최근 스캔에서 종료된 스캔의 그룹·후보 결과를 선택 삭제하고 Run ID tombstone과 감사·작업 journal은 보존
 - Plex Token 비저장 및 로그·UI 미노출
 
 ## 요구사항
@@ -35,7 +37,7 @@ Plex 연결정보는 별도로 저장하지 않고, 작업을 시작할 때마�
 - Python 3.8 이상
 - [`plex_mate`](https://github.com/flaskfarm/plex_mate)가 설치되고 Plex URL, Token, Machine ID가 설정된 상태
 - `requests` 2.25 이상
-- 안전 격리 또는 직접 영구삭제 사용 시 Plex 미디어 경로를 FlaskFarm 프로세스가 직접 읽고 쓸 수 있는 실행환경(안전 격리는 격리 경로 접근도 필요)
+- 안전 격리 또는 외부 자막 정리 사용 시 Plex 미디어 경로를 FlaskFarm 프로세스가 직접 읽고 쓸 수 있는 실행환경(안전 격리는 격리 경로, 외부 자막 정리는 FlaskFarm data 보호본 경로 접근도 필요)
 
 현재 공개 FlaskFarm의 `require_plugin` 자동 설치 코드에는 호환성 문제가 있어 `info.yaml`에서 자동 의존성 설치를 선언하지 않습니다. `plex_mate`를 먼저 설치해야 하며, 플러그인도 실행 시 이를 다시 확인합니다.
 
@@ -58,9 +60,9 @@ FlaskFarm을 재시작한 뒤 `PLEX DupeFinder` 메뉴를 엽니다.
 5. 삭제가 필요하면 **삭제 허용 미디어 루트**를 한 줄에 하나씩 설정합니다.
 6. 허용 루트를 적용한 상태로 다시 스캔해 그룹의 안전성 판정을 갱신합니다.
 7. 백업을 확인한 뒤 `그룹별 수동 삭제 활성화`를 켭니다.
-8. 외부 자막을 유지본과 분리해 정리하려면 `파일 처리 방식`에서 **안전 격리** 또는 **직접 영구삭제**를 선택합니다. 안전 격리에만 FlaskFarm 호스트 기준 절대 `안전 격리 루트`가 필요합니다.
-9. 안전 격리와 직접 영구삭제는 PMS DB 반영과 사후 검증을 위해 `삭제 성공 후 Plex 부분 스캔 방식`을 Binary 또는 Web으로 반드시 선택해야 합니다.
-10. 단건 처리라면 결과의 `개별 삭제`를 눌러 유지·처리 버전, 함께 처리될 자막과 위험하여 제외된 자막의 전체 경로·사유를 확인한 뒤 화면의 정확한 확인 문구를 입력합니다. 실행 버튼 뒤에 같은 내용을 다시 묻는 브라우저 확인창은 표시하지 않습니다.
+8. 외부 자막을 유지본과 분리해 정리하려면 `파일 처리 방식`에서 **안전 격리** 또는 **Plex Media DELETE + 외부 자막 정리**를 선택합니다. 안전 격리에만 FlaskFarm 호스트 기준 절대 `안전 격리 루트`가 필요합니다.
+9. 안전 격리와 Plex Media DELETE + 외부 자막 정리는 PMS DB 반영과 사후 검증을 위해 `삭제 성공 후 Plex 부분 스캔 방식`을 Binary 또는 Web으로 반드시 선택해야 합니다.
+10. 단건 처리라면 결과의 `개별 삭제`를 눌러 유지·처리 버전, 함께 처리될 자막과 보호·차단 검토 대상 자막의 전체 경로·사유를 확인한 뒤 화면의 정확한 확인 문구를 입력합니다. 실행 버튼 뒤에 같은 내용을 다시 묻는 브라우저 확인창은 표시하지 않습니다.
 11. 결과 화면에서 `삭제 계획 만들기`를 누르고 각 그룹의 유지·처리 Media ID, 점수와 파일 경로를 모두 검토합니다.
 12. 화면에 표시된 일괄 확인 문구를 정확히 한 번 입력하면 항목별 재검증과 파일 처리가 순차 실행됩니다.
 13. 처리된 그룹은 부분 스캔 성공 여부와 관계없이 잠깁니다. 같은 스캔의 다른 미처리 그룹은 계속 처리할 수 있지만, 처리한 그룹을 최신 상태로 다시 판정하려면 DupeFinder 중복 스캔을 새로 실행합니다.
@@ -103,15 +105,20 @@ FlaskFarm을 재시작한 뒤 `PLEX DupeFinder` 메뉴를 엽니다.
 
 안전 격리는 FlaskFarm 실행 환경에서 Plex가 반환한 미디어 경로와 미리 생성한 격리 루트를 직접 읽고 쓸 수 있어야 합니다. 격리 루트는 모든 Plex library Location과 삭제 허용 미디어 루트 밖에 있어야 하며 symlink/reparse 경로일 수 없습니다. 영상·함께 이동할 자막·격리 루트가 서로 다른 파일시스템이면 원자 이동을 보장할 수 없어 해당 처리를 차단하거나 자막을 위험 예외로 제외합니다. 또한 PMS DB 반영과 유지본 사후 검증을 위해 Binary 또는 Web 부분 스캔 설정이 필수이며, 정확한 section과 부분 스캔 경로를 만들 수 없으면 파일 이동 전에 차단합니다.
 
-## 직접 영구삭제와 외부 자막
+## Plex Media DELETE + 외부 자막 정리
 
-`직접 영구삭제 (영상 + 전용 외부 자막)`는 안전 격리와 동일한 보수적 자막 귀속 규칙을 사용하지만 격리 루트를 사용하지 않습니다. 단일 Part 삭제 영상과 그 영상에만 대응한다고 증명된 `.srt`, `.smi`, `.ssa`, `.ass`, `.vtt` 자막만 처리 대상으로 삼습니다. 유지본 소유·공유·모호·symlink/reparse·hard link·지원하지 않는 자막은 원본 위치에 보존하고 전체 경로와 사유를 사전확인, 결과와 감사 이력에 표시합니다.
+설정 값 `direct`는 기존 설치와 저장값 호환을 위해 유지하지만, 이제 영상을 FlaskFarm에서 직접 `rename`/`unlink`하지 않습니다. 단일 Part 삭제 영상은 PMS의 Media DELETE로 한 번만 요청하고, 외부 자막만 FlaskFarm이 별도로 보호·정리합니다. 이 구조는 mergerfs에서 새 handoff 이름이 다른 물리 branch에 배치되어 `EXDEV (errno 18)`가 발생하던 영상 rename 경로를 제거합니다. 안전 격리 루트는 사용하지 않습니다.
 
-이 방식은 복구 기능이 아닙니다. 화면에 표시된 영상·자막 목록과 `DELETE FILES {media_id} SUBTITLES {count} {digest12}` 문구를 정확히 승인하면, 실행 직전에 Plex metadata, 파일 identity·hash, 유지본과 관련 폴더 목록을 다시 검증합니다. 모든 승인 정보를 durable `direct_delete_journal`에 먼저 기록한 다음, 각 파일을 원본과 같은 상위 폴더의 충돌하기 어려운 임의 handoff 이름으로 원자 인계하고 곧바로 `unlink`합니다. 별도 하위 작업 폴더를 만들지 않으므로 mergerfs의 생성 정책이 다른 물리 branch를 선택해 cross-device rename이 되는 문제를 피합니다. handoff 경로는 휴지통이나 격리 공간이 아니며 삭제 후 복원할 파일을 보관하지 않습니다.
+사전확인은 `.srt`, `.smi`, `.ssa`, `.ass`, `.vtt` 외부 자막을 두 종류로 나눕니다.
 
-mergerfs의 path-hash inode 모드처럼 경로 변경만으로 표시 inode가 달라질 수 있는 환경에서는 원본 파일 descriptor를 열린 채로 유지하고 handoff 파일의 내용 증명과 속성을 비교한 뒤, `unlink` 직전에 현재 경로 identity를 다시 확인합니다. 이 절차는 일반적인 동시 파일 교체를 방어하지만 적대적 환경에서 경쟁 조건이 절대로 없다고 보장하는 것은 아닙니다. FUSE가 디렉터리 `fsync` 자체를 명시적으로 지원하지 않는 경우에는 그 한계를 서버 로그에 남기고 계속하며, 그 밖의 동기화 오류는 실패로 처리합니다.
+- **정리 대상**: 삭제할 영상에만 대응한다고 증명된 동일 stem 자막. PMS DELETE 뒤에도 남아 있으면 열린 파일 descriptor, identity와 전체 SHA-256을 다시 확인한 후 영구삭제합니다. PMS가 이미 함께 삭제했다면 다시 삭제하지 않습니다.
+- **보호 대상**: 유지본 소유, 공유 또는 귀속이 모호하지만 regular-file snapshot을 안전하게 만들 수 있는 자막. PMS DELETE 전에 FlaskFarm `path_data` 아래 `plex_dupefinder_ff/direct-delete-backups/op-<operation-key>/sidecars`에 전체 SHA-256 보호본을 내구성 있게 기록합니다. PMS 처리 뒤 원본이 없어졌을 때만 SHA-256을 검증해 원래 경로에 배타적 생성(no-overwrite)으로 복원합니다.
 
-첫 handoff 전에 실패해 파일 변경이 없다고 확인되면 단계·예외 종류·errno·journal ID를 이력에 기록하고 그룹을 새 사전확인으로 다시 검토할 수 있는 차단 상태로 돌립니다. 영상 또는 자막 하나라도 handoff되거나 삭제되기 시작한 뒤 오류·재시작·상태 불일치가 발생하면 자동 재시도나 자동 복구를 하지 않습니다. 그룹을 `manual_check_required`로 잠그고 작업 이력과 원본 경로를 직접 확인하도록 합니다. 이전 버전에서 생성된 `recovery_required` journal은 원본과 handoff 경로의 현재 존재 상태만 읽기 전용으로 진단하며, 어떤 파일도 자동으로 삭제하거나 복원하지 않습니다. 직접 영구삭제에는 Binary 또는 Web 부분 스캔이 필수이며, 대상 Media 제거와 모든 유지 Media fingerprint 및 유지 파일을 사후 재검증해야 성공으로 확정합니다.
+관련 자막 중 symlink/reparse, 지원하지 않는 특수 파일 또는 그 밖에 snapshot을 안전하게 만들 수 없는 보호 대상이 하나라도 있으면 PMS DELETE를 보내기 전에 전체 작업을 차단합니다. 실행 직전에 Plex metadata, Media/Part fingerprint, 자막 목록·identity·SHA-256과 보호본을 다시 검증하며, 승인한 계획과 달라져도 PMS DELETE 전에 차단합니다.
+
+화면에 표시된 영상·자막 계획과 `DELETE MEDIA {media_id} SUBTITLES {count} {digest12}` 문구를 정확히 승인하면 durable `direct_delete_journal`과 보호본을 먼저 확정한 뒤 PMS Media DELETE를 한 번 보냅니다. timeout 또는 응답 오류가 나도 DELETE를 자동 재시도하지 않습니다. 즉시 PMS를 정확히 재조회해 대상 Media가 사라졌고 유지 Media 집합과 fingerprint가 그대로인 경우에만 보호 자막 복원과 전용 자막 정리를 계속합니다. 대상 Media가 남았거나 결과를 확정할 수 없으면 전용 자막은 건드리지 않고 보호 자막만 안전하게 복원한 뒤 `unknown`/`manual_check_required`와 보호본을 남깁니다.
+
+Binary 또는 Web 부분 스캔과 최종 유지본 검증까지 성공한 뒤에만 임시 보호본을 정리합니다. 보호본은 PMS의 연관 파일 삭제로부터 유지본 자막을 되돌리기 위한 트랜잭션용 임시 데이터이며, 성공 후 영상이나 전용 자막을 복구하는 사용자 백업이 아닙니다. 복원 경로에 다른 파일이 생겼거나 SHA-256이 일치하지 않으면 덮어쓰지 않고 수동 확인 상태로 남깁니다. 이전 버전에서 생성된 `recovery_required` 직접 파일삭제 journal은 읽기 전용 진단 대상으로 유지하며, 과거 source/handoff 파일을 자동 삭제하거나 복원하지 않습니다.
 
 ## 삭제 안전장치
 
@@ -120,7 +127,7 @@ mergerfs의 path-hash inode 모드처럼 경로 변경만으로 표시 inode가 
 - 로그인된 FlaskFarm AJAX 요청
 - Flask session CSRF 토큰
 - 120초 동안 한 번만 사용할 수 있는 삭제 사전확인 nonce
-- 기존 Plex 방식은 `DELETE {media_id}`, 안전 격리는 `QUARANTINE {media_id} SUBTITLES {count} {digest12}`, 직접 영구삭제는 `DELETE FILES {media_id} SUBTITLES {count} {digest12}` 정확 확인 문구
+- 기존 Plex 방식은 `DELETE {media_id}`, 안전 격리는 `QUARANTINE {media_id} SUBTITLES {count} {digest12}`, Plex DELETE + 자막 정리는 `DELETE MEDIA {media_id} SUBTITLES {count} {digest12}` 정확 확인 문구
 - `plex_mate`의 현재 Machine ID와 스캔 당시 서버 일치
 - ratingKey, GUID, 미디어 타입 및 영화/TV 식별정보 일치
 - 스캔 당시와 현재의 Media ID 집합 일치
@@ -138,21 +145,21 @@ mergerfs의 path-hash inode 모드처럼 경로 변경만으로 표시 inode가 
 
 개별 삭제에서는 정확한 확인 문구를 입력한 뒤 별도의 브라우저 최종 확인창을 띄우지 않습니다. 서버는 실행할 때마다 Flask session CSRF, 짧게 유효한 일회용 nonce, 승인된 plan digest와 정확한 확인 문구를 계속 검증하며, 일괄 승인 실행의 별도 브라우저 확인은 유지합니다.
 
-DELETE 요청이 timeout되거나 연결 결과를 확정할 수 없으면 같은 요청을 자동 재시도하지 않습니다. Plex를 다시 조회해 결과를 확인하며, 확정할 수 없으면 감사 이력에 `unknown`으로 기록합니다. 결과가 `unknown`이어도 실제 삭제가 수행됐을 수 있으므로 삭제 시도 횟수에는 계속 기록됩니다. FlaskFarm이 작업 도중 재시작되면 `validating` 이력은 `blocked`, `deleting` 이력은 `unknown`으로 복구하고 해당 그룹을 수동 확인 상태로 잠급니다. 안전 격리의 `quarantining` 이력과 직접 영구삭제 journal의 진행 중 이력은 실제 경로를 기준으로 `recovery_required`/`unknown`으로 보수 복구하며 자동 파일 처리·복구를 이어가지 않습니다.
+DELETE 요청이 timeout되거나 연결 결과를 확정할 수 없으면 같은 요청을 자동 재시도하지 않습니다. Plex를 다시 조회해 결과를 확인하며, 확정할 수 없으면 감사 이력에 `unknown`으로 기록합니다. 결과가 `unknown`이어도 실제 삭제가 수행됐을 수 있으므로 삭제 시도 횟수에는 계속 기록됩니다. FlaskFarm이 작업 도중 재시작되면 `validating` 이력은 `blocked`, `deleting` 이력은 `unknown`으로 복구하고 해당 그룹을 수동 확인 상태로 잠급니다. 안전 격리의 `quarantining` 이력과 Plex DELETE + 자막 정리 journal의 진행 중 이력은 실제 PMS·원본·보호본 상태를 기준으로 `recovery_required`/`unknown`으로 보수 복구하며, DELETE나 전용 자막 삭제를 자동 재실행하지 않습니다.
 
 스캔별 삭제 시도 횟수에는 상한이 없습니다. 결과 화면은 감사 목적으로 누적 시도 횟수를 표시하며, 개별 처리 수는 제한하지 않습니다. 배치 하나의 항목 수에는 별도 `배치 계획 최대 항목 수`가 계속 적용됩니다. 이전 버전에서 저장한 `setting_max_delete_per_run` 값은 읽거나 덮어쓰거나 마이그레이션하지 않고 무시합니다.
 
 ## 삭제 후 Plex 부분 스캔
 
-`삭제 성공 후 Plex 부분 스캔 방식`의 호환 기본값은 `사용 안 함(none)`입니다. 기존 Plex 방식에서는 Plex DELETE가 완료되고 Media 사후 재조회로 삭제 결과가 정확히 확인된 경우에만 durable outbox에 비파괴 스캔 요청을 기록합니다. 안전 격리와 직접 영구삭제 방식에서는 PMS DB 반영과 유지본 검증에 부분 스캔이 필수이므로 `none`을 허용하지 않으며, 승인한 파일 처리가 완료된 뒤에만 요청합니다. 파일 처리 결과가 실패·불명확·검증 실패이면 요청하지 않습니다.
+`삭제 성공 후 Plex 부분 스캔 방식`의 호환 기본값은 `사용 안 함(none)`입니다. 기존 Plex 방식에서는 Plex DELETE가 완료되고 Media 사후 재조회로 삭제 결과가 정확히 확인된 경우에만 durable outbox에 비파괴 스캔 요청을 기록합니다. 안전 격리와 Plex DELETE + 외부 자막 정리 방식에서는 PMS DB 반영과 유지본 검증에 부분 스캔이 필수이므로 `none`을 허용하지 않습니다. 외부 자막 정리 방식은 PMS DELETE 결과를 정확히 확인하고 보호 자막을 복원하며 전용 자막을 정리한 뒤에만 부분 스캔을 요청합니다.
 
-Binary 또는 Web을 선택하면 파일 처리 전에 현재 PMS에서 library section, 타입과 Location을 다시 읽고 모든 대상 Part에 대한 정확한 스캔 경로를 먼저 만듭니다. 영화 폴더나 TV 쇼 루트를 하나라도 안전하게 계산할 수 없거나 경로가 section/삭제 허용 루트를 벗어나면 DELETE, 격리 이동 또는 직접 영구삭제를 시작하지 않습니다. 기존 Plex 방식의 사후 스캔 전달은 best-effort지만 그 대상 경로를 정확히 준비하는 것은 파일 처리의 필수 사전조건입니다. 안전 격리와 직접 영구삭제에서는 부분 스캔과 유지본 사후검증이 성공 확정의 일부입니다. 기존 Plex 방식에서만 이 추가 차단을 원하지 않을 때 기본값 `none`을 유지할 수 있습니다.
+Binary 또는 Web을 선택하면 파일 처리 전에 현재 PMS에서 library section, 타입과 Location을 다시 읽고 모든 대상 Part에 대한 정확한 스캔 경로를 먼저 만듭니다. 영화 폴더나 TV 쇼 루트를 하나라도 안전하게 계산할 수 없거나 경로가 section/삭제 허용 루트를 벗어나면 DELETE, 격리 이동 또는 외부 자막 정리를 시작하지 않습니다. 기존 Plex 방식의 사후 스캔 전달은 best-effort지만 그 대상 경로를 정확히 준비하는 것은 파일 처리의 필수 사전조건입니다. 안전 격리와 Plex DELETE + 외부 자막 정리에서는 부분 스캔과 유지본 사후검증이 성공 확정의 일부입니다. 기존 Plex 방식에서만 이 추가 차단을 원하지 않을 때 기본값 `none`을 유지할 수 있습니다.
 
 - `Binary`: 로드된 `plex_mate`의 `PlexBinaryScanner.scan_refresh(section_id, path)`를 사용합니다. FlaskFarm/PlexMate 실행 환경에서 Plex Media Scanner binary, 실행 사용자·권한과 Plex가 반환한 파일 경로에 접근할 수 있어야 합니다.
 - `Web`: `plex_mate`에서 지연 조회한 URL·Token을 사용해 이 플러그인의 header-auth Plex client가 부분 스캔을 요청합니다. 대상 library section ID와 Plex 서버에서 보이는 경로가 필요합니다.
 - 영화는 삭제된 Part가 속한 영화 폴더, TV 에피소드는 Plex 라이브러리 위치를 기준으로 계산한 해당 TV 쇼 루트를 대상으로 합니다. 안전하게 section과 경로를 계산할 수 없거나 경로가 비어 있으면 요청을 실행하지 않으며, 빈 경로로 전체 라이브러리 스캔을 시작하지 않습니다.
 
-기존 Plex 방식에서 사후 스캔은 best-effort 후처리입니다. 일시적 실패는 outbox에서 최대 3회까지 제한적으로 지수 backoff 재시도할 수 있지만, Plex DELETE는 절대로 재시도하지 않습니다. 사후 스캔의 실패나 최종 포기는 이미 확인된 Plex 삭제 성공을 실패로 바꾸거나 삭제를 다시 실행하지 않습니다. 안전 격리와 직접 영구삭제 방식은 다릅니다. 승인한 파일 처리 뒤 부분 스캔과 유지본 사후검증까지 통과해야 성공이며, 최종 실패하면 `unknown`/`manual_check_required`로 남겨 운영자가 journal과 Plex 상태를 확인하도록 합니다. 또한 이 기능은 DupeFinder 중복 재검사를 실행하지 않고 `rescan_required` 잠금을 해제하지 않습니다. 처리한 그룹의 최신 중복 판정은 DupeFinder 스캔을 별도로 실행해야 반영됩니다. 백엔드는 각 항목을 실행 직전 다시 검증하므로 같은 스캔의 다른 미처리 그룹을 계속 처리할 수 있습니다.
+기존 Plex 방식에서 사후 스캔은 best-effort 후처리입니다. 일시적 실패는 outbox에서 최대 3회까지 제한적으로 지수 backoff 재시도할 수 있지만, Plex DELETE는 절대로 재시도하지 않습니다. 사후 스캔의 실패나 최종 포기는 이미 확인된 Plex 삭제 성공을 실패로 바꾸거나 삭제를 다시 실행하지 않습니다. 안전 격리와 Plex DELETE + 외부 자막 정리 방식은 다릅니다. 승인한 처리 뒤 부분 스캔과 유지본 사후검증까지 통과해야 성공이며, 외부 자막 정리의 임시 보호본도 그때까지 보존합니다. 최종 실패하면 `unknown`/`manual_check_required`로 남겨 운영자가 journal, Plex, 원본과 보호본 상태를 확인하도록 합니다. 또한 이 기능은 DupeFinder 중복 재검사를 실행하지 않고 `rescan_required` 잠금을 해제하지 않습니다. 처리한 그룹의 최신 중복 판정은 DupeFinder 스캔을 별도로 실행해야 반영됩니다. 백엔드는 각 항목을 실행 직전 다시 검증하므로 같은 스캔의 다른 미처리 그룹을 계속 처리할 수 있습니다.
 
 Binary 프로세스에 종료를 요청한 뒤에도 실제 종료 여부를 확인할 수 없는 예외 상황에서는 자동 스캔 재실행을 영구 차단하고, 다른 삭제·부분 스캔과 겹치지 않도록 전역 작업 잠금을 1시간 유지합니다. 작업 이력에 이 상태가 표시되면 운영자는 1시간 잠금 만료 전후로 Plex Media Scanner 프로세스가 실제로 종료됐는지 확인해야 합니다. 1시간은 운영상 격리 시간이며, 만료 후에도 종료되지 않은 외부 프로세스를 이 플러그인이 증명하거나 계속 추적하지는 않습니다.
 
@@ -173,18 +180,20 @@ Binary 프로세스에 종료를 요청한 뒤에도 실제 종료 여부를 확
 
 플러그인 전용 FlaskFarm DB에 다음 정보를 저장합니다.
 
-- `scan_run`: 실행 상태와 서버 식별정보
+- `scan_run`: 실행 상태와 서버 식별정보. 결과 삭제 뒤에는 Run ID 재사용을 막는 최소 `results_deleted` tombstone만 보존
 - `duplicate_group`: Plex 작품 단위 중복 그룹과 안전성 판정
 - `media_candidate`: Media/Part 스냅샷, 점수, 지문
 - `action_log`: 삭제 시도, 차단, 응답 및 전후 검증 결과
 - `post_delete_scan_job`: 확인된 삭제 뒤 부분 스캔을 전달하는 durable outbox 상태와 제한된 재시도 정보
 - `quarantine_journal`: 승인 manifest, 파일 identity·hash, 보호본과 실제 격리 이동 경로 및 복구 상태
-- `direct_delete_journal`: 직접 영구삭제 승인 manifest, 파일 identity·hash, unlink 진행 상태 및 수동 확인 정보
+- `direct_delete_journal`: Plex DELETE + 외부 자막 정리 승인 manifest, PMS 결과, 자막 identity·hash, 임시 보호·복원·정리 상태 및 수동 확인 정보
 - `batch_run`: 일괄 계획, 승인, 진행률, 중단 및 복구 상태
 - `batch_item`: 계획에 포함된 유지·삭제 후보와 항목별 처리 결과
 - `deletion_lease`: 단건과 배치를 직렬화하는 cross-worker 전역 lease
 
 Plex Token은 어느 테이블에도 저장하지 않습니다.
+
+**최근 스캔 → 스캔 결과 삭제**는 현재 실행 중이 아닌 종료 상태의 스캔 결과만 정리합니다. 연결된 `duplicate_group`, `media_candidate` 결과 행은 삭제하고, 원래 `scan_run`은 감사 기록의 Run ID가 미래 스캔에 재사용되지 않도록 식별정보를 비운 최소 `results_deleted` tombstone으로 남깁니다. tombstone은 최근 스캔 목록과 결과 API에서 숨겨집니다. 미디어·자막 파일이나 Plex 항목에는 어떤 명령도 보내지 않으며, `action_log`, `batch_run`/`batch_item`, `post_delete_scan_job`, 격리·직접 처리 journal 같은 삭제·감사 이력도 보존됩니다. 연결된 삭제·배치·부분 스캔 또는 미완료 journal이 아직 활성 상태라면 결과 삭제를 차단하므로, 작업 상태를 먼저 확인해야 합니다.
 
 ## 제한사항
 

@@ -181,8 +181,10 @@ class BatchDeleteManager:
         confirmation = str(getattr(batch, "confirmation", "") or "")
         if confirmation.startswith("BATCH QUARANTINE "):
             return "quarantine"
-        if confirmation.startswith("BATCH DELETE FILES "):
+        if confirmation.startswith("BATCH DELETE MEDIA "):
             return "direct"
+        if confirmation.startswith("BATCH DELETE FILES "):
+            return "legacy_direct"
         # v1.2 previews and every legacy/test row are Plex DELETE plans.
         return "plex"
 
@@ -195,10 +197,31 @@ class BatchDeleteManager:
         mutation and never copied into an existing batch table.
         """
 
+        def public_entries(values: Any) -> List[Dict[str, str]]:
+            result: List[Dict[str, str]] = []
+            for raw in values or []:
+                if not isinstance(raw, dict):
+                    continue
+                path = str(raw.get("path") or raw.get("source_path") or "")
+                if not path:
+                    continue
+                item = {
+                    "path": path,
+                    "source_path": path,
+                    "reason": str(raw.get("reason") or ""),
+                }
+                if raw.get("reason_code"):
+                    item["reason_code"] = str(raw["reason_code"])
+                result.append(item)
+            return result
+
         return {
-            "eligible": list(cleanup.get("eligible") or []),
-            "excluded": list(cleanup.get("excluded") or []),
-            "protected": [],
+            "eligible": public_entries(cleanup.get("eligible")),
+            "excluded": public_entries(cleanup.get("excluded")),
+            "protected": public_entries(
+                cleanup.get("protected")
+                or cleanup.get("protected_subtitles")
+            ),
             "batch_binding": dict(binding),
         }
 
@@ -211,9 +234,20 @@ class BatchDeleteManager:
             video = cleanup.get("video") or {}
             if video.get("path"):
                 paths.append(str(video["path"]))
-            for entry in cleanup.get("eligible") or []:
-                if isinstance(entry, dict) and (entry.get("path") or entry.get("source_path")):
-                    paths.append(str(entry.get("path") or entry.get("source_path")))
+            for collection in (
+                cleanup.get("eligible") or [],
+                cleanup.get("excluded") or [],
+                cleanup.get("protected")
+                or cleanup.get("protected_subtitles")
+                or [],
+            ):
+                for entry in collection:
+                    if isinstance(entry, dict) and (
+                        entry.get("path") or entry.get("source_path")
+                    ):
+                        paths.append(
+                            str(entry.get("path") or entry.get("source_path"))
+                        )
             for path in paths:
                 key = os.path.normcase(os.path.realpath(os.path.abspath(path)))
                 previous = owners.get(key)
@@ -278,6 +312,8 @@ class BatchDeleteManager:
             str(preview.get("plan_digest") or ""), str(journal.plan_digest or "")
         ):
             raise RuntimeError("직접 삭제할 영상·자막 계획이 승인 이후 변경되었습니다.")
+        if (preview.get("subtitle_cleanup") or {}).get("executable") is False:
+            raise RuntimeError("보호할 수 없는 관련 자막이 있어 새 사전확인이 필요합니다.")
         return preview
 
     def preview(self, run_id: int) -> Dict[str, Any]:
@@ -315,9 +351,17 @@ class BatchDeleteManager:
                 if binding["post_delete_scan_mode"] not in ("binary", "web"):
                     raise RuntimeError("파일 처리는 Binary 또는 Web 부분 스캔이 필수입니다.")
                 for group, keep, target in pairs:
-                    previews.append(
-                        self.delete_service.preview(group.id, target.id, keep.id)
+                    item_preview = self.delete_service.preview(
+                        group.id, target.id, keep.id
                     )
+                    if backend == "direct" and (
+                        item_preview.get("subtitle_cleanup") or {}
+                    ).get("executable") is False:
+                        raise RuntimeError(
+                            "보호본을 만들 수 없는 관련 자막이 있어 일괄 계획을 "
+                            "생성하지 않습니다. 개별 결과에서 예외를 확인하세요."
+                        )
+                    previews.append(item_preview)
                 self._assert_source_sets_disjoint(previews)
 
             nonce = secrets.token_urlsafe(32)
@@ -333,6 +377,29 @@ class BatchDeleteManager:
                 current_message="사용자 일괄 승인 대기 중",
             )
             try:
+                # Serialize the final preview materialization with scan-result
+                # cleanup. Network-backed fresh previews above can take long
+                # enough for the parent run to become ineligible meanwhile.
+                locked_run = (
+                    F.db.session.query(ModelScanRun)
+                    .filter(
+                        ModelScanRun.id == int(run.id),
+                        ModelScanRun.status.in_(
+                            ("completed", "completed_with_warnings")
+                        ),
+                    )
+                    .populate_existing()
+                    .with_for_update()
+                    .first()
+                )
+                if locked_run is None or locked_run.status not in (
+                    "completed",
+                    "completed_with_warnings",
+                ):
+                    raise RuntimeError(
+                        "원본 스캔 상태가 변경되어 일괄 사전확인을 저장하지 않습니다."
+                    )
+                self._assert_settings_snapshot(locked_run)
                 F.db.session.add(batch)
                 F.db.session.flush()
                 if backend in ("quarantine", "direct"):
@@ -359,7 +426,7 @@ class BatchDeleteManager:
                         )
                     else:
                         batch.confirmation = (
-                            "BATCH DELETE FILES %s ITEMS %s SUBTITLES %s %s"
+                            "BATCH DELETE MEDIA %s ITEMS %s SUBTITLES %s %s"
                             % (batch.id, len(pairs), total_subtitles, aggregate[:12])
                         )
                 else:
@@ -496,6 +563,11 @@ class BatchDeleteManager:
                 journal = self._preview_journal(batch.id, item.delete_candidate_id)
                 fresh_previews.append(self._fresh_quarantine_preview(item, journal))
             self._assert_source_sets_disjoint(fresh_previews)
+        elif planned_backend == "legacy_direct":
+            raise RuntimeError(
+                "이 사전확인은 이전 파일 직접 삭제 방식으로 생성되었습니다. "
+                "Plex Media DELETE 방식으로 다시 사전확인하세요."
+            )
         elif planned_backend == "direct":
             if _delete_backend() != "direct":
                 raise RuntimeError(
@@ -719,6 +791,10 @@ class BatchDeleteManager:
 
                     try:
                         backend = self._planned_backend(batch)
+                        if backend == "legacy_direct":
+                            raise RuntimeError(
+                                "이전 직접 삭제 계획은 실행할 수 없습니다. 다시 사전확인하세요."
+                            )
                         if _delete_backend() != backend:
                             raise RuntimeError(
                                 "사전확인 이후 파일 처리 방식이 변경되어 실행을 차단했습니다."
@@ -970,7 +1046,20 @@ class BatchDeleteManager:
             # A valid manual or batch owner belongs to another live web worker.
             return 0
         try:
-            self.last_delete_recovery_counts = self.delete_service.recover_interrupted()
+            recovery_owner_ref = (
+                "%s:%s"
+                % (
+                    getattr(recovery_claim, "previous_kind", ""),
+                    getattr(recovery_claim, "previous_ref", ""),
+                )
+                if getattr(recovery_claim, "previous_kind", "")
+                or getattr(recovery_claim, "previous_ref", "")
+                else "plugin_load"
+            )
+            self.last_delete_recovery_counts = self.delete_service.recover_interrupted(
+                recovery_lease_token=recovery_claim.token,
+                recovery_lease_owner_ref=recovery_owner_ref,
+            )
             with F.app.app_context():
                 batches = ModelBatchRun.unfinished()
                 now = datetime.now()

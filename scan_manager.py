@@ -180,6 +180,15 @@ class ScanManager:
         self._cancel.set()
         return run
 
+    def delete_run(self, run_id: int) -> Dict[str, Any]:
+        """Delete one terminal scan result without deleting audit evidence."""
+
+        # This is a synchronous authenticated web operation.  Reuse the
+        # request's app context/session so a nested Flask context cannot leave
+        # the caller's identity map holding the pre-tombstone scan snapshot.
+        with self._lock:
+            return ModelScanRun.delete_results(run_id)
+
     def unload(self) -> None:
         self._cancel.set()
 

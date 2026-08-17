@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0
+
+- Changed the persisted `direct` mode from FlaskFarm-side video unlinking to one PMS Media DELETE followed by separate cleanup of target-exclusive same-stem external subtitles, eliminating the mergerfs video-rename `EXDEV` path.
+- Added durable full SHA-256 protection copies for survivor-owned, shared and ambiguous regular sidecars before PMS DELETE, with verified no-overwrite restoration when PMS removes protected subtitles as collateral.
+- Blocked the PMS DELETE before mutation when a related protected sidecar cannot be snapshotted safely; target-exclusive subtitles are removed only after an exact PMS post-read confirms the target Media is gone and every retained Media fingerprint is unchanged.
+- Kept direct-mode protection copies in FlaskFarm `path_data` until the mandatory Binary/Web partial scan and retained-version verification complete; uncertain operations keep their journal and protection data for manual review without retrying DELETE.
+- Replaced direct-mode exact confirmations with `DELETE MEDIA ...` / `BATCH DELETE MEDIA ...`; stale `DELETE FILES` batch previews cannot be approved and must be regenerated.
+- Added terminal Recent Scans result deletion for `duplicate_group` and `media_candidate` rows while retaining a scrubbed, API-hidden `results_deleted` scan tombstone to prevent Run ID reuse; files, Plex items and all deletion/audit work records remain preserved, and active linked work blocks deletion.
+
 ## 1.4.1
 
 - Reworked direct deletion to use a randomized same-parent handoff path, avoiding mergerfs cross-branch child-directory renames while keeping every mutation journaled before it starts.

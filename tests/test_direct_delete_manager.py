@@ -45,6 +45,7 @@ class _Session:
         self.added = []
         self.commits = 0
         self.rollbacks = 0
+        self.expires = 0
 
     def add(self, value) -> None:
         if getattr(value, "id", None) is None:
@@ -58,8 +59,12 @@ class _Session:
     def rollback(self) -> None:
         self.rollbacks += 1
 
+    def expire(self, _value) -> None:
+        self.expires += 1
 
-class DirectDeleteManagerFilesystemSafetyTest(unittest.TestCase):
+
+class _LegacyDirectDeleteManagerFilesystemSafetyFixture:
+    """Archived fixture for pre-1.5 journals; it is intentionally not executed."""
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="pdff-direct-manager-")
         self.root = Path(self.temporary.name)
@@ -179,7 +184,8 @@ class DirectDeleteManagerFilesystemSafetyTest(unittest.TestCase):
             {"same_parent_v2"},
         )
 
-    def test_first_handoff_exdev_is_retryable_no_mutation_and_redacted(self) -> None:
+    @unittest.skipIf(os.name == "nt", "POSIX dirfd fallback")
+    def test_exdev_uses_held_fd_dirfd_fallback_and_completes(self) -> None:
         plan = self.make_plan()
         harness, module, session, manager, records = self.manager_context()
         attempted = []
@@ -195,37 +201,89 @@ class DirectDeleteManagerFilesystemSafetyTest(unittest.TestCase):
             with mock.patch.object(
                 module.os, "rename", side_effect=fail_with_realistic_exdev
             ):
+                journal = manager.execute(plan, plan.plan_digest, **records)
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(len(attempted), 2)
+        self.assertEqual(journal.status, "deleted_pending_scan")
+        self.assertEqual(records["action_log"].status, "deleted_pending_scan")
+        self.assertFalse(self.delete_video.exists())
+        self.assertFalse(self.delete_subtitle.exists())
+        self.assertTrue(self.keep_video.exists())
+        self.assertTrue(self.keep_subtitle.exists())
+        self.assertFalse(any(self.folder.glob(".pdff-direct-*")))
+        operations = json.loads(journal.unlink_json)
+        self.assertEqual(
+            {value["handoff_strategy"] for value in operations},
+            {"posix_dirfd_unlink_v1"},
+        )
+        self.assertEqual(
+            {value["identity_proof"] for value in operations},
+            {"open_fd_dirfd_identity_v1"},
+        )
+        self.assertEqual({value["state"] for value in operations}, {"deleted"})
+
+    @unittest.skipIf(os.name == "nt", "POSIX dirfd fallback")
+    def test_exdev_fallback_rejects_source_replacement_before_unlinkat(self) -> None:
+        plan = self.make_plan()
+        harness, module, session, manager, records = self.manager_context()
+        real_rename = os.rename
+        real_guard = module._descriptor_owns_dirfd_entry
+        saved_original = self.root / "saved-original-before-unlinkat"
+        replacement = b"replacement!"
+        injected = False
+
+        def fail_exdev(_source, _destination):
+            raise OSError(errno.EXDEV, "cross-device link")
+
+        def replace_then_guard(descriptor, parent_descriptor, name, expected):
+            nonlocal injected
+            if not injected and expected.path == str(self.delete_video):
+                injected = True
+                real_rename(self.delete_video, saved_original)
+                self.delete_video.write_bytes(replacement)
+                os.utime(
+                    self.delete_video,
+                    ns=(expected.mtime_ns, expected.mtime_ns),
+                )
+            return real_guard(descriptor, parent_descriptor, name, expected)
+
+        try:
+            with mock.patch.object(
+                module.os, "rename", side_effect=fail_exdev
+            ), mock.patch.object(
+                module,
+                "_descriptor_owns_dirfd_entry",
+                side_effect=replace_then_guard,
+            ), mock.patch.object(
+                module.os,
+                "unlink",
+                side_effect=AssertionError("replacement must not be unlinked"),
+            ) as unlink:
                 with self.assertRaisesRegex(RuntimeError, "원본 삭제는 시작되지"):
                     manager.execute(plan, plan.plan_digest, **records)
+                unlink.assert_not_called()
             journal = session.added[0]
         finally:
             harness.__exit__(None, None, None)
 
-        self.assertEqual(len(attempted), 1)
+        self.assertTrue(injected)
         self.assertEqual(journal.status, "failed_no_mutation")
-        self.assertIsNotNone(journal.finished_at)
         self.assertEqual(records["action_log"].status, "blocked")
         self.assertEqual(records["group"].resolution_status, "open")
-        self.assertTrue(records["group"].safe_to_delete)
-        self.assertEqual(json.loads(records["group"].safety_flags_json), [])
-        self.assertTrue(self.delete_video.exists())
+        self.assertFalse(records["group"].safe_to_delete)
+        self.assertEqual(self.delete_video.read_bytes(), replacement)
+        self.assertEqual(saved_original.read_bytes(), b"delete-video")
         self.assertTrue(self.delete_subtitle.exists())
         self.assertTrue(self.keep_video.exists())
-        self.assertTrue(self.keep_subtitle.exists())
-        self.assertFalse(any(self.folder.glob(".pdff-direct-*")))
-        self.assertIn("stage=rename_video_0", journal.last_error)
-        self.assertIn("error=OSError", journal.last_error)
-        self.assertIn("errno=%s" % errno.EXDEV, journal.last_error)
-        self.assertIn("journal=1", journal.last_error)
-        self.assertIn("action=5", journal.last_error)
-        for secret in (
-            attempted[0][0],
-            attempted[0][1],
-            journal.operation_key,
-            ".pdff-direct-",
-            "cross-device link",
-        ):
-            self.assertNotIn(secret, journal.last_error)
+        self.assertEqual(self.keep_subtitle.read_bytes(), b"keep-subtitle")
+        operation = json.loads(journal.unlink_json)[0]
+        self.assertEqual(operation["state"], "direct_unlink_prepared")
+        self.assertEqual(
+            operation["handoff_strategy"], "posix_dirfd_unlink_v1"
+        )
+        self.assertIn("stage=direct_unlink_video_0", journal.last_error)
 
     def test_posix_handoff_accepts_path_hash_inode_change_only_with_content_proof(self) -> None:
         harness, module, _session, _manager, _records = self.manager_context()
@@ -667,6 +725,655 @@ class DirectDeleteManagerFilesystemSafetyTest(unittest.TestCase):
         self.assertEqual(self.delete_video.read_bytes(), before)
         self.assertFalse(tombstone.exists())
         self.assertEqual(session.commits, 1)
+
+    def test_restart_classifies_prepared_exdev_fallback_with_source_as_no_mutation(self) -> None:
+        harness, module, session, manager, _records = self.manager_context()
+        tombstone = self.folder / ".pdff-direct-private-001.tombstone"
+        pending = _Record(
+            id=40,
+            status="deleting",
+            action_log_id=41,
+            group_id=42,
+            last_error="",
+            updated_at=None,
+            finished_at=None,
+            operation_paths_json="[]",
+            unlink_json=json.dumps(
+                [
+                    {
+                        "source_path": str(self.delete_video),
+                        "tombstone_path": str(tombstone),
+                        "kind": "video",
+                        "state": "direct_unlink_prepared",
+                        "handoff_strategy": "posix_dirfd_unlink_v1",
+                    }
+                ]
+            ),
+        )
+        action = _Record(id=41, status="direct_deleting", message="")
+        group = _Record(
+            id=42,
+            safe_to_delete=True,
+            resolution_status="delete_in_progress",
+            safety_flags_json="[]",
+        )
+        module.ModelDirectDeleteJournal = types.SimpleNamespace(
+            unfinished=lambda: [pending]
+        )
+        module.ModelPostDeleteScanJob = types.SimpleNamespace(
+            active_for_action=lambda _action_id: None
+        )
+        module.ModelActionLog = types.SimpleNamespace(get=lambda _action_id: action)
+        module.ModelDuplicateGroup = types.SimpleNamespace(get=lambda _group_id: group)
+        before = self.delete_video.read_bytes()
+        try:
+            count = manager.recover_interrupted()
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(pending.status, "failed_no_mutation")
+        self.assertEqual(action.status, "blocked")
+        self.assertEqual(group.resolution_status, "open")
+        self.assertFalse(group.safe_to_delete)
+        self.assertEqual(self.delete_video.read_bytes(), before)
+        self.assertFalse(tombstone.exists())
+        self.assertEqual(session.commits, 1)
+
+
+class _MediaVersion:
+    def __init__(self, media_id: str, path: Path) -> None:
+        self.media_id = str(media_id)
+        self.paths = (str(path),)
+
+    def fingerprint(self):
+        return self.media_id, self.paths
+
+    def as_dict(self):
+        return {"media_id": self.media_id, "paths": list(self.paths)}
+
+
+class _PlexItem:
+    def __init__(self, *media: _MediaVersion) -> None:
+        self.media = tuple(media)
+
+    def identity_fingerprint(self):
+        return "rating-key-100", "movie", "1"
+
+    def as_dict(self):
+        return {"media": [value.as_dict() for value in self.media]}
+
+
+class _HybridGateway:
+    def __init__(self, before, after, mutate=None, raise_after_delete=False):
+        self.before = before
+        self.after = after
+        self.mutate = mutate or (lambda: None)
+        self.raise_after_delete = raise_after_delete
+        self.delete_calls = []
+        self.get_calls = 0
+        self.sent = False
+        self.read_error = None
+
+    def delete_media(self, rating_key, media_id):
+        self.delete_calls.append((str(rating_key), str(media_id)))
+        self.sent = True
+        self.mutate()
+        if self.raise_after_delete:
+            raise RuntimeError("transport outcome unknown")
+        return 200
+
+    def get_metadata(self, rating_key):
+        self.get_calls += 1
+        if self.read_error is not None:
+            raise self.read_error
+        return self.after
+
+
+class HybridDirectDeleteManagerSafetyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="pdff-hybrid-manager-")
+        self.root = Path(self.temporary.name)
+        self.media = self.root / "media"
+        self.data = self.root / "data"
+        self.folder = self.media / "Movie"
+        self.data.mkdir(parents=True)
+        self.delete_video = _write(self.folder / "Film.1080p.mkv", b"delete-video")
+        self.keep_video = _write(self.folder / "Film.2160p.mkv", b"keep-video")
+        self.delete_subtitle = _write(
+            self.folder / "Film.1080p.ko.srt", b"delete-subtitle"
+        )
+        self.keep_subtitle = _write(
+            self.folder / "Film.2160p.ko.srt", b"keep-subtitle"
+        )
+        self.before = _PlexItem(
+            _MediaVersion("10", self.delete_video),
+            _MediaVersion("20", self.keep_video),
+        )
+        self.after = _PlexItem(_MediaVersion("20", self.keep_video))
+        _Journal.values = {}
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def plan(self):
+        return build_direct_delete_plan(
+            (str(self.delete_video),),
+            (str(self.keep_video),),
+            (str(self.media),),
+            (str(self.media),),
+            "web",
+        )
+
+    @staticmethod
+    def records():
+        return {
+            "run": _Record(id=1),
+            "group": _Record(
+                id=2,
+                rating_key="100",
+                safe_to_delete=False,
+                resolution_status="delete_in_progress",
+                safety_flags_json="[]",
+            ),
+            "candidate": _Record(id=3, media_id="10"),
+            "keep": _Record(id=4, media_id="20"),
+            "action_log": _Record(
+                id=5,
+                status="validating",
+                message="",
+                response_status=None,
+                after_json="",
+            ),
+        }
+
+    def manager_context(self, records=None):
+        records = records or self.records()
+        harness = FlaskFarmImportHarness()
+        harness.__enter__()
+        module = sys.modules["plex_dupefinder_ff.direct_delete_manager"]
+        module.F.config = {"path_data": str(self.data)}
+        session = _Session()
+        module.F.db.session = session
+        module.ModelDirectDeleteJournal = _Journal
+        module.ModelActionLog = types.SimpleNamespace(
+            get=lambda action_id: records["action_log"]
+            if int(action_id) == records["action_log"].id
+            else None
+        )
+        module.ModelDuplicateGroup = types.SimpleNamespace(
+            get=lambda group_id: records["group"]
+            if int(group_id) == records["group"].id
+            else None
+        )
+        return harness, module, session, module.DirectDeleteManager(), records
+
+    @staticmethod
+    def _unlink(*paths: Path) -> None:
+        for path in paths:
+            if path.exists():
+                path.unlink()
+
+    def test_success_uses_one_pms_delete_restores_collateral_and_keeps_backups(self):
+        plan = self.plan()
+        harness, module, _session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(
+                self.delete_video, self.delete_subtitle, self.keep_subtitle
+            ),
+        )
+        real_chmod = module.os.chmod
+        chmod_paths = []
+
+        def observed_chmod(path, mode):
+            chmod_paths.append(os.path.normcase(os.path.abspath(str(path))))
+            return real_chmod(path, mode)
+
+        try:
+            with mock.patch.object(
+                module.os, "chmod", side_effect=observed_chmod
+            ), mock.patch.object(
+                module.os,
+                "rename",
+                side_effect=AssertionError("hybrid execution must not rename video files"),
+            ):
+                journal = manager.execute(
+                    plan,
+                    plan.plan_digest,
+                    gateway=gateway,
+                    current_item=self.before,
+                    **records,
+                )
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(gateway.delete_calls, [("100", "10")])
+        self.assertEqual(journal.status, "deleted_pending_scan")
+        self.assertFalse(self.delete_video.exists())
+        self.assertFalse(self.delete_subtitle.exists())
+        self.assertEqual(self.keep_subtitle.read_bytes(), b"keep-subtitle")
+        operations = json.loads(journal.unlink_json)
+        self.assertEqual(operations[0]["state"], "pms_delete_confirmed")
+        self.assertEqual(operations[1]["state"], "removed_by_plex")
+        backups = [
+            value
+            for value in json.loads(journal.operation_paths_json)
+            if value.get("kind") == "subtitle_backup"
+        ]
+        self.assertEqual({value["role"] for value in backups}, {"target", "protected"})
+        self.assertTrue(all(Path(value["backup_snapshot"]["path"]).exists() for value in backups))
+        self.assertNotIn(
+            os.path.normcase(os.path.abspath(str(self.data))),
+            chmod_paths,
+        )
+
+    def test_success_removes_remaining_target_sidecar_with_exact_guard(self):
+        plan = self.plan()
+        harness, _module, _session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(self.delete_video),
+        )
+        try:
+            journal = manager.execute(
+                plan,
+                plan.plan_digest,
+                gateway=gateway,
+                current_item=self.before,
+                **records,
+            )
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertFalse(self.delete_subtitle.exists())
+        self.assertTrue(self.keep_subtitle.exists())
+        self.assertEqual(json.loads(journal.unlink_json)[1]["state"], "deleted_by_plugin")
+
+    def test_transport_error_is_reconciled_without_resending_delete(self):
+        plan = self.plan()
+        harness, _module, _session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(self.delete_video, self.delete_subtitle),
+            raise_after_delete=True,
+        )
+        try:
+            journal = manager.execute(
+                plan,
+                plan.plan_digest,
+                gateway=gateway,
+                current_item=self.before,
+                **records,
+            )
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(len(gateway.delete_calls), 1)
+        self.assertEqual(gateway.get_calls, 1)
+        self.assertEqual(journal.status, "deleted_pending_scan")
+
+    def test_unknown_postread_restores_all_missing_sidecars_and_never_retries(self):
+        plan = self.plan()
+        harness, _module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(self.delete_subtitle, self.keep_subtitle),
+        )
+        gateway.read_error = RuntimeError("PMS unavailable")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "자동 재시도하지"):
+                manager.execute(
+                    plan,
+                    plan.plan_digest,
+                    gateway=gateway,
+                    current_item=self.before,
+                    **records,
+                )
+            journal = session.added[0]
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(len(gateway.delete_calls), 1)
+        self.assertTrue(self.delete_video.exists())
+        self.assertEqual(self.delete_subtitle.read_bytes(), b"delete-subtitle")
+        self.assertEqual(self.keep_subtitle.read_bytes(), b"keep-subtitle")
+        self.assertEqual(journal.status, "recovery_required")
+
+    def test_metadata_removed_but_video_present_restores_all_and_requires_manual_check(self):
+        plan = self.plan()
+        harness, _module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(self.delete_subtitle, self.keep_subtitle),
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "자동 재시도하지"):
+                manager.execute(
+                    plan,
+                    plan.plan_digest,
+                    gateway=gateway,
+                    current_item=self.before,
+                    **records,
+                )
+            journal = session.added[0]
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(len(gateway.delete_calls), 1)
+        self.assertTrue(self.delete_video.exists())
+        self.assertTrue(self.delete_subtitle.exists())
+        self.assertTrue(self.keep_subtitle.exists())
+        self.assertEqual(journal.status, "recovery_required")
+
+    def test_replaced_target_sidecar_is_never_unlinked(self):
+        plan = self.plan()
+        harness, _module, session, manager, records = self.manager_context()
+
+        def mutate():
+            self._unlink(self.delete_video, self.delete_subtitle)
+            self.delete_subtitle.write_bytes(b"replacement-subtitle")
+
+        gateway = _HybridGateway(self.before, self.after, mutate=mutate)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "자동 재시도하지"):
+                manager.execute(
+                    plan,
+                    plan.plan_digest,
+                    gateway=gateway,
+                    current_item=self.before,
+                    **records,
+                )
+            journal = session.added[0]
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(self.delete_subtitle.read_bytes(), b"replacement-subtitle")
+        self.assertEqual(journal.status, "recovery_required")
+
+    def test_backup_failure_blocks_before_pms_and_cleans_private_operation_folder(self):
+        plan = self.plan()
+        harness, module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(self.before, self.after)
+        try:
+            with mock.patch.object(
+                module,
+                "_copy_snapshot_to_backup",
+                side_effect=module.DirectDeletePlanError("backup failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "원본 삭제는 시작되지"):
+                    manager.execute(
+                        plan,
+                        plan.plan_digest,
+                        gateway=gateway,
+                        current_item=self.before,
+                        **records,
+                    )
+            journal = session.added[0]
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertTrue(self.delete_video.exists())
+        self.assertTrue(self.delete_subtitle.exists())
+        self.assertEqual(journal.status, "failed_no_mutation")
+        self.assertFalse(any(self.data.rglob("op-*")))
+
+    def test_tampered_durable_backup_is_rejected_by_final_reread_before_pms(self):
+        plan = self.plan()
+        harness, _module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(self.before, self.after)
+        create_backups = manager._create_hybrid_backups
+
+        def create_then_tamper(*args, **kwargs):
+            create_backups(*args, **kwargs)
+            journal = args[1]
+            first = next(
+                value
+                for value in json.loads(journal.operation_paths_json)
+                if value.get("kind") == "subtitle_backup"
+            )
+            Path(first["backup_snapshot"]["path"]).write_bytes(b"tampered")
+
+        try:
+            with mock.patch.object(
+                manager,
+                "_create_hybrid_backups",
+                side_effect=create_then_tamper,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "원본 삭제는 시작되지"):
+                    manager.execute(
+                        plan,
+                        plan.plan_digest,
+                        gateway=gateway,
+                        current_item=self.before,
+                        **records,
+                    )
+            journal = session.added[0]
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertGreaterEqual(session.expires, 1)
+        self.assertTrue(self.delete_video.exists())
+        self.assertTrue(self.delete_subtitle.exists())
+        self.assertEqual(journal.status, "failed_no_mutation")
+        self.assertEqual(json.loads(journal.unlink_json)[0]["state"], "planned")
+
+    def test_missing_durable_backup_is_rejected_before_pms(self):
+        plan = self.plan()
+        harness, _module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(self.before, self.after)
+        create_backups = manager._create_hybrid_backups
+
+        def create_then_remove(*args, **kwargs):
+            create_backups(*args, **kwargs)
+            journal = args[1]
+            first = next(
+                value
+                for value in json.loads(journal.operation_paths_json)
+                if value.get("kind") == "subtitle_backup"
+            )
+            Path(first["backup_snapshot"]["path"]).unlink()
+
+        try:
+            with mock.patch.object(
+                manager,
+                "_create_hybrid_backups",
+                side_effect=create_then_remove,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "원본 삭제는 시작되지"):
+                    manager.execute(
+                        plan,
+                        plan.plan_digest,
+                        gateway=gateway,
+                        current_item=self.before,
+                        **records,
+                    )
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertGreaterEqual(session.expires, 1)
+        self.assertTrue(self.delete_video.exists())
+        self.assertEqual(json.loads(session.added[0].unlink_json)[0]["state"], "planned")
+
+    def test_posix_chmod_failure_blocks_before_pms(self):
+        plan = self.plan()
+        harness, module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(self.before, self.after)
+        try:
+            with mock.patch.object(module.os, "name", "posix"), mock.patch.object(
+                module.os, "chmod", side_effect=OSError("chmod denied")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "원본 삭제는 시작되지"):
+                    manager.execute(
+                        plan,
+                        plan.plan_digest,
+                        gateway=gateway,
+                        current_item=self.before,
+                        **records,
+                    )
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertTrue(self.delete_video.exists())
+        self.assertEqual(session.added[0].status, "failed_no_mutation")
+
+    def test_unbackuppable_related_hardlink_is_non_executable(self):
+        linked = self.folder / "Film.1080p.en.srt"
+        os.link(self.delete_subtitle, linked)
+        plan = self.plan()
+        self.assertTrue(plan.blocking)
+        self.assertFalse(plan.as_api()["executable"])
+        harness, _module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(self.before, self.after)
+        try:
+            with self.assertRaisesRegex(Exception, "보호본"):
+                manager.execute(
+                    plan,
+                    plan.plan_digest,
+                    gateway=gateway,
+                    current_item=self.before,
+                    **records,
+                )
+        finally:
+            harness.__exit__(None, None, None)
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(session.added, [])
+
+    def test_recovery_owner_restores_all_after_lease_loss_without_pms_retry(self):
+        class DeletionLeaseLost(RuntimeError):
+            pass
+
+        plan = self.plan()
+        harness, module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(
+                self.delete_video, self.delete_subtitle, self.keep_subtitle
+            ),
+        )
+
+        def heartbeat():
+            if gateway.sent:
+                raise DeletionLeaseLost("lost")
+
+        try:
+            with self.assertRaises(DeletionLeaseLost):
+                manager.execute(
+                    plan,
+                    plan.plan_digest,
+                    gateway=gateway,
+                    current_item=self.before,
+                    heartbeat=heartbeat,
+                    **records,
+                )
+            journal = session.added[0]
+            self.assertEqual(len(gateway.delete_calls), 1)
+            self.assertEqual(json.loads(journal.unlink_json)[0]["state"], "pms_delete_prepared")
+            module.ModelDirectDeleteJournal = types.SimpleNamespace(
+                unfinished=lambda: [journal],
+                completed_with_backups=lambda: [],
+            )
+            module.ModelPostDeleteScanJob = types.SimpleNamespace(
+                active_for_action=lambda _action_id: None
+            )
+            recovery_beats = []
+            count = manager.recover_interrupted(
+                heartbeat=lambda: recovery_beats.append("renewed")
+            )
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(journal.status, "recovery_required")
+        self.assertEqual(len(gateway.delete_calls), 1)
+        self.assertTrue(recovery_beats)
+        self.assertEqual(self.delete_subtitle.read_bytes(), b"delete-subtitle")
+        self.assertEqual(self.keep_subtitle.read_bytes(), b"keep-subtitle")
+
+    def test_lease_loss_after_pms_get_never_commits_confirmation(self):
+        class DeletionLeaseLost(RuntimeError):
+            pass
+
+        plan = self.plan()
+        harness, module, session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(
+                self.delete_video, self.delete_subtitle, self.keep_subtitle
+            ),
+        )
+
+        def heartbeat():
+            if gateway.get_calls:
+                raise DeletionLeaseLost("lost after GET")
+
+        try:
+            with self.assertRaises(DeletionLeaseLost):
+                manager.execute(
+                    plan,
+                    plan.plan_digest,
+                    gateway=gateway,
+                    current_item=self.before,
+                    heartbeat=heartbeat,
+                    **records,
+                )
+            journal = session.added[0]
+            self.assertEqual(json.loads(journal.unlink_json)[0]["state"], "pms_delete_returned")
+            module.ModelDirectDeleteJournal = types.SimpleNamespace(
+                unfinished=lambda: [journal],
+                completed_with_backups=lambda: [],
+                get=lambda _journal_id: journal,
+            )
+            module.ModelPostDeleteScanJob = types.SimpleNamespace(
+                active_for_action=lambda _action_id: None
+            )
+            manager.recover_interrupted(heartbeat=lambda: None)
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(gateway.delete_calls, [("100", "10")])
+        self.assertEqual(gateway.get_calls, 1)
+        self.assertEqual(journal.status, "recovery_required")
+        self.assertEqual(self.delete_subtitle.read_bytes(), b"delete-subtitle")
+        self.assertEqual(self.keep_subtitle.read_bytes(), b"keep-subtitle")
+
+    def test_final_verification_then_cleanup_removes_only_private_backups(self):
+        plan = self.plan()
+        harness, _module, _session, manager, records = self.manager_context()
+        gateway = _HybridGateway(
+            self.before,
+            self.after,
+            mutate=lambda: self._unlink(self.delete_video, self.delete_subtitle),
+        )
+        try:
+            journal = manager.execute(
+                plan,
+                plan.plan_digest,
+                gateway=gateway,
+                current_item=self.before,
+                **records,
+            )
+            verified = manager.verify_deleted(journal)
+            cleaned = manager.cleanup_backups(journal)
+        finally:
+            harness.__exit__(None, None, None)
+
+        self.assertEqual(verified["videos"], 1)
+        self.assertGreaterEqual(cleaned["removed"], 2)
+        self.assertTrue(self.keep_video.exists())
+        self.assertTrue(self.keep_subtitle.exists())
+        self.assertFalse(any(self.data.rglob("*.backup")))
 
 
 if __name__ == "__main__":

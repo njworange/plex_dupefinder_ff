@@ -195,6 +195,132 @@ class BatchBackendTest(unittest.TestCase):
                     manager.preview(run.id)
             self.assertEqual(calls, [run.id])
 
+    def test_preview_final_lock_rejects_stale_cached_parent_run(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module(harness)
+            stale_run = _Record(id=9, status="completed")
+            group = _Record(
+                id=3,
+                title="Movie",
+                grandparent_title="",
+                media_type="movie",
+            )
+            keep = _Record(id=10, media_id="keep", score=2.0, parts_json="[]")
+            target = _Record(id=20, media_id="delete", score=1.0, parts_json="[]")
+
+            class Field:
+                def __init__(self, name):
+                    self.name = name
+
+                def __eq__(self, value):
+                    return ("eq", self.name, value)
+
+                def in_(self, values):
+                    return ("in", self.name, tuple(values))
+
+            class Runs:
+                id = Field("id")
+                status = Field("status")
+
+                @classmethod
+                def get(cls, run_id):
+                    self.assertEqual(int(run_id), stale_run.id)
+                    return stale_run
+
+            class Groups:
+                @classmethod
+                def safe_open_by_run(cls, run_id):
+                    self.assertEqual(int(run_id), stale_run.id)
+                    return [group]
+
+            class Batches(_Record):
+                def __init__(self, **values):
+                    super().__init__(id=71, confirmation="", **values)
+
+            class FinalQuery:
+                def __init__(self):
+                    self.predicates = []
+                    self.populated = False
+                    self.locked = False
+
+                def filter(self, *predicates):
+                    self.predicates.extend(predicates)
+                    return self
+
+                def populate_existing(self):
+                    self.populated = True
+                    return self
+
+                def with_for_update(self):
+                    self.locked = True
+                    return self
+
+                def first(self):
+                    expected = {
+                        ("eq", "id", stale_run.id),
+                        (
+                            "in",
+                            "status",
+                            ("completed", "completed_with_warnings"),
+                        ),
+                    }
+                    # The database row is now results_deleted. A correct final
+                    # query returns no row despite the session's stale object.
+                    if self.populated and expected.issubset(set(self.predicates)):
+                        return None
+                    return stale_run
+
+            query = FinalQuery()
+            case = self
+
+            class Session(_Session):
+                def __init__(self):
+                    super().__init__()
+                    self.added = []
+
+                def query(self, model):
+                    case.assertIs(model, Runs)
+                    return query
+
+                def add(self, item):
+                    self.added.append(item)
+
+            session = Session()
+            module.ModelScanRun = Runs
+            module.ModelDuplicateGroup = Groups
+            module.ModelBatchRun = Batches
+            module.F.db.session = session
+            manager = module.BatchDeleteManager()
+            manager._assert_settings_snapshot = lambda value: None
+            manager._cross_group_path_conflicts = lambda run_id: set()
+            manager._eligible_pair = lambda value: (keep, target)
+
+            with mock.patch.dict(
+                harness.setup_module.P.ModelSetting._data,
+                {
+                    "setting_delete_enabled": "True",
+                    "setting_batch_delete_enabled": "True",
+                    "setting_delete_backend": "plex",
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "원본 스캔 상태"):
+                    manager.preview(stale_run.id)
+
+            self.assertTrue(query.populated)
+            self.assertTrue(query.locked)
+            self.assertIn(("eq", "id", stale_run.id), query.predicates)
+            self.assertIn(
+                (
+                    "in",
+                    "status",
+                    ("completed", "completed_with_warnings"),
+                ),
+                query.predicates,
+            )
+            self.assertEqual(session.added, [])
+            self.assertEqual(session.rollbacks, 1)
+
     def test_db_lease_driver_errors_are_sanitized_and_renew_is_lost(self) -> None:
         with FlaskFarmImportHarness() as harness:
             lease_module = sys.modules[PACKAGE_NAME + ".deletion_lease"]
@@ -842,12 +968,20 @@ class BatchBackendTest(unittest.TestCase):
             module.ModelActionLog = Actions
             module.F.db.session = _Session()
             manager = module.BatchDeleteManager()
+            recovery_calls = []
             manager.delete_service = types.SimpleNamespace(
-                recover_interrupted=lambda: {"blocked": 0, "unknown": 1}
+                recover_interrupted=lambda **kwargs: (
+                    recovery_calls.append(kwargs)
+                    or {"blocked": 0, "unknown": 1}
+                )
             )
             manager.lease_service = types.SimpleNamespace(
                 recovery_state=lambda: "expired",
-                acquire_for_recovery=lambda: _Record(token="recovery-lease"),
+                acquire_for_recovery=lambda: _Record(
+                    token="recovery-lease",
+                    previous_kind="batch",
+                    previous_ref="1",
+                ),
                 release=lambda token: True,
             )
             count = manager.recover_interrupted()
@@ -856,6 +990,15 @@ class BatchBackendTest(unittest.TestCase):
             self.assertEqual(item.action_log_id, 6)
             self.assertEqual(batch.status, "interrupted")
             self.assertIsNone(batch.lease_key)
+            self.assertEqual(
+                recovery_calls,
+                [
+                    {
+                        "recovery_lease_token": "recovery-lease",
+                        "recovery_lease_owner_ref": "batch:1",
+                    }
+                ],
+            )
 
     def test_valid_db_batch_lease_excludes_other_worker_from_recovery(self) -> None:
         with FlaskFarmImportHarness() as harness:
@@ -1016,8 +1159,8 @@ class BatchBackendTest(unittest.TestCase):
                     module.F.db.session = _Session()
                     manager = module.BatchDeleteManager()
                     manager.delete_service = types.SimpleNamespace(
-                        recover_interrupted=lambda: (
-                            recover_calls.append(True)
+                        recover_interrupted=lambda **kwargs: (
+                            recover_calls.append(kwargs)
                             or {"blocked": 0, "unknown": 1}
                         )
                     )
@@ -1025,7 +1168,15 @@ class BatchBackendTest(unittest.TestCase):
                     manager._wake_post_delete_scans = lambda: None
 
                     self.assertEqual(manager.recover_interrupted(), 0)
-                    self.assertEqual(recover_calls, [True])
+                    self.assertEqual(
+                        recover_calls,
+                        [
+                            {
+                                "recovery_lease_token": "recovery-token",
+                                "recovery_lease_owner_ref": "plugin_load",
+                            }
+                        ],
+                    )
                     self.assertEqual(
                         lease_events,
                         ["acquire", ("release", "recovery-token")],

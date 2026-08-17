@@ -236,6 +236,7 @@ class DeleteService:
 
         from .post_delete_scan import (
             PostDeleteScanBlocked,
+            PostDeleteScanRefreshRequired,
             PostDeleteScanRetryable,
         )
 
@@ -331,9 +332,17 @@ class DeleteService:
                     before = json.loads(action.before_json or "{}")
                 except (TypeError, ValueError):
                     raise RuntimeError("직접 삭제 당시 Plex snapshot을 읽을 수 없습니다.") from None
-                self.direct_delete_manager.verify_deleted(
+                filesystem = self.direct_delete_manager.verify_deleted(
                     journal, heartbeat=heartbeat if callable(heartbeat) else None
                 )
+                if int(filesystem.get("restored", 0) or 0):
+                    journal.last_error = (
+                        "PMS DELETE가 제거한 유지 자막 보호본을 복원했습니다. "
+                        "Plex 재스캔 후 다시 확인합니다."
+                    )
+                    action.message = journal.last_error
+                    F.db.session.commit()
+                    raise PostDeleteScanRefreshRequired(journal.last_error)
                 state = self._quarantine_snapshot_state(
                     before, current, str(candidate.media_id)
                 )
@@ -369,6 +378,37 @@ class DeleteService:
                     batch_item.finished_at = datetime.now()
                 self._sync_batch_after_scan(journal.batch_run_id)
                 F.db.session.commit()
+                # Backup copies are erased only after the verified success is
+                # durable.  A cleanup problem must never turn a proven media
+                # deletion into an ambiguous/critical result; startup recovery
+                # can safely retry this idempotent, internal-only cleanup.
+                try:
+                    self.direct_delete_manager.cleanup_backups(
+                        journal,
+                        heartbeat=heartbeat if callable(heartbeat) else None,
+                    )
+                    journal.last_error = ""
+                    F.db.session.commit()
+                except DeletionLeaseLost:
+                    F.db.session.rollback()
+                    raise
+                except Exception as cleanup_exc:
+                    F.db.session.rollback()
+                    journal = ModelDirectDeleteJournal.for_action(action_id)
+                    if journal is not None:
+                        journal.last_error = (
+                            "삭제 검증은 완료됐지만 내부 자막 보호본 정리가 남아 있습니다."
+                        )
+                        journal.updated_at = datetime.now()
+                        F.db.session.commit()
+                    P.logger.warning(
+                        "Direct delete backup cleanup deferred: journal=%s error=%s",
+                        getattr(journal, "id", None),
+                        cleanup_exc.__class__.__name__,
+                    )
+            except PostDeleteScanRefreshRequired:
+                F.db.session.rollback()
+                raise
             except PostDeleteScanRetryable:
                 F.db.session.rollback()
                 retry_needed = True
@@ -858,7 +898,7 @@ class DeleteService:
                         plan.plan_digest[:12],
                     )
                 else:
-                    confirmation = "DELETE FILES %s SUBTITLES %s %s" % (
+                    confirmation = "DELETE MEDIA %s SUBTITLES %s %s" % (
                         candidate.media_id,
                         len(plan.eligible),
                         plan.plan_digest[:12],
@@ -954,7 +994,10 @@ class DeleteService:
         F.db.session.commit()
 
     def recover_interrupted(
-        self, exclude_delete_keys: Optional[Set[Tuple[int, int, int]]] = None
+        self,
+        exclude_delete_keys: Optional[Set[Tuple[int, int, int]]] = None,
+        recovery_lease_token: str = "",
+        recovery_lease_owner_ref: str = "plugin_load",
     ) -> Dict[str, int]:
         """Conservatively recover audit rows left mid-delete by a process restart."""
         counts = {"blocked": 0, "unknown": 0}
@@ -971,7 +1014,20 @@ class DeleteService:
                 self.direct_delete_manager, "recover_interrupted", None
             )
             if callable(direct_recover):
-                direct_recover()
+                if recovery_lease_token:
+                    direct_recover(
+                        heartbeat=lambda: self.lease_service.renew(
+                            recovery_lease_token,
+                            "recovery",
+                            recovery_lease_owner_ref or "plugin_load",
+                        )
+                    )
+                else:
+                    # Backward-compatible diagnostic entry point.  The real
+                    # startup path always supplies the singleton recovery
+                    # claim; hybrid filesystem recovery skips itself without
+                    # that heartbeat.
+                    direct_recover()
             logs = ModelActionLog.interrupted()
             for log in logs:
                 key = (
@@ -1311,7 +1367,7 @@ class DeleteService:
                         safety_policy.allowed_roots,
                         post_scan_locations,
                     )
-                    expected_confirmation = "DELETE FILES %s SUBTITLES %s %s" % (
+                    expected_confirmation = "DELETE MEDIA %s SUBTITLES %s %s" % (
                         candidate.media_id,
                         len(plan.eligible),
                         plan.plan_digest[:12],
@@ -1323,6 +1379,11 @@ class DeleteService:
                     ):
                         raise ValueError(
                             "직접 삭제 계획이 사전확인과 일치하지 않습니다. 다시 확인하세요."
+                        )
+                    if plan.blocking:
+                        raise RuntimeError(
+                            "보호본을 만들 수 없는 관련 자막이 있어 Plex Media "
+                            "DELETE를 실행하지 않습니다. 예외 목록을 확인하세요."
                         )
                     self.lease_service.renew(
                         lease_owner_token, lease_owner_kind, lease_owner_ref
@@ -1351,6 +1412,8 @@ class DeleteService:
                         keep=keep,
                         action_log=log,
                         batch_run_id=batch_run_id,
+                        gateway=gateway,
+                        current_item=current,
                         heartbeat=lambda: self.lease_service.renew(
                             lease_owner_token,
                             lease_owner_kind,
@@ -1407,7 +1470,7 @@ class DeleteService:
                         "action_id": log.id,
                         "deleted_media_id": candidate.media_id,
                         "kept_media_id": keep.media_id,
-                        "response_status": None,
+                        "response_status": getattr(log, "response_status", None),
                         "verification": "deleted_pending_scan",
                         "subtitle_cleanup": journal.cleanup_api(True),
                         "post_delete_scan": {

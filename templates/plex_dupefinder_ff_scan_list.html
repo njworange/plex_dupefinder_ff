@@ -39,6 +39,17 @@ var pollHandle = null;
 var librariesLoaded = false;
 var librariesLoading = false;
 var scanStarting = false;
+var scanDeleteStatuses = ['completed', 'completed_with_warnings', 'cancelled', 'failed', 'interrupted'];
+var scanDeletePending = {};
+
+function canDeleteScan(run) {
+  var status = String(run && run.status || '').toLowerCase();
+  return scanDeleteStatuses.indexOf(status) >= 0;
+}
+
+function isScanDeletePending(runId) {
+  return Object.prototype.hasOwnProperty.call(scanDeletePending, String(runId));
+}
 
 function selectedIds() {
   return Array.prototype.slice.call(document.querySelectorAll('.pdff-section:checked')).map(function (node) { return node.value; });
@@ -99,6 +110,11 @@ function runCard(run, current) {
   if (run.error_summary) html += '<div class="small text-danger mt-2">' + PDFF.esc(run.error_summary) + '</div>';
   html += '<div class="pdff-actions mt-2"><a class="btn btn-sm btn-outline-primary" href="/' + packageName + '/scan/results?run_id=' + encodeURIComponent(run.id) + '">결과 보기</a>';
   if (active && current) html += '<button type="button" class="btn btn-sm btn-outline-warning cancel-run" data-id="' + PDFF.esc(run.id) + '">취소</button>';
+  if (!current && canDeleteScan(run)) {
+    var deletePending = isScanDeletePending(run.id);
+    html += '<button type="button" class="btn btn-sm btn-outline-danger delete-scan" data-id="' + PDFF.esc(run.id) + '"' +
+      (deletePending ? ' disabled' : '') + '>' + (deletePending ? '삭제 중…' : '스캔 결과 삭제') + '</button>';
+  }
   html += '</div>';
   return html;
 }
@@ -158,6 +174,32 @@ $('#start_scan_btn').on('click', function () {
 $(document).on('click', '.cancel-run', function () {
   if (!window.confirm('현재 중복 스캔을 취소하시겠습니까?')) return;
   PDFF.request(packageName, 'scan', 'cancel', {run_id: $(this).data('id'), csrf_token: csrfToken}, 'POST', function (ret) { if (ret.ret === 'success') renderCurrent(ret.data); });
+});
+$(document).on('click', '.delete-scan', function () {
+  var button = $(this);
+  if (button.prop('disabled')) return;
+  if (!window.confirm(
+    '이 스캔 결과를 DB에서 삭제하시겠습니까?\n\n' +
+    'DupeFinder의 중복 그룹·후보 결과 DB 행을 삭제하고, Run ID 재사용 방지용 최소 tombstone만 남깁니다. 이 스캔은 최근 스캔과 결과 API에서 숨겨집니다. 미디어·자막 파일, Plex 항목 및 삭제·감사 작업 이력은 삭제되지 않습니다.'
+  )) return;
+  var runId = button.data('id');
+  if (isScanDeletePending(runId)) return;
+  scanDeletePending[String(runId)] = true;
+  button.prop('disabled', true).text('삭제 중…');
+  PDFF.request(packageName, 'scan', 'delete_scan', {run_id: runId, csrf_token: csrfToken}, 'POST', function (ret) {
+    if (ret.ret !== 'success') {
+      delete scanDeletePending[String(runId)];
+      button.prop('disabled', false).text('스캔 결과 삭제');
+      if (!ret.msg) PDFF.notify('이 스캔 결과를 DB에서 삭제할 수 없습니다.', 'warning');
+      loadRuns();
+      return;
+    }
+    delete scanDeletePending[String(runId)];
+    button.closest('.pdff-row').remove();
+    PDFF.notify(ret.msg || '스캔 결과를 DB에서 삭제했습니다.', 'success');
+    loadRuns();
+    loadStatus();
+  });
 });
 $('#refresh_runs_btn').on('click', function () { loadRuns(); loadStatus(); });
 $(document).ready(function () { loadLibraries(); loadRuns(); loadStatus(); pollHandle = window.setInterval(loadStatus, 2500); });

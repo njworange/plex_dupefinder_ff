@@ -43,11 +43,20 @@ class DirectDeletePlan:
     scan_mode: str
     plan_digest: str
 
+    @property
+    def blocking(self) -> Tuple[SubtitleDecision, ...]:
+        return tuple(
+            item
+            for item in self.excluded
+            if str(item.reason).startswith("required_backup_unavailable:")
+        )
+
     def as_api(self) -> Dict[str, Any]:
         return {
             "enabled": True,
             "backend": "direct",
-            "status": "planned",
+            "status": "blocked" if self.blocking else "planned",
+            "executable": not bool(self.blocking),
             "video": {"path": self.video.path, "size": self.video.size},
             "eligible": [item.as_dict(False) for item in self.eligible],
             "excluded": [item.as_dict(False) for item in self.excluded],
@@ -56,6 +65,7 @@ class DirectDeletePlan:
                 "excluded": len(self.excluded),
                 "protected": len(self.protected),
                 "deleted": 0,
+                "blocking": len(self.blocking),
             },
             "plan_digest": self.plan_digest,
         }
@@ -82,11 +92,15 @@ class DirectDeletePlan:
         payload = self.as_api()
         payload["included_subtitles"] = [value(item, False) for item in self.eligible]
         payload["excluded_subtitles"] = [value(item, True) for item in self.excluded]
+        payload["protected"] = [value(item, True) for item in self.protected]
+        payload["protected_subtitles"] = list(payload["protected"])
+        payload["blocking"] = [value(item, True) for item in self.blocking]
         return payload
 
     def manifest_dict(self) -> Dict[str, Any]:
         return {
             "backend": "direct",
+            "execution_strategy": "plex_media_delete_sidecar_v1",
             "scan_mode": self.scan_mode,
             "video": self.video.as_dict(),
             "survivors": [value.as_dict() for value in self.survivors],
@@ -215,12 +229,29 @@ def build_direct_delete_plan(
                 continue
             seen.add(path)
             snapshot, unsafe_reason = _decision_snapshot(path)
-            if extension in UNSUPPORTED_SUBTITLE_EXTENSIONS and candidate_prefix:
+            # Every related sidecar needs a rollback copy before PMS DELETE.
+            # This includes target-exclusive files: Plex can remove a subtitle
+            # while leaving its Media version present after a failed/unknown
+            # request, in which case we must be able to restore it.
+            requires_backup = bool(
+                delete_matches or survivor_matches or candidate_prefix
+            )
+            if requires_backup and snapshot is None:
                 excluded.append(
                     SubtitleDecision(
-                        path, "unsupported_or_paired_subtitle_format", snapshot
+                        path,
+                        "required_backup_unavailable:%s"
+                        % (unsafe_reason or "file_state_unverifiable"),
                     )
                 )
+                continue
+            if extension in UNSUPPORTED_SUBTITLE_EXTENSIONS and candidate_prefix:
+                decision = SubtitleDecision(
+                    path, "unsupported_or_paired_subtitle_format", snapshot
+                )
+                excluded.append(decision)
+                if snapshot is not None and survivor_matches:
+                    protected.append(decision)
                 continue
             if delete_matches:
                 if unsafe_reason:
@@ -240,15 +271,16 @@ def build_direct_delete_plan(
                         SubtitleDecision(path, "exclusive_to_deleted_video", snapshot)
                     )
             elif candidate_prefix:
-                excluded.append(
-                    SubtitleDecision(
-                        path,
-                        "survivor_owned"
-                        if survivor_matches
-                        else "subtitle_name_not_exclusive",
-                        snapshot,
-                    )
+                decision = SubtitleDecision(
+                    path,
+                    "survivor_owned"
+                    if survivor_matches
+                    else "subtitle_name_not_exclusive",
+                    snapshot,
                 )
+                excluded.append(decision)
+                if snapshot is not None:
+                    protected.append(decision)
             if survivor_matches and snapshot is not None:
                 protected.append(
                     SubtitleDecision(path, "protected_for_surviving_video", snapshot)
@@ -257,6 +289,12 @@ def build_direct_delete_plan(
     eligible_values = _sorted_decisions(eligible)
     excluded_values = _sorted_decisions(excluded)
     protected_by_path: Dict[str, SubtitleDecision] = {}
+    # An exclusion means the plugin must preserve that related sidecar even if
+    # PMS removes it as collateral.  Only entries without a safe full snapshot
+    # remain blocking and therefore cannot reach execution.
+    for value in excluded_values:
+        if value.snapshot is not None:
+            protected_by_path[value.path] = value
     for value in protected:
         protected_by_path[value.path] = value
     protected_values = _sorted_decisions(protected_by_path.values())
@@ -294,6 +332,7 @@ def build_direct_delete_plan(
         )
     manifest = {
         "backend": "direct",
+        "execution_strategy": "plex_media_delete_sidecar_v1",
         "scan_mode": mode,
         "video": video.as_dict(),
         "survivors": [value.as_dict() for value in survivor_snapshots],

@@ -422,7 +422,7 @@ class FlaskFarmStaticContractTest(unittest.TestCase):
         self.assertIsNotNone(gateway)
         self.assertEqual(
             {manifest.group(1), package.group(1), readme.group(1), gateway.group(1)},
-            {"1.4.1"},
+            {"1.5.0"},
         )
 
     def test_post_delete_scan_mode_normalization_is_fail_closed(self) -> None:

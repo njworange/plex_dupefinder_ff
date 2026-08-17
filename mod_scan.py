@@ -184,10 +184,27 @@ class ModuleScan(PluginModuleBase):
                 run = self.manager.cancel(run_id)
                 return jsonify({"ret": "success", "msg": "취소를 요청했습니다.", "data": run.as_api()})
 
+            if sub == "delete_scan":
+                if req.method != "POST":
+                    raise ValueError("스캔 결과 삭제는 POST만 허용합니다.")
+                self._csrf(req)
+                run_id = _positive_int(req.form.get("run_id"), "run_id")
+                data = self.manager.delete_run(run_id)
+                return jsonify(
+                    {
+                        "ret": "success",
+                        "msg": (
+                            "최근 스캔 결과를 DB에서 삭제했습니다. "
+                            "삭제 작업 이력과 파일 처리 journal은 보존했습니다."
+                        ),
+                        "data": data,
+                    }
+                )
+
             if sub == "status":
                 run_id = req.values.get("run_id")
                 run = ModelScanRun.get(run_id) if run_id else ModelScanRun.active()
-                if run is None:
+                if run is None and not run_id:
                     recent = ModelScanRun.recent(1)
                     run = recent[0] if recent else None
                 return jsonify({"ret": "success", "data": run.as_api() if run else None})

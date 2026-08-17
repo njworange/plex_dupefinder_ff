@@ -28,6 +28,13 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
                 }
             ],
             "excluded": [],
+            "protected": [
+                {
+                    "path": "C:/media/Movie.keep.ko.srt",
+                    "reason": "protected_for_surviving_video",
+                }
+            ],
+            "executable": True,
             "counts": {
                 "eligible": 1,
                 "excluded": 0,
@@ -85,6 +92,107 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "설정"):
                 manager._fresh_direct_preview(item, journal)
 
+    def test_blocking_direct_preview_cannot_be_reused_for_batch_approval(self) -> None:
+        with FlaskFarmImportHarness() as harness:
+            module = self._module()
+            harness.setup_module.P.ModelSetting._data.update(
+                {
+                    "setting_delete_backend": "direct",
+                    "setting_post_delete_scan_mode": "web",
+                }
+            )
+            digest = "a" * 64
+            item = _Record(group_id=1, delete_candidate_id=2, keep_candidate_id=3)
+            journal = _Record(
+                plan_digest=digest,
+                manifest_json=json.dumps(
+                    {
+                        "batch_binding": {
+                            "backend": "direct",
+                            "post_delete_scan_mode": "web",
+                            "quarantine_root": "",
+                        }
+                    }
+                ),
+            )
+            cleanup = self._cleanup()
+            cleanup["executable"] = False
+            manager = module.BatchDeleteManager(
+                types.SimpleNamespace(
+                    preview=lambda **kwargs: {
+                        "backend": "direct",
+                        "plan_digest": digest,
+                        "subtitle_cleanup": cleanup,
+                    }
+                )
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "보호"):
+                manager._fresh_direct_preview(item, journal)
+
+    def test_batch_manifest_keeps_public_protected_paths_only(self) -> None:
+        with FlaskFarmImportHarness() as _harness:
+            module = self._module()
+            cleanup = self._cleanup()
+            cleanup["protected"][0]["backup_path"] = "C:/private/op-secret"
+            manifest = module.BatchDeleteManager._preview_manifest(
+                cleanup,
+                {
+                    "backend": "direct",
+                    "post_delete_scan_mode": "web",
+                    "quarantine_root": "",
+                },
+            )
+
+            self.assertEqual(
+                manifest["protected"][0]["path"],
+                "C:/media/Movie.keep.ko.srt",
+            )
+            # Production cleanup serializers omit this key; the batch layer
+            # must never invent backup internals of its own.
+            self.assertNotIn("operation_paths", manifest)
+            self.assertNotIn("backup_snapshot", manifest)
+            self.assertNotIn("backup_path", json.dumps(manifest))
+
+    def test_cross_item_target_and_protected_path_conflict_is_blocked(self) -> None:
+        with FlaskFarmImportHarness() as _harness:
+            module = self._module()
+            shared = "C:/media/Shared.ko.srt"
+            first = {
+                "subtitle_cleanup": {
+                    "video": {"path": "C:/media/One.mkv"},
+                    "eligible": [{"path": shared}],
+                    "excluded": [],
+                    "protected": [],
+                }
+            }
+            second = {
+                "subtitle_cleanup": {
+                    "video": {"path": "C:/media/Two.mkv"},
+                    "eligible": [],
+                    "excluded": [],
+                    "protected": [{"path": shared}],
+                }
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "공유"):
+                module.BatchDeleteManager._assert_source_sets_disjoint(
+                    [first, second]
+                )
+
+    def test_legacy_file_delete_confirmation_is_never_treated_as_hybrid(self) -> None:
+        with FlaskFarmImportHarness() as _harness:
+            module = self._module()
+            batch = _Record(
+                confirmation=(
+                    "BATCH DELETE FILES 7 ITEMS 2 SUBTITLES 1 aaaaaaaaaaaa"
+                )
+            )
+            self.assertEqual(
+                module.BatchDeleteManager._planned_backend(batch),
+                "legacy_direct",
+            )
+
     def _assert_backend_drift_blocked(self, selected_backend: str) -> None:
         with FlaskFarmImportHarness() as harness:
             module = self._module()
@@ -106,7 +214,7 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
                 scan_run_id=9,
                 total_items=1,
                 confirmation=(
-                    "BATCH DELETE FILES 1 ITEMS 1 SUBTITLES 1 aaaaaaaaaaaa"
+                    "BATCH DELETE MEDIA 1 ITEMS 1 SUBTITLES 1 aaaaaaaaaaaa"
                 ),
             )
             journal = _Record(plan_digest="a" * 64)
@@ -171,7 +279,7 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
                 finished_at=None,
                 deletion_lease_token="batch-lease",
                 confirmation=(
-                    "BATCH DELETE FILES 1 ITEMS 1 SUBTITLES 1 aaaaaaaaaaaa"
+                    "BATCH DELETE MEDIA 1 ITEMS 1 SUBTITLES 1 aaaaaaaaaaaa"
                 ),
             )
             item = _Record(
@@ -238,7 +346,7 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             journal = _Record(plan_digest="a" * 64)
             manager._direct_preview_journal = lambda *args: journal
             manager._fresh_direct_preview = lambda *args: {
-                "confirmation": "DELETE FILES 40 SUBTITLES 1 aaaaaaaaaaaa"
+                "confirmation": "DELETE MEDIA 40 SUBTITLES 1 aaaaaaaaaaaa"
             }
 
             manager._worker(1)
@@ -267,8 +375,8 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             recovery_calls = []
 
             class DeleteService:
-                def recover_interrupted(self):
-                    recovery_calls.append(True)
+                def recover_interrupted(self, **kwargs):
+                    recovery_calls.append(kwargs)
                     return {"blocked": 0, "unknown": 1}
 
             manager = module.BatchDeleteManager(DeleteService())
@@ -280,7 +388,15 @@ class BatchDirectBackendSafetyTest(unittest.TestCase):
             )
 
             self.assertEqual(manager.recover_interrupted(), 0)
-            self.assertEqual(recovery_calls, [True])
+            self.assertEqual(
+                recovery_calls,
+                [
+                    {
+                        "recovery_lease_token": "recovery-token",
+                        "recovery_lease_owner_ref": "plugin_load",
+                    }
+                ],
+            )
             self.assertEqual(released, ["recovery-token"])
             self.assertEqual(
                 manager.last_delete_recovery_counts,

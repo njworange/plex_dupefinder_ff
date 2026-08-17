@@ -521,6 +521,7 @@ class DeleteFlowTest(unittest.TestCase):
         plan = _Record(
             plan_digest=digest,
             eligible=tuple(object() for _ in range(subtitle_count)),
+            blocking=(),
         )
 
         def public_dict():
@@ -552,6 +553,7 @@ class DeleteFlowTest(unittest.TestCase):
         plan = _Record(
             plan_digest=digest,
             eligible=tuple(object() for _ in range(subtitle_count)),
+            blocking=(),
         )
 
         def public_dict():
@@ -596,13 +598,13 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertEqual(result["plan_digest"], "d" * 64)
         self.assertEqual(
             result["confirmation"],
-            "DELETE FILES 10 SUBTITLES 1 %s" % ("d" * 12),
+            "DELETE MEDIA 10 SUBTITLES 1 %s" % ("d" * 12),
         )
         self.assertEqual(gateway.delete_calls, [])
         self.assertEqual(harness.direct_execute_calls, [])
         self.assertEqual(harness.run.deletion_attempts, 0)
 
-    def test_direct_execution_never_calls_pms_delete_and_requires_scan(self) -> None:
+    def test_direct_execution_delegates_hybrid_delete_and_requires_scan(self) -> None:
         before = _item(
             _version("10", path="/media/movies/Delete Review/10.mkv"),
             _version("20", bitrate=2_000, path="/media/movies/Delete Review/20.mkv"),
@@ -630,7 +632,7 @@ class DeleteFlowTest(unittest.TestCase):
             10,
             1,
             2,
-            "DELETE FILES 10 SUBTITLES 1 %s" % ("d" * 12),
+            "DELETE MEDIA 10 SUBTITLES 1 %s" % ("d" * 12),
             plan_digest="d" * 64,
         )
 
@@ -641,6 +643,8 @@ class DeleteFlowTest(unittest.TestCase):
         self.assertEqual(
             harness.direct_execute_calls[0][1]["expected_digest"], "d" * 64
         )
+        self.assertIs(harness.direct_execute_calls[0][1]["gateway"], gateway)
+        self.assertIs(harness.direct_execute_calls[0][1]["current_item"], before)
         self.assertEqual(len(manager.calls), 1)
         self.assertEqual(manager.wake_count, 1)
         self.assertEqual(harness.run.deletion_attempts, 1)
@@ -662,7 +666,7 @@ class DeleteFlowTest(unittest.TestCase):
                 10,
                 1,
                 2,
-                "DELETE FILES 10 SUBTITLES 1 %s" % ("d" * 12),
+                "DELETE MEDIA 10 SUBTITLES 1 %s" % ("d" * 12),
                 plan_digest="d" * 64,
             )
 
