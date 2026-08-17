@@ -105,7 +105,11 @@ class DirectDeletePlanSafetyTest(unittest.TestCase):
         plan = self.plan()
         self.assertNotIn(str(self.delete_subtitle), {value.path for value in plan.eligible})
         excluded = {value.path: value.reason for value in plan.excluded}
-        self.assertEqual(excluded[str(self.delete_subtitle)], "symlink_or_reparse_not_safe")
+        self.assertEqual(
+            excluded[str(self.delete_subtitle)],
+            "required_backup_unavailable:symlink_or_reparse_not_safe",
+        )
+        self.assertFalse(plan.as_api()["executable"])
         self.assertEqual(outside.read_bytes(), b"outside")
 
     def test_unsupported_paired_subtitle_is_reported_but_not_deleted(self) -> None:
