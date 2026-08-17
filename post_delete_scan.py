@@ -137,6 +137,7 @@ class PostDeleteScanManager:
         section_locations: Sequence[str],
         mode: Optional[str] = None,
         batch_run_id: Optional[int] = None,
+        scan_candidate: Optional[Any] = None,
     ) -> List[ModelPostDeleteScanJob]:
         """Add jobs to the caller's current success transaction; never commit."""
 
@@ -146,8 +147,13 @@ class PostDeleteScanManager:
         if selected_mode not in ("binary", "web"):
             raise RuntimeError("삭제 후 Plex 스캔 방식 설정이 올바르지 않습니다.")
 
+        # The audit/candidate columns always identify the deleted version, but
+        # direct PMS deletion must scan the selected surviving version.  The
+        # deleted version's now-empty directory can legitimately disappear
+        # before this asynchronous worker starts.
+        target_source = scan_candidate if scan_candidate is not None else candidate
         targets = build_scan_targets(
-            group, candidate, current_item, section_locations
+            group, target_source, current_item, section_locations
         )
         if not targets:
             raise RuntimeError(
@@ -981,7 +987,16 @@ class PostDeleteScanManager:
         except PostDeleteScanPrearmFailed:
             status = "blocked"
             message = "Binary 실행 전 안전 격리 잠금을 확정하지 못해 실행하지 않았습니다."
-        except (PostDeleteScanBlocked, PlexAuthenticationError, PlexMateUnavailable):
+        except PostDeleteScanBlocked as exc:
+            status = "blocked"
+            # These messages are authored fixed strings and contain neither
+            # credentials nor driver parameters.  Preserve the exact safe
+            # reason so operators can distinguish a vanished keep folder from
+            # scanner configuration or section identity problems.
+            message = str(exc)[:2000] or (
+                "삭제 후 스캔 환경 검증에 실패했습니다. 설정과 경로를 확인하세요."
+            )
+        except (PlexAuthenticationError, PlexMateUnavailable):
             status = "blocked"
             message = "삭제 후 스캔 환경 검증에 실패했습니다. 설정과 경로를 확인하세요."
         except PostDeleteScanUnverified:

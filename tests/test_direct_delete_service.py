@@ -211,10 +211,47 @@ class DirectDeleteServiceOrchestrationSafetyTest(unittest.TestCase):
         self.assertIs(direct.execute_calls[0][1]["gateway"], gateway)
         self.assertIs(direct.execute_calls[0][1]["current_item"], before)
         self.assertEqual(len(scans.calls), 1)
+        self.assertIs(scans.calls[0]["candidate"], harness.candidates[1])
+        self.assertIs(scans.calls[0]["scan_candidate"], harness.candidates[2])
+        self.assertEqual(len(scans.jobs), 1)
         self.assertEqual(scans.wake_count, 1)
         self.assertEqual(harness.run.deletion_attempts, 1)
         self.assertFalse(harness.candidates[1].deleted)
         self.assertEqual(harness.group.resolution_status, "delete_in_progress")
+
+    def test_section_root_keep_target_blocks_before_direct_execution(self) -> None:
+        before = _item(
+            _version(
+                "10",
+                path="/media/movies/Deleted Folder/10.mkv",
+            ),
+            _version(
+                "20",
+                bitrate=2_000,
+                path="/media/movies/20.mkv",
+            ),
+        )
+        harness = DeleteServiceHarness(before)
+        self.configure(harness)
+        gateway = _Gateway([before])
+        direct = _DirectManager()
+        scans = _ScanManager()
+        service = harness.service_for(gateway, scans)
+        service.direct_delete_manager = direct
+
+        with self.assertRaisesRegex(RuntimeError, "유지 Media"):
+            service.delete(
+                10,
+                1,
+                2,
+                "DELETE MEDIA 10 SUBTITLES 1 %s" % ("a" * 12),
+                plan_digest="a" * 64,
+            )
+
+        self.assertEqual(direct.execute_calls, [])
+        self.assertEqual(gateway.delete_calls, [])
+        self.assertEqual(scans.calls, [])
+        self.assertEqual(harness.run.deletion_attempts, 0)
 
     def test_backup_blocked_state_survives_outer_catch_without_pms_delete(self) -> None:
         before = self.item()

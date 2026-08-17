@@ -754,6 +754,60 @@ class SQLiteDeletionLeaseIntegrationTest(unittest.TestCase):
                 )
             )
 
+    def test_scan_candidate_selects_target_without_changing_deleted_candidate_audit(self) -> None:
+        manager = self.post_scan_module.PostDeleteScanManager()
+        run, group, candidate, action, _current = self._scan_enqueue_values()
+        keep = types.SimpleNamespace(id=4, media_id="20")
+        current = MetadataItem(
+            rating_key="100",
+            guid="plex://movie/outbox-keep-target",
+            media_type="movie",
+            title="Example",
+            media=(
+                MediaVersion(
+                    media_id="10",
+                    duration=1,
+                    parts=(
+                        MediaPart(
+                            "101",
+                            "/library/movies/Deleted Folder/deleted.mkv",
+                        ),
+                    ),
+                ),
+                MediaVersion(
+                    media_id="20",
+                    duration=1,
+                    parts=(
+                        MediaPart(
+                            "201",
+                            "/library/movies/Retained Folder/retained.mkv",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        with self.app.app_context():
+            jobs = manager.enqueue_confirmed(
+                run,
+                group,
+                candidate,
+                action,
+                current,
+                section_locations=["/library/movies"],
+                mode="binary",
+                scan_candidate=keep,
+            )
+
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].candidate_id, candidate.id)
+            self.assertEqual(
+                jobs[0].target_path,
+                "/library/movies/Retained Folder",
+            )
+            self.assertEqual(jobs[0].action_log_id, action.id)
+            self.db.session.rollback()
+
     def test_batch_enqueue_deduplicates_target_and_retains_all_action_ids(self) -> None:
         manager = self.post_scan_module.PostDeleteScanManager()
         with self.app.app_context():
@@ -1224,22 +1278,37 @@ class SQLiteDeletionLeaseIntegrationTest(unittest.TestCase):
                     bool(lease.owner_token),
                     stored.status,
                     bool(stored.worker_token),
+                    message,
                 )
             )
 
         manager.failure_callback = failure_callback
-        blocked = self.post_scan_module.PostDeleteScanBlocked("blocked")
+        blocked = self.post_scan_module.PostDeleteScanBlocked(
+            "Binary 스캐너에서 부분 스캔 폴더에 접근할 수 없습니다."
+        )
         with mock.patch.object(manager, "_execute", side_effect=blocked):
             self.assertTrue(manager.process_one())
 
         self.assertEqual(
             observed,
-            [("blocked", "post_scan", str(job_id), True, "running", True)],
+            [
+                (
+                    "blocked",
+                    "post_scan",
+                    str(job_id),
+                    True,
+                    "running",
+                    True,
+                    "Binary 스캐너에서 부분 스캔 폴더에 접근할 수 없습니다.",
+                )
+            ],
         )
         with self.app.app_context():
+            stored = self.models.ModelPostDeleteScanJob.get(job_id)
+            self.assertEqual(stored.status, "blocked")
             self.assertEqual(
-                self.models.ModelPostDeleteScanJob.get(job_id).status,
-                "blocked",
+                stored.last_error,
+                "Binary 스캐너에서 부분 스캔 폴더에 접근할 수 없습니다.",
             )
             self.assertEqual(
                 self.models.ModelDeletionLease.get_singleton().owner_token,

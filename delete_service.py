@@ -51,6 +51,31 @@ def _timeout() -> int:
         return 20
 
 
+def _single_surviving_scan_target(
+    group: Any,
+    keep: Any,
+    current_item: Any,
+    section_locations: Tuple[str, ...],
+    allowed_roots: Tuple[str, ...],
+) -> str:
+    """Return one narrow target derived from the selected surviving Media.
+
+    A direct PMS delete may remove the candidate's final file and directory.
+    Binding the outbox to that directory produces a false terminal block.  A
+    target derived from the selected keep version remains item-scoped while
+    also proving that a retained file is still visible before mutation.
+    """
+
+    targets = build_scan_targets(group, keep, current_item, section_locations)
+    if len(targets) != 1 or not validate_scan_target(
+        targets[0], section_locations, allowed_roots
+    ):
+        raise RuntimeError(
+            "유지 Media의 정확한 단일 Plex 부분 스캔 폴더를 확인할 수 없습니다."
+        )
+    return targets[0]
+
+
 class DeleteService:
     def __init__(self, post_delete_scan_manager: Optional[Any] = None) -> None:
         self._lock = threading.Lock()
@@ -889,6 +914,13 @@ class DeleteService:
                         safety_policy.allowed_roots,
                         tuple(section.locations),
                     )
+                    _single_surviving_scan_target(
+                        group,
+                        keep,
+                        current,
+                        tuple(section.locations),
+                        tuple(safety_policy.allowed_roots),
+                    )
                 cleanup = plan.public_dict()
                 plan_digest = plan.plan_digest
                 if backend == "quarantine":
@@ -1193,6 +1225,7 @@ class DeleteService:
                 post_scan_mode = self._post_delete_scan_mode()
                 post_scan_locations: Tuple[str, ...] = ()
                 all_section_locations: Tuple[str, ...] = ()
+                post_scan_targets: Tuple[str, ...] = ()
                 if post_scan_mode != "none":
                     if self.post_delete_scan_manager is None:
                         raise RuntimeError(
@@ -1218,20 +1251,22 @@ class DeleteService:
                     all_section_locations = tuple(
                         location for item in sections for location in item.locations
                     )
-                    post_scan_targets = build_scan_targets(
-                        group, candidate, current, post_scan_locations
-                    )
-                    if not post_scan_targets or any(
-                        not validate_scan_target(
-                            target,
-                            post_scan_locations,
-                            safety_policy.allowed_roots,
+                    if delete_backend != "direct":
+                        values = build_scan_targets(
+                            group, candidate, current, post_scan_locations
                         )
-                        for target in post_scan_targets
-                    ):
-                        raise RuntimeError(
-                            "삭제 대상의 정확한 Plex 부분 스캔 폴더를 확인할 수 없습니다."
-                        )
+                        if not values or any(
+                            not validate_scan_target(
+                                target,
+                                post_scan_locations,
+                                safety_policy.allowed_roots,
+                            )
+                            for target in values
+                        ):
+                            raise RuntimeError(
+                                "삭제 대상의 정확한 Plex 부분 스캔 폴더를 확인할 수 없습니다."
+                            )
+                        post_scan_targets = tuple(values)
 
                 if delete_backend == "quarantine":
                     if post_scan_mode not in ("binary", "web"):
@@ -1367,6 +1402,13 @@ class DeleteService:
                         safety_policy.allowed_roots,
                         post_scan_locations,
                     )
+                    _single_surviving_scan_target(
+                        group,
+                        keep,
+                        current,
+                        post_scan_locations,
+                        tuple(safety_policy.allowed_roots),
+                    )
                     expected_confirmation = "DELETE MEDIA %s SUBTITLES %s %s" % (
                         candidate.media_id,
                         len(plan.eligible),
@@ -1433,10 +1475,15 @@ class DeleteService:
                             section_locations=post_scan_locations,
                             mode=post_scan_mode,
                             batch_run_id=batch_run_id,
+                            scan_candidate=keep,
                         )
                         if not post_scan_jobs:
                             raise RuntimeError(
                                 "직접 삭제 후 Plex 부분 스캔 작업이 생성되지 않았습니다."
+                            )
+                        if len(post_scan_jobs) != 1:
+                            raise RuntimeError(
+                                "유지 Media의 부분 스캔 작업이 단일 대상으로 생성되지 않았습니다."
                             )
                         F.db.session.commit()
                     except Exception:

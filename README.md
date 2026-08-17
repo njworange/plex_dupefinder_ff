@@ -1,6 +1,6 @@
 # Plex DupeFinder FF
 
-현재 버전: `1.5.0`
+현재 버전: `1.5.1`
 
 `plex_dupefinder_ff`는 FlaskFarm에서 동작하는 Plex 중복 검사, **그룹별 수동 처리**, **일괄 승인형 반자동 처리** 플러그인입니다.
 
@@ -141,7 +141,7 @@ Binary 또는 Web 부분 스캔과 최종 유지본 검증까지 성공한 뒤�
 - 단건·배치 공용 전역 DB lease, 승인된 배치의 항목별 갱신 및 DB 원자 선점
 - 일괄 계획 생성·승인·각 항목 시작 시 점수와 안전 설정 snapshot 일치
 - 일괄 계획 내 다른 그룹을 포함한 동일 Part 경로 교차 참조 없음
-- 사후 부분 스캔을 Binary/Web으로 선택한 경우 현재 PMS section/Location에서 정확한 영화 폴더 또는 TV 쇼 루트 산정 성공
+- 사후 부분 스캔을 Binary/Web으로 선택한 경우 현재 PMS section/Location에서 정확한 영화 폴더 또는 TV 쇼 루트 산정 성공. `direct` 방식은 삭제 뒤 사라질 수 있는 후보 폴더가 아니라 사용자가 선택한 유지 Media의 폴더/쇼 루트 하나를 고정합니다.
 
 개별 삭제에서는 정확한 확인 문구를 입력한 뒤 별도의 브라우저 최종 확인창을 띄우지 않습니다. 서버는 실행할 때마다 Flask session CSRF, 짧게 유효한 일회용 nonce, 승인된 plan digest와 정확한 확인 문구를 계속 검증하며, 일괄 승인 실행의 별도 브라우저 확인은 유지합니다.
 
@@ -153,7 +153,7 @@ DELETE 요청이 timeout되거나 연결 결과를 확정할 수 없으면 같�
 
 `삭제 성공 후 Plex 부분 스캔 방식`의 호환 기본값은 `사용 안 함(none)`입니다. 기존 Plex 방식에서는 Plex DELETE가 완료되고 Media 사후 재조회로 삭제 결과가 정확히 확인된 경우에만 durable outbox에 비파괴 스캔 요청을 기록합니다. 안전 격리와 Plex DELETE + 외부 자막 정리 방식에서는 PMS DB 반영과 유지본 검증에 부분 스캔이 필수이므로 `none`을 허용하지 않습니다. 외부 자막 정리 방식은 PMS DELETE 결과를 정확히 확인하고 보호 자막을 복원하며 전용 자막을 정리한 뒤에만 부분 스캔을 요청합니다.
 
-Binary 또는 Web을 선택하면 파일 처리 전에 현재 PMS에서 library section, 타입과 Location을 다시 읽고 모든 대상 Part에 대한 정확한 스캔 경로를 먼저 만듭니다. 영화 폴더나 TV 쇼 루트를 하나라도 안전하게 계산할 수 없거나 경로가 section/삭제 허용 루트를 벗어나면 DELETE, 격리 이동 또는 외부 자막 정리를 시작하지 않습니다. 기존 Plex 방식의 사후 스캔 전달은 best-effort지만 그 대상 경로를 정확히 준비하는 것은 파일 처리의 필수 사전조건입니다. 안전 격리와 Plex DELETE + 외부 자막 정리에서는 부분 스캔과 유지본 사후검증이 성공 확정의 일부입니다. 기존 Plex 방식에서만 이 추가 차단을 원하지 않을 때 기본값 `none`을 유지할 수 있습니다.
+Binary 또는 Web을 선택하면 파일 처리 전에 현재 PMS에서 library section, 타입과 Location을 다시 읽고 정확한 스캔 경로를 먼저 만듭니다. 영화 폴더나 TV 쇼 루트를 안전하게 계산할 수 없거나 경로가 section/삭제 허용 루트를 벗어나면 DELETE, 격리 이동 또는 외부 자막 정리를 시작하지 않습니다. `direct` 방식은 Plex DELETE 뒤 빈 후보 폴더가 정상적으로 사라질 수 있으므로, 사용자가 지정한 유지 Media에서 정확히 하나의 영화 폴더 또는 TV 쇼 루트를 계산해 durable outbox에 고정합니다. 유지 대상이 section 루트에 직접 있어 부분 스캔이 전체 library로 넓어지거나 유지 폴더가 실행 전에 사라지면 성공으로 간주하지 않고 차단합니다. 기존 Plex 방식의 사후 스캔 전달은 best-effort지만 그 대상 경로를 정확히 준비하는 것은 파일 처리의 필수 사전조건입니다. 안전 격리와 Plex DELETE + 외부 자막 정리에서는 부분 스캔과 유지본 사후검증이 성공 확정의 일부입니다. 기존 Plex 방식에서만 이 추가 차단을 원하지 않을 때 기본값 `none`을 유지할 수 있습니다.
 
 - `Binary`: 로드된 `plex_mate`의 `PlexBinaryScanner.scan_refresh(section_id, path)`를 사용합니다. FlaskFarm/PlexMate 실행 환경에서 Plex Media Scanner binary, 실행 사용자·권한과 Plex가 반환한 파일 경로에 접근할 수 있어야 합니다.
 - `Web`: `plex_mate`에서 지연 조회한 URL·Token을 사용해 이 플러그인의 header-auth Plex client가 부분 스캔을 요청합니다. 대상 library section ID와 Plex 서버에서 보이는 경로가 필요합니다.

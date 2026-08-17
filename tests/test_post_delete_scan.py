@@ -65,6 +65,124 @@ class PostDeleteScanTargetTests(unittest.TestCase):
 
         self.assertEqual(targets, ["/library/tv/Example Show"])
 
+    def test_movie_can_bind_scan_target_to_selected_surviving_media(self) -> None:
+        current = MetadataItem(
+            rating_key="100",
+            guid="plex://movie/post-delete-keep-target",
+            media_type="movie",
+            title="Example",
+            media=(
+                MediaVersion(
+                    media_id="10",
+                    duration=1,
+                    parts=(
+                        MediaPart(
+                            "101",
+                            "/library/movies/Deleted Folder/deleted.mkv",
+                        ),
+                    ),
+                ),
+                MediaVersion(
+                    media_id="20",
+                    duration=1,
+                    parts=(
+                        MediaPart(
+                            "201",
+                            "/library/movies/Retained Folder/retained.mkv",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        targets = build_scan_targets(
+            types.SimpleNamespace(media_type="movie"),
+            types.SimpleNamespace(media_id="20"),
+            current,
+            ["/library/movies"],
+        )
+
+        self.assertEqual(targets, ["/library/movies/Retained Folder"])
+
+    def test_episode_can_bind_scan_target_to_selected_surviving_show_root(self) -> None:
+        current = MetadataItem(
+            rating_key="100",
+            guid="plex://episode/post-delete-keep-target",
+            media_type="episode",
+            title="Episode",
+            grandparent_title="Example Show",
+            grandparent_rating_key="50",
+            parent_index=1,
+            index=2,
+            media=(
+                MediaVersion(
+                    media_id="10",
+                    duration=1,
+                    parts=(
+                        MediaPart(
+                            "101",
+                            "/library/tv-old/Example Show/Season 01/deleted.mkv",
+                        ),
+                    ),
+                ),
+                MediaVersion(
+                    media_id="20",
+                    duration=1,
+                    parts=(
+                        MediaPart(
+                            "201",
+                            "/library/tv-new/Example Show/Season 01/retained.mkv",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        targets = build_scan_targets(
+            types.SimpleNamespace(media_type="episode"),
+            types.SimpleNamespace(media_id="20"),
+            current,
+            ["/library/tv-old", "/library/tv-new"],
+        )
+
+        self.assertEqual(targets, ["/library/tv-new/Example Show"])
+
+    def test_surviving_movie_directly_under_section_root_is_not_widened(self) -> None:
+        current = MetadataItem(
+            rating_key="100",
+            guid="plex://movie/post-delete-no-wide-target",
+            media_type="movie",
+            title="Example",
+            media=(
+                MediaVersion(
+                    media_id="10",
+                    duration=1,
+                    parts=(
+                        MediaPart(
+                            "101",
+                            "/library/movies/Deleted Folder/deleted.mkv",
+                        ),
+                    ),
+                ),
+                MediaVersion(
+                    media_id="20",
+                    duration=1,
+                    parts=(
+                        MediaPart("201", "/library/movies/retained.mkv"),
+                    ),
+                ),
+            ),
+        )
+
+        targets = build_scan_targets(
+            types.SimpleNamespace(media_type="movie"),
+            types.SimpleNamespace(media_id="20"),
+            current,
+            ["/library/movies"],
+        )
+
+        self.assertEqual(targets, [])
+
     def test_multiple_parts_are_deduplicated_without_widening_movie_target(self) -> None:
         group = types.SimpleNamespace(media_type="movie")
 

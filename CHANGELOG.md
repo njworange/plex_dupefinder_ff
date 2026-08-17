@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.1
+
+- Changed hybrid direct-delete partial scans to target the user-selected surviving Media folder (or TV show root) instead of the deleted candidate folder, so a normally removed empty candidate directory no longer produces a false terminal `blocked` result.
+- Kept the scan target narrow and fail-closed: direct deletion requires exactly one retained target inside the current Plex Location and allowed roots, never widens to a section/library root, and still blocks if the retained target disappears before the worker runs.
+- Preserved fixed, credential-free `PostDeleteScanBlocked` reasons in job history so missing retained folders, scanner configuration, section identity and path-policy failures are distinguishable.
+
 ## 1.5.0
 
 - Changed the persisted `direct` mode from FlaskFarm-side video unlinking to one PMS Media DELETE followed by separate cleanup of target-exclusive same-stem external subtitles, eliminating the mergerfs video-rename `EXDEV` path.
