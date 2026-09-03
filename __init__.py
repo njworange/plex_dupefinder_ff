@@ -1,3 +1,3 @@
-"""FlaskFarm plugin package for safe Plex duplicate management."""
+"""Minimal FlaskFarm Plex duplicate cleanup plugin."""
 
-__version__ = "1.6.1"
+__version__ = "2.0.0"

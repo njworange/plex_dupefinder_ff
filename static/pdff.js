@@ -1,335 +1,239 @@
-(function (window, $) {
+(function (global) {
   'use strict';
 
-  function esc(value) {
-    return String(value === null || value === undefined ? '' : value)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+  function valueText(value) {
+    if (value === null || value === undefined || value === '') return '-';
+    return String(value);
   }
 
-  function notify(message, type) {
-    var safe = esc(message || '요청을 처리할 수 없습니다.');
-    if ($ && $.notify) $.notify('<strong>' + safe + '</strong>', {type: type || 'info'});
-    else window.alert(String(message || '요청을 처리할 수 없습니다.'));
-  }
-
-  function request(packageName, moduleName, action, data, method, callback) {
-    $.ajax({
-      url: '/' + packageName + '/ajax/' + moduleName + '/' + action,
-      type: method || 'GET',
-      cache: false,
-      data: data || {},
-      dataType: 'json',
-      success: function (ret) {
-        if (ret && ret.ret !== 'success' && ret.msg) notify(ret.msg, 'warning');
-        if (typeof callback === 'function') callback(ret || {});
-      },
-      error: function (xhr) {
-        var ret = xhr.responseJSON || {};
-        notify(ret.msg || '서버 요청이 실패했습니다.', 'danger');
-        if (typeof callback === 'function') callback(ret);
-      }
-    });
+  function number(value) {
+    var parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
   }
 
   function bytes(value) {
-    var size = Number(value || 0);
-    if (!isFinite(size) || size <= 0) return '-';
-    var units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    var index = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
-    return (size / Math.pow(1024, index)).toFixed(index < 2 ? 0 : 2) + ' ' + units[index];
+    var amount = number(value);
+    var units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    var unit = 0;
+    while (amount >= 1024 && unit < units.length - 1) {
+      amount /= 1024;
+      unit += 1;
+    }
+    var digits = unit === 0 || amount >= 100 ? 0 : (amount >= 10 ? 1 : 2);
+    return amount.toFixed(digits) + ' ' + units[unit];
   }
 
-  function duration(value) {
-    var seconds = Math.round(Number(value || 0) / 1000);
-    if (!seconds) return '-';
-    var hours = Math.floor(seconds / 3600);
-    var minutes = Math.floor((seconds % 3600) / 60);
-    var remain = seconds % 60;
-    return (hours ? hours + ':' : '') + String(minutes).padStart(2, '0') + ':' + String(remain).padStart(2, '0');
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function element(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = valueText(text);
+    return node;
+  }
+
+  function appendField(parent, label, value, className) {
+    var field = element('div', className || 'pdff-field');
+    field.appendChild(element('span', 'pdff-label', label));
+    field.appendChild(element('span', 'pdff-value', value));
+    parent.appendChild(field);
+  }
+
+  function statusClass(status) {
+    var key = String(status || '').toLowerCase();
+    if (key === 'success' || key === 'completed' || key === 'deleted' || key === 'would_delete') return 'pdff-status-success';
+    if (key === 'partial' || key === 'stopping' || key === 'stopped' || key === 'interrupted' || key === 'skipped' || key === 'completed_with_errors') return 'pdff-status-warning';
+    if (key === 'error' || key === 'failed' || key === 'unknown') return 'pdff-status-danger';
+    if (key === 'running' || key === 'deleting' || key === 'queued') return 'pdff-status-running';
+    return 'pdff-status-neutral';
+  }
+
+  function statusBadge(status) {
+    var badge = element('span', 'pdff-status ' + statusClass(status), status || 'unknown');
+    return badge;
   }
 
   function date(value) {
     if (!value) return '-';
     var parsed = new Date(value);
-    return isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
+    return Number.isNaN(parsed.getTime()) ? valueText(value) : parsed.toLocaleString();
   }
 
-  function badge(status) {
-    var key = String(status || 'unknown').toLowerCase();
-    var kind = 'pdff-secondary';
-    if (['completed', 'success', 'succeeded', 'safe', 'quarantined', 'deleted'].indexOf(key) >= 0) kind = 'pdff-success';
-    else if (['running', 'executing', 'approved', 'queued', 'deleted_pending_scan'].indexOf(key) >= 0) kind = 'pdff-primary';
-    else if (['planned', 'preview', 'ready', 'draft', 'pending', 'skipped'].indexOf(key) >= 0) kind = 'pdff-secondary';
-    else if (['cancelled', 'cancelling', 'completed_with_warnings', 'completed_with_errors', 'unknown', 'stopped', 'interrupted', 'expired', 'retry_wait', 'unverified'].indexOf(key) >= 0) kind = 'pdff-warning-badge';
-    else if (['failed', 'blocked', 'critical', 'verification_failed', 'recovery_required'].indexOf(key) >= 0) kind = 'pdff-danger-badge';
-    return '<span class="pdff-badge ' + kind + '">' + esc(status || '-') + '</span>';
+  function mode(value) {
+    if (value === 'dry_run') return 'Dry Run';
+    if (value === 'live') return '즉시 자동 정리';
+    return valueText(value);
   }
 
-  function deleteBudget(value) {
-    value = value && typeof value === 'object' ? value : {};
-    var nested = value.delete_budget;
-    var budget = nested && typeof nested === 'object' ? nested : value;
-    var attemptedRaw = budget.attempted !== undefined
-      ? budget.attempted : value.deletion_attempts;
-    var attempted = Number(attemptedRaw);
-    if ((typeof attemptedRaw !== 'number' && typeof attemptedRaw !== 'string') ||
-        String(attemptedRaw).trim() === '' || !Number.isInteger(attempted) ||
-        attempted < 0) attempted = 0;
-    return {
-      unlimited: true,
-      attempted: attempted,
-      limit: null,
-      remaining: null,
-      exhausted: false
-    };
-  }
-
-  function flagLabel(flag) {
-    var labels = {
-      unsupported_media_type: '지원하지 않는 미디어 타입', less_than_two_versions: '버전 2개 미만',
-      missing_guid: 'GUID 없음', missing_episode_identity: 'TV 회차 식별정보 없음',
-      missing_media_id: 'Media ID 없음', duplicate_media_id: 'Media ID 중복',
-      missing_file_path: '파일 경로 없음', multipart_version: '멀티파트 버전',
-      shared_file_path: '버전 간 동일 파일 경로', path_outside_allowed_roots: '허용 경로 밖',
-      invalid_allowed_root: '허용 루트가 절대 경로가 아님', non_absolute_file_path: '미디어 경로가 절대 경로가 아님',
-      missing_machine_id: 'Machine ID 미설정', rescan_required_after_delete: '삭제 후 재스캔 필요',
-      delete_outcome_unknown: '삭제 결과 확인 필요', delete_verification_failed: '삭제 대상 재확인 실패',
-      delete_postcheck_critical: '유지 버전 재확인 실패', delete_postcheck_media_set_changed: '삭제 후 Media 집합 변경',
-      delete_postcheck_snapshot_changed: '삭제 후 남은 Media 정보 변경',
-      delete_precheck_blocked: '삭제 전 재검증 차단', restart_delete_validation_interrupted: '재시작으로 삭제 검증 중단',
-      restart_delete_outcome_unknown: '재시작 후 삭제 결과 확인 필요',
-      direct_delete_recovery_required: 'Plex DELETE + 자막 정리 결과 수동 확인 필요'
-    };
-    return labels[flag] || flag;
-  }
-
-  function redact(value, key) {
-    if (key && /(token|password|secret|authorization|cookie)/i.test(String(key))) return '[REDACTED]';
-    if (key && /(backup|protection)/i.test(String(key))) return '[REDACTED]';
-    if (Array.isArray(value)) return value.map(function (item) { return redact(item); });
-    if (value && typeof value === 'object') {
-      var clean = {};
-      Object.keys(value).forEach(function (name) { clean[name] = redact(value[name], name); });
-      return clean;
+  function current(value) {
+    if (!value) return '-';
+    if (typeof value === 'string' || typeof value === 'number') return valueText(value);
+    if (typeof value === 'object') {
+      return valueText(value.title || value.rating_key || value.file_path || value.id);
     }
-    if (typeof value === 'string') {
-      return value.replace(/([?&]X-Plex-Token=)[^&\s]+/ig, '$1[REDACTED]');
-    }
-    return value;
+    return '-';
   }
 
-  function subtitleCleanup(value) {
-    value = value && typeof value === 'object' ? value : {};
-    var cleanup = value.subtitle_cleanup && typeof value.subtitle_cleanup === 'object'
-      ? value.subtitle_cleanup : value;
-    var eligible = cleanup.eligible || cleanup.included_subtitles || [];
-    var excluded = cleanup.excluded || cleanup.excluded_subtitles || [];
-    var protectedEntries = cleanup.protected || cleanup.protected_subtitles || [];
-    if (!Array.isArray(eligible)) eligible = [];
-    if (!Array.isArray(excluded)) excluded = [];
-    if (!Array.isArray(protectedEntries)) protectedEntries = [];
-    var counts = cleanup.counts && typeof cleanup.counts === 'object' ? cleanup.counts : {};
-    var backend = String(cleanup.backend || value.backend || '');
-    var recoveryDiagnostics = cleanup.recovery_diagnostics !== undefined
-      ? cleanup.recovery_diagnostics : value.recovery_diagnostics;
-    if (!Array.isArray(recoveryDiagnostics) && (!recoveryDiagnostics || typeof recoveryDiagnostics !== 'object')) {
-      recoveryDiagnostics = [];
+  function sidecarItems(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== 'string' || value.trim() === '') return [];
+    try {
+      var parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      return [];
     }
-    var detailsPresent = ['eligible', 'excluded', 'included_subtitles', 'excluded_subtitles'].some(function (key) {
-      return Object.prototype.hasOwnProperty.call(cleanup, key);
+  }
+
+  function renderSidecars(parent, sidecars) {
+    var items = sidecarItems(sidecars);
+    if (!items.length) return;
+    var details = element('details', 'pdff-sidecars');
+    details.appendChild(element('summary', '', '외부 자막 ' + items.length + '개'));
+    var list = element('ul', 'pdff-sidecar-list');
+    items.forEach(function (item) {
+      var textValue;
+      if (item && typeof item === 'object') {
+        var path = item.path || item.file_path || item.source_path || '-';
+        var result = item.status || item.result || '';
+        textValue = result ? path + ' · ' + result : path;
+      } else {
+        textValue = item;
+      }
+      list.appendChild(element('li', 'pdff-path', textValue));
     });
-    var protectedDetailsPresent = ['protected', 'protected_subtitles'].some(function (key) {
-      return Object.prototype.hasOwnProperty.call(cleanup, key);
+    details.appendChild(list);
+    parent.appendChild(details);
+  }
+
+  function renderActions(targetId, actions, limit) {
+    var target = document.getElementById(targetId);
+    if (!target) return;
+    clear(target);
+    var items = Array.isArray(actions) ? actions : [];
+    if (Number.isInteger(limit) && limit >= 0) items = items.slice(0, limit);
+    if (!items.length) {
+      target.className = 'pdff-empty';
+      target.textContent = '최근 작업이 없습니다.';
+      return;
+    }
+    target.className = 'pdff-list';
+    items.forEach(function (item) {
+      var action = item && typeof item === 'object' ? item : {};
+      var card = element('article', 'pdff-card');
+      var heading = element('div', 'pdff-card-heading');
+      var title = action.title || action.file_path || ('작업 #' + valueText(action.id));
+      heading.appendChild(element('strong', 'pdff-card-title', title));
+      heading.appendChild(statusBadge(action.status));
+      card.appendChild(heading);
+
+      var fields = element('div', 'pdff-card-grid');
+      appendField(fields, '모드', mode(action.mode));
+      appendField(fields, 'Library', action.section_id);
+      appendField(fields, 'Plex ID', action.rating_key);
+      appendField(fields, '유지 / 삭제', valueText(action.keep_media_id) + ' / ' + valueText(action.delete_media_id));
+      appendField(fields, '점수', valueText(action.keep_score) + ' / ' + valueText(action.delete_score));
+      if (action.file_size !== null && action.file_size !== undefined) {
+        appendField(fields, '영상 크기', bytes(action.file_size));
+      }
+      appendField(fields, 'HTTP', action.response_status);
+      appendField(fields, '시각', date(action.finished_at || action.created_at));
+      card.appendChild(fields);
+
+      if (action.file_path) appendField(card, '영상 경로', action.file_path, 'pdff-field pdff-path');
+      if (action.message) appendField(card, '결과', action.message, 'pdff-field');
+      renderSidecars(card, action.sidecars);
+      target.appendChild(card);
     });
-    return {
-      present: Boolean(value.subtitle_cleanup || cleanup.included_subtitles || cleanup.excluded_subtitles || cleanup.protected_subtitles || cleanup.eligible || cleanup.excluded || cleanup.protected || backend),
-      detailsPresent: detailsPresent,
-      protectedDetailsPresent: protectedDetailsPresent,
-      enabled: cleanup.enabled === true || backend === 'quarantine' || backend === 'direct',
-      executable: cleanup.executable !== false,
-      backend: backend || 'plex',
-      status: String(cleanup.status || ((backend === 'quarantine' || backend === 'direct') ? 'planned' : 'disabled')),
-      message: String(cleanup.message || value.message || ''),
-      operationId: String(cleanup.operation_id || value.operation_id || ''),
-      recoveryDiagnostics: recoveryDiagnostics,
-      planDigest: String(cleanup.plan_digest || value.plan_digest || ''),
-      quarantineDir: String(cleanup.quarantine_dir || cleanup.quarantine_root || ''),
-      eligible: eligible,
-      excluded: excluded,
-      protected: protectedEntries,
-      eligibleCount: Number(counts.eligible !== undefined ? counts.eligible : eligible.length) || 0,
-      excludedCount: Number(counts.excluded !== undefined ? counts.excluded : excluded.length) || 0,
-      protectedCount: Number(counts.protected !== undefined ? counts.protected : protectedEntries.length) || 0,
-      blockingCount: Number(counts.blocking || 0) || 0,
-      quarantinedCount: Number(counts.quarantined || 0) || 0,
-      deletedCount: Number(counts.deleted || 0) || 0
-    };
   }
 
-  function recoveryDiagnosticStates(value) {
-    var labels = {
-      source_only: '원본 존재',
-      tombstone_only: '임시파일 존재·수동 복구 필요',
-      both_absent: '둘 다 없음·삭제 여부 수동 확인',
-      conflict: '충돌',
-      both_present: '충돌',
-      unreadable: '경로 상태 확인 불가·수동 확인'
-    };
-    var states = [];
-    function add(state) {
-      state = String(state || '');
-      if (Object.prototype.hasOwnProperty.call(labels, state)) states.push(labels[state]);
+  function renderRuns(targetId, runs) {
+    var target = document.getElementById(targetId);
+    if (!target) return;
+    clear(target);
+    var items = Array.isArray(runs) ? runs : [];
+    if (!items.length) {
+      target.className = 'pdff-empty';
+      target.textContent = '최근 실행이 없습니다.';
+      return;
     }
-    function visit(node, depth) {
-      if (depth > 8 || node === null || node === undefined) return;
-      if (Array.isArray(node)) {
-        node.forEach(function (entry) { visit(entry, depth + 1); });
-        return;
-      }
-      if (typeof node === 'string') {
-        add(node);
-        return;
-      }
-      if (typeof node !== 'object') return;
-      if (Object.prototype.hasOwnProperty.call(node, 'state')) {
-        add(node.state);
-        return;
-      }
-      Object.keys(node).forEach(function (key) {
-        if (Object.prototype.hasOwnProperty.call(labels, key) && node[key]) add(key);
-        else visit(node[key], depth + 1);
-      });
-    }
-    visit(value, 0);
-    return states;
-  }
-
-  function subtitlePath(entry, eligible) {
-    if (typeof entry === 'string') return entry;
-    entry = entry && typeof entry === 'object' ? entry : {};
-    return String(eligible
-      ? (entry.source_path || entry.path || entry.file || '')
-      : (entry.path || entry.source_path || entry.file || ''));
-  }
-
-  function subtitleReason(entry, fallback) {
-    var value = entry && typeof entry === 'object' && entry.reason
-      ? String(entry.reason) : '';
-    var labels = {
-      exclusive_to_deleted_video: '삭제 영상에만 정확히 대응하는 일반 외부 자막',
-      ambiguous_owner: '같은 파일명을 쓰는 유지본이 있어 소유권이 모호함',
-      shared_with_surviving_or_sibling_video: '유지본 또는 다른 영상과 공유될 수 있음',
-      survivor_owned: '유지할 영상에 대응하는 자막',
-      subtitle_name_not_exclusive: '파일명만으로 삭제 영상 전용임을 증명할 수 없음',
-      unsupported_or_paired_subtitle_format: '쌍 파일 또는 현재 안전 처리 대상이 아닌 자막 형식',
-      symlink: '심볼릭 링크 또는 reparse 경로',
-      symlink_or_reparse_not_safe: '심볼릭 링크 또는 reparse 경로',
-      hardlink: '하드링크라 다른 경로와 파일 내용을 공유함',
-      hardlink_not_safe: '하드링크라 다른 경로와 파일 내용을 공유함',
-      subtitle_too_large: '자막 안전 크기 한도를 초과함',
-      not_regular_file: '일반 파일이 아님',
-      file_state_unverifiable: '파일 identity를 안전하게 확인할 수 없음',
-      different_filesystem: '영상과 다른 파일시스템이라 원자 격리를 보장할 수 없음',
-      subtitle_directory_reparse_point: '자막 폴더가 링크 또는 reparse 경로임',
-      protected_for_surviving_video: '유지할 영상의 보호 대상 자막',
-      protected_survivor_directory_sidecar: '유지 영상이 있는 폴더의 보호 대상 외부 자막'
-    };
-    if (value.indexOf('required_backup_unavailable:') === 0) {
-      var cause = value.slice('required_backup_unavailable:'.length);
-      return '필수 보호본을 안전하게 만들 수 없어 PMS DELETE 차단 (' + (labels[cause] || cause) + ')';
-    }
-    return labels[value] || value || fallback;
-  }
-
-  function subtitleCleanupHtml(value, phase) {
-    var cleanup = subtitleCleanup(value);
-    var direct = cleanup.backend === 'direct';
-    var quarantine = cleanup.backend === 'quarantine';
-    var recoveryRequired = cleanup.status === 'recovery_required' || cleanup.status === 'manual_check_required';
-    var isResult = phase === 'result' || cleanup.status === 'quarantined' || cleanup.status === 'deleted' || cleanup.status === 'deleted_pending_scan' || recoveryRequired;
-    var handledCount = isResult
-      ? (direct ? cleanup.deletedCount : cleanup.quarantinedCount)
-      : cleanup.eligibleCount;
-    var handledLabel = direct ? (isResult ? '전용 자막 정리 ' : '전용 자막 정리 예정 ') : '함께 격리 ';
-    var backendLabel = direct ? 'Plex DELETE + 자막 정리' : cleanup.backend;
-    var protectedPaths = {};
-    cleanup.protected.forEach(function (entry) {
-      protectedPaths[subtitlePath(entry, false)] = true;
+    target.className = 'pdff-list';
+    items.forEach(function (item) {
+      var run = item && typeof item === 'object' ? item : {};
+      var progress = run.progress && typeof run.progress === 'object' ? run.progress : {};
+      var summary = run.summary && typeof run.summary === 'object' ? run.summary : {};
+      var card = element('article', 'pdff-card');
+      var heading = element('div', 'pdff-card-heading');
+      heading.appendChild(element('strong', 'pdff-card-title', '실행 #' + valueText(run.id) + ' · ' + mode(run.mode)));
+      heading.appendChild(statusBadge(run.status));
+      card.appendChild(heading);
+      var fields = element('div', 'pdff-card-grid');
+      appendField(fields, '진행', number(progress.processed) + ' / ' + number(progress.total));
+      appendField(fields, '중복 그룹', number(summary.groups));
+      appendField(fields, '삭제', number(summary.deleted));
+      appendField(fields, '삭제 용량', bytes(summary.bytes));
+      appendField(fields, 'Dry Run 대상', number(summary.would_delete));
+      appendField(fields, '예상 확보 용량', bytes(summary.would_delete_bytes));
+      appendField(fields, '부분 완료 / 오류', number(summary.partial) + ' / ' + number(summary.errors));
+      appendField(fields, '시작', date(run.started_at || run.created_at));
+      appendField(fields, '종료', date(run.finished_at));
+      card.appendChild(fields);
+      if (run.current) appendField(card, '현재 항목', current(run.current), 'pdff-field');
+      if (run.message) appendField(card, '결과', run.message, 'pdff-field');
+      target.appendChild(card);
     });
-    var reviewEntries = direct ? cleanup.excluded.filter(function (entry) {
-      return !protectedPaths[subtitlePath(entry, false)];
-    }) : cleanup.excluded;
-    var reviewLabel = direct
-      ? '보호 ' + cleanup.protectedCount + ' · 기타·차단 검토 '
-      : '위험 예외 ';
-    var reviewCount = direct ? Math.max(cleanup.blockingCount, reviewEntries.length) : cleanup.excludedCount;
-    var html = '<div class="pdff-subtitle-summary"><strong>외부 자막 안전 처리</strong> ' +
-      badge(cleanup.status) + '<span class="pdff-muted ml-2">방식 ' + esc(backendLabel) +
-      ' · ' + handledLabel + esc(handledCount) +
-      ' · ' + reviewLabel + esc(reviewCount) + '</span></div>';
-    if ((!quarantine && !direct) || !cleanup.enabled) {
-      return html + '<div class="pdff-danger mt-2">Plex Media DELETE 방식에서는 자막을 직접 선별·격리하지 않으며, PMS가 외부 자막을 어떻게 처리할지 이 플러그인이 보장할 수 없습니다.</div>';
-    }
-    html += direct
-      ? '<div class="pdff-danger mt-2"><strong>Plex DELETE + 자막 정리:</strong> 영상 삭제는 PMS에 한 번만 요청합니다. 그 전에 유지본·공유·모호 자막을 FlaskFarm data에 전체 SHA-256으로 보호하고, PMS 처리 뒤 삭제 대상 전용 자막만 남아 있으면 영구삭제합니다. 보호 대상이 누락되면 SHA-256을 검증해 원래 경로에 덮어쓰기 없이 복원하며, 보호할 수 없는 관련 파일이 있으면 PMS DELETE 전에 차단합니다. 보호본은 부분 스캔과 사후 검증 성공 뒤 정리됩니다.</div>'
-      : '<div class="pdff-muted mt-2">영구삭제가 아니라 격리 이동입니다. 승인한 목록과 파일 상태를 실행 직전에 정확히 재검증하며, 달라지면 아무 파일도 이동하지 않고 새 사전확인을 요구합니다. 모호한 자막은 이동하지 않습니다.</div>';
-    if (quarantine && cleanup.quarantineDir) {
-      html += '<div class="mt-2"><span class="pdff-kv-label">격리 위치</span><div class="pdff-code">' + esc(cleanup.quarantineDir) + '</div></div>';
-    }
-    if (cleanup.eligible.length) {
-      html += '<details class="pdff-subtitle-details mt-2" open><summary>' + handledLabel + esc(cleanup.eligible.length) + '개</summary>';
-      cleanup.eligible.forEach(function (entry) {
-        var destination = quarantine && entry && typeof entry === 'object'
-          ? String(entry.quarantine_path || entry.destination_path || '') : '';
-        html += '<div class="pdff-subtitle-entry pdff-subtitle-eligible"><div class="pdff-code">' + esc(subtitlePath(entry, true)) + '</div>' +
-          (destination ? '<div class="pdff-muted">→ ' + esc(destination) + '</div>' : '') +
-          '<div class="small">' + esc(subtitleReason(entry, '삭제 영상에만 대응하는 외부 자막')) + '</div></div>';
-      });
-      html += '</details>';
-    } else {
-      html += '<div class="pdff-muted mt-2">' + (direct ? 'PMS 처리 뒤 별도로 정리할' : '함께 격리할') + ' 전용 외부 자막이 없습니다.</div>';
-    }
-    if (direct && cleanup.protected.length) {
-      html += '<details class="pdff-subtitle-details mt-2" open><summary>PMS DELETE 전 SHA-256 보호·복원 대상 ' + esc(cleanup.protected.length) + '개</summary>';
-      cleanup.protected.forEach(function (entry) {
-        html += '<div class="pdff-subtitle-entry pdff-subtitle-eligible"><div class="pdff-code">' + esc(subtitlePath(entry, false)) + '</div>' +
-          '<div class="small"><strong>보호 사유:</strong> ' + esc(subtitleReason(entry, '유지본 자막 보호 대상')) + '</div></div>';
-      });
-      html += '</details>';
-    } else if (direct && cleanup.protectedCount > 0) {
-      html += '<div class="pdff-danger mt-2">보호 대상 경로 세부정보가 없어 실행하면 안 됩니다. 새 사전확인을 만드세요.</div>';
-    }
-    if (reviewEntries.length) {
-      html += '<details class="pdff-subtitle-details pdff-subtitle-exceptions mt-2" open><summary>' + (direct ? '기타·차단 검토 대상 ' : '위험·모호하여 제외 ') + esc(reviewEntries.length) + '개</summary>';
-      reviewEntries.forEach(function (entry) {
-        html += '<div class="pdff-subtitle-entry pdff-subtitle-excluded"><div class="pdff-code">' + esc(subtitlePath(entry, false)) + '</div>' +
-          '<div class="small"><strong>' + (direct ? '검토 사유:' : '보존 사유:') + '</strong> ' + esc(subtitleReason(entry, '유지본과의 관계를 안전하게 확정할 수 없음')) + '</div></div>';
-      });
-      html += '</details>';
-    }
-    if (direct && (!cleanup.executable || cleanup.blockingCount > 0)) {
-      html += '<div class="pdff-danger mt-2"><strong>PMS DELETE 전 차단:</strong> 필수 보호본을 만들 수 없는 관련 자막이 있어 이 계획을 실행할 수 없습니다. 파일 상태를 정리한 뒤 새 사전확인을 만드세요.</div>';
-    }
-    if (recoveryRequired) {
-      if (cleanup.message) {
-        html += '<div class="pdff-danger mt-2"><strong>실패 사유:</strong> ' + esc(cleanup.message) + '</div>';
-      }
-      if (cleanup.operationId) {
-        html += '<div class="pdff-muted mt-2"><span class="pdff-kv-label">작업 ID</span><span class="pdff-code">' + esc(cleanup.operationId) + '</span></div>';
-      }
-      var diagnosticStates = recoveryDiagnosticStates(cleanup.recoveryDiagnostics);
-      if (diagnosticStates.length) {
-        html += '<div class="pdff-danger mt-2"><strong>파일 상태 진단</strong><ul class="mb-0">';
-        diagnosticStates.forEach(function (label) {
-          html += '<li>' + esc(label) + '</li>';
-        });
-        html += '</ul></div>';
-      }
-      html += '<div class="pdff-danger mt-2"><strong>수동 확인 필요:</strong> Plex 및 외부 자막 처리 결과가 완결되지 않았습니다. 감사 상세, 실제 파일과 보호본 상태를 확인하세요.</div>';
-    }
-    return html;
   }
 
-  window.PDFF = {request: request, esc: esc, notify: notify, bytes: bytes, duration: duration, date: date, badge: badge, deleteBudget: deleteBudget, flagLabel: flagLabel, redact: redact, subtitleCleanup: subtitleCleanup, subtitleCleanupHtml: subtitleCleanupHtml};
-})(window, window.jQuery);
+  function payload(ret) {
+    if (ret && typeof ret === 'object' && ret.data && typeof ret.data === 'object') return ret.data;
+    return ret && typeof ret === 'object' ? ret : {};
+  }
+
+  function ok(ret) {
+    return Boolean(ret) && (ret.ret === 'success' || ret.success === true);
+  }
+
+  function messageText(ret, fallback) {
+    if (ret && typeof ret.msg === 'string' && ret.msg) return ret.msg;
+    if (ret && typeof ret.message === 'string' && ret.message) return ret.message;
+    return fallback;
+  }
+
+  function setText(id, value) {
+    var node = document.getElementById(id);
+    if (node) node.textContent = valueText(value);
+  }
+
+  function setProgress(id, percent) {
+    var node = document.getElementById(id);
+    if (!node) return;
+    var safe = Math.max(0, Math.min(100, number(percent)));
+    node.style.width = safe + '%';
+    node.setAttribute('aria-valuenow', String(safe));
+  }
+
+  function message(id, text, success) {
+    var node = document.getElementById(id);
+    if (!node) return;
+    node.textContent = text || '';
+    node.className = text ? 'pdff-message ' + (success ? 'pdff-message-success' : 'pdff-message-error') : 'pdff-message';
+  }
+
+  global.PDFF = Object.freeze({
+    bytes: bytes,
+    current: current,
+    date: date,
+    message: message,
+    messageText: messageText,
+    mode: mode,
+    number: number,
+    ok: ok,
+    payload: payload,
+    renderActions: renderActions,
+    renderRuns: renderRuns,
+    setProgress: setProgress,
+    setText: setText
+  });
+}(window));

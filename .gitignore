@@ -1,10 +1,11 @@
 __pycache__/
 *.py[cod]
-*.log
-*.db
 .pytest_cache/
 .coverage
+htmlcov/
 .idea/
 .vscode/
-.DS_Store
-Thumbs.db
+*.db
+*.sqlite*
+.env
+.testdeps/

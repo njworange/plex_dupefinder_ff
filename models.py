@@ -1,141 +1,18 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-from sqlalchemy import UniqueConstraint, or_
 
 from framework import F
 from plugin import ModelBase
 
 from .setup import P
 
+
 db = F.db
 
-
-# Deleting a row from Recent Scans is deliberately narrower than deleting an
-# audit history entry.  Only states produced by ScanManager as terminal states
-# are eligible; every unknown/future state fails closed.
-SCAN_RESULT_DELETE_ALLOWED_STATUSES = frozenset(
-    [
-        "completed",
-        "completed_with_warnings",
-        "cancelled",
-        "failed",
-        "interrupted",
-    ]
-)
-_SCAN_RESULT_DELETE_CLAIM_STATUS = "deleting_results"
-_SCAN_RESULT_TOMBSTONE_STATUS = "results_deleted"
-_SCAN_CANDIDATE_TOMBSTONE_FINGERPRINT = "__pdff_results_deleted__"
-
-_SAFE_ACTION_TERMINAL_STATUSES = frozenset(
-    [
-        "success",
-        "blocked",
-        "unknown",
-        "verification_failed",
-        "critical",
-        "history_deleted",
-    ]
-)
-_FORCE_ACTION_TERMINAL_STATUSES = _SAFE_ACTION_TERMINAL_STATUSES | frozenset(
-    ["failed"]
-)
-_SAFE_BATCH_ITEM_TERMINAL_STATUSES = frozenset(
-    [
-        "success",
-        "failed",
-        "blocked",
-        "unknown",
-        "verification_failed",
-        "critical",
-        "skipped",
-        "cancelled",
-        "interrupted",
-    ]
-)
-_SAFE_POST_SCAN_TERMINAL_STATUSES = frozenset(
-    ["success", "blocked", "unverified", "failed", "history_deleted"]
-)
-_SAFE_BATCH_TERMINAL_STATUSES = frozenset(
-    [
-        "completed",
-        "completed_with_warnings",
-        "completed_with_errors",
-        "cancelled",
-        "stopped",
-        "interrupted",
-        "expired",
-    ]
-)
-_SAFE_JOURNAL_TERMINAL_STATUSES = frozenset(
-    ["batch_preview", "failed_no_mutation", "verified", "trash_pending"]
-)
-_FORCE_JOURNAL_REVIEW_STATUSES = frozenset(["critical", "recovery_required"])
-_HISTORY_DELETE_CLAIM_STATUS = "deleting_history"
-_HISTORY_TOMBSTONE_STATUS = "history_deleted"
-
-
-def _post_scan_action_ids(job: Any) -> List[int]:
-    values = _json_load(getattr(job, "action_ids_json", "[]"), [])
-    result: List[int] = []
-    for raw in values if isinstance(values, list) else []:
-        try:
-            action_id = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if action_id > 0 and action_id not in result:
-            result.append(action_id)
-    try:
-        primary = int(getattr(job, "action_log_id", 0) or 0)
-    except (TypeError, ValueError):
-        primary = 0
-    if primary > 0 and primary not in result:
-        result.insert(0, primary)
-    return result
-
-
-def _assert_no_live_deletion_lease(session: Any, now: datetime) -> None:
-    lease = (
-        session.query(ModelDeletionLease)
-        .filter(ModelDeletionLease.id == 1)
-        .with_for_update()
-        .first()
-    )
-    if (
-        lease is not None
-        and str(lease.owner_token or "")
-        and (lease.expires_at is None or lease.expires_at >= now)
-    ):
-        raise RuntimeError(
-            "실행 중인 삭제 작업이 전역 잠금을 보유하고 있어 작업 이력을 "
-            "삭제할 수 없습니다."
-        )
-
-
-def _tombstone_post_scan_job(job: Any, now: datetime) -> None:
-    """Scrub one terminal job without freeing its durable numeric/unique IDs."""
-
-    job.updated_at = now
-    job.started_at = None
-    job.finished_at = now
-    job.action_ids_json = "[]"
-    job.server_machine_id = ""
-    job.mode = "deleted"
-    job.section_key = ""
-    job.media_type = ""
-    job.target_path = ""
-    job.status = _HISTORY_TOMBSTONE_STATUS
-    job.attempts = 0
-    job.max_attempts = 0
-    job.response_status = None
-    job.last_error = ""
-    job.lease_key = None
-    job.worker_token = ""
-    job.lease_expires_at = None
+ACTIVE_RUN_STATUSES = frozenset(("queued", "running", "stopping"))
 
 
 def _iso(value: Optional[datetime]) -> Optional[str]:
@@ -151,2276 +28,257 @@ def _json_load(value: Optional[str], fallback: Any) -> Any:
         return fallback
 
 
-class ModelScanRun(ModelBase):
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+class ModelCleanupRun(ModelBase):
+    """One dry-run or live immediate-cleanup invocation."""
+
     P = P
-    __tablename__ = "scan_run"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    started_at = db.Column(db.DateTime)
-    finished_at = db.Column(db.DateTime)
-    status = db.Column(db.String(32), nullable=False, index=True)
-    progress = db.Column(db.Integer, default=0, nullable=False)
-    status_message = db.Column(db.String(512), default="")
-    section_ids_json = db.Column(db.Text, default="[]")
-    settings_snapshot_json = db.Column(db.Text, default="{}")
-    server_machine_id = db.Column(db.String(128), default="")
-    server_version = db.Column(db.String(64), default="")
-    total_sections = db.Column(db.Integer, default=0)
-    completed_sections = db.Column(db.Integer, default=0)
-    total_groups = db.Column(db.Integer, default=0)
-    safe_groups = db.Column(db.Integer, default=0)
-    unsafe_groups = db.Column(db.Integer, default=0)
-    successful_deletions = db.Column(db.Integer, default=0)
-    deletion_attempts = db.Column(db.Integer, default=0, nullable=False)
-    cancellation_requested = db.Column(db.Boolean, default=False)
-    error_summary = db.Column(db.Text, default="")
-
-    def as_api(self) -> Dict[str, Any]:
-        if self.status == _SCAN_RESULT_TOMBSTONE_STATUS:
-            # Tombstones reserve primary keys for immutable audit references.
-            # They are excluded from normal lookups, and even an explicit raw
-            # serialization cannot recover the scrubbed scan snapshot.
-            return {
-                "id": self.id,
-                "status": _SCAN_RESULT_TOMBSTONE_STATUS,
-                "results_deleted": True,
-            }
-        value = {
-            "id": self.id,
-            "created_at": _iso(self.created_at),
-            "started_at": _iso(self.started_at),
-            "finished_at": _iso(self.finished_at),
-            "status": self.status,
-            "progress": self.progress or 0,
-            "status_message": self.status_message or "",
-            "section_ids": _json_load(self.section_ids_json, []),
-            "server_machine_id": self.server_machine_id or "",
-            "server_version": self.server_version or "",
-            "total_sections": self.total_sections or 0,
-            "completed_sections": self.completed_sections or 0,
-            "total_groups": self.total_groups or 0,
-            "safe_groups": self.safe_groups or 0,
-            "unsafe_groups": self.unsafe_groups or 0,
-            "successful_deletions": self.successful_deletions or 0,
-            "deletion_attempts": self.deletion_attempts or 0,
-            "cancellation_requested": bool(self.cancellation_requested),
-            "error_summary": self.error_summary or "",
-        }
-        # Local import avoids setup -> models -> budget -> setup import cycles.
-        from .delete_budget import delete_attempt_budget
-
-        value["delete_budget"] = delete_attempt_budget(self)
-        return value
-
-    @classmethod
-    def get(
-        cls, run_id: Any, include_results_deleted: bool = False
-    ) -> Optional["ModelScanRun"]:
-        query = db.session.query(cls).filter_by(id=int(run_id))
-        if not include_results_deleted:
-            query = query.filter(cls.status != _SCAN_RESULT_TOMBSTONE_STATUS)
-        return query.first()
-
-    @classmethod
-    def active(cls) -> Optional["ModelScanRun"]:
-        return (
-            db.session.query(cls)
-            .filter(cls.status.in_(["queued", "running", "cancelling"]))
-            .order_by(cls.id.desc())
-            .first()
-        )
-
-    @classmethod
-    def recent(cls, limit: int = 30) -> List["ModelScanRun"]:
-        return (
-            db.session.query(cls)
-            .filter(cls.status != _SCAN_RESULT_TOMBSTONE_STATUS)
-            .order_by(cls.id.desc())
-            .limit(max(1, min(limit, 100)))
-            .all()
-        )
-
-    @classmethod
-    def claim_deletion_slot(cls, run_id: Any, limit: Any = None) -> bool:
-        """Atomically record one attempt while guarding the scan-run status.
-
-        ``limit`` is accepted only so an older worker can finish during a
-        rolling reload.  Per-scan attempt caps were removed in v1.4.0.
-        """
-        del limit
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == int(run_id),
-                cls.status.in_(["completed", "completed_with_warnings"]),
-            )
-            .update(
-                {cls.deletion_attempts: cls.deletion_attempts + 1},
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def delete_results(cls, run_id: Any, force: bool = False) -> Dict[str, Any]:
-        """Remove one terminal duplicate-scan result while preserving audits.
-
-        The scan row is first claimed with a compare-and-swap transition.  The
-        uncommitted update serializes manual DELETE claims against this cleanup,
-        while ``FOR UPDATE`` range reads guard batch-plan inserts on databases
-        that support row/gap locks.  SQLite's writer transaction provides the
-        equivalent serialization there.
-
-        ``scan_run``, ``duplicate_group``, and ``media_candidate`` all become
-        scrubbed logical tombstones.  Keeping every referenced primary key is
-        essential on SQLite and database configurations that may otherwise
-        reuse a physically deleted group/candidate ID for a later scan.  That
-        keeps immutable audit references unambiguous while every normal result
-        lookup hides the tombstones.  Destructive action logs, batch
-        plans/items, post-delete scan jobs, and filesystem journals are counted
-        but never removed. ``force`` only permits terminal manual-review
-        journal states; it never bypasses a live worker or lease and never
-        performs filesystem or Plex operations.
-        """
-
-        target_id = int(run_id)
-        session = db.session
-        try:
-            run = session.query(cls).filter(cls.id == target_id).first()
-            if run is None:
-                raise ValueError("스캔 이력을 찾을 수 없습니다.")
-            original_status = str(run.status or "")
-            if original_status not in SCAN_RESULT_DELETE_ALLOWED_STATUSES:
-                raise RuntimeError(
-                    "완료되거나 중단된 스캔 결과만 삭제할 수 있습니다. "
-                    "(현재 상태: %s)" % (original_status or "unknown")
-                )
-
-            claimed = (
-                session.query(cls)
-                .filter(cls.id == target_id, cls.status == original_status)
-                .update(
-                    {cls.status: _SCAN_RESULT_DELETE_CLAIM_STATUS},
-                    synchronize_session=False,
-                )
-            )
-            if claimed != 1:
-                raise RuntimeError("다른 작업이 이 스캔 결과의 상태를 변경했습니다.")
-            session.flush()
-
-            now = datetime.now()
-
-            # The singleton lease serializes the entire delete/post-scan
-            # mutation domain. Force cleanup never overrides a live owner.
-            _assert_no_live_deletion_lease(session, now)
-
-            # Lock the complete target ranges before classifying them.  This is
-            # also a gap/range guard for a concurrent batch preview on MySQL.
-            batches = (
-                session.query(ModelBatchRun)
-                .filter(ModelBatchRun.scan_run_id == target_id)
-                .with_for_update()
-                .all()
-            )
-            batch_exclusions = (
-                session.query(ModelBatchExclusion)
-                .filter(ModelBatchExclusion.scan_run_id == target_id)
-                .with_for_update()
-                .order_by(ModelBatchExclusion.id.asc())
-                .all()
-            )
-            for batch in batches:
-                status = str(batch.status or "")
-                expired_preview = bool(
-                    status == "preview"
-                    and batch.expires_at is not None
-                    and batch.expires_at < now
-                )
-                if status not in _SAFE_BATCH_TERMINAL_STATUSES and not expired_preview:
-                    raise RuntimeError(
-                        "활성 또는 확인이 필요한 일괄 삭제 계획이 있어 스캔 결과를 "
-                        "삭제할 수 없습니다. (plan=%s, status=%s)"
-                        % (batch.id, status or "unknown")
-                    )
-
-            nonterminal_items = (
-                session.query(ModelBatchItem)
-                .filter(
-                    ModelBatchItem.scan_run_id == target_id,
-                    ~ModelBatchItem.status.in_(_SAFE_BATCH_ITEM_TERMINAL_STATUSES),
-                )
-                .with_for_update()
-                .order_by(ModelBatchItem.id.asc())
-                .all()
-            )
-            batch_by_id = {int(batch.id): batch for batch in batches}
-            active_item = None
-            for item in nonterminal_items:
-                parent = batch_by_id.get(int(item.batch_run_id))
-                expired_preview = bool(
-                    parent is not None
-                    and str(parent.status or "") == "preview"
-                    and parent.expires_at is not None
-                    and parent.expires_at < now
-                )
-                expired_plan = bool(
-                    parent is not None and str(parent.status or "") == "expired"
-                )
-                # A preview cannot ever be approved after its deadline.  Its
-                # planned items are immutable audit snapshots, not active work.
-                # Explicitly expired plans have the same property.  Every
-                # other current or future item state fails closed.
-                if not (
-                    str(item.status or "") == "planned"
-                    and (expired_preview or expired_plan)
-                ):
-                    active_item = item
-                    break
-            if active_item is not None:
-                raise RuntimeError(
-                    "처리 중인 일괄 삭제 항목이 있어 스캔 결과를 삭제할 수 없습니다. "
-                    "(item=%s, status=%s)"
-                    % (active_item.id, active_item.status)
-                )
-
-            allowed_action_statuses = (
-                _FORCE_ACTION_TERMINAL_STATUSES
-                if force
-                else _SAFE_ACTION_TERMINAL_STATUSES
-            )
-            active_action = (
-                session.query(ModelActionLog)
-                .filter(
-                    ModelActionLog.run_id == target_id,
-                    ~ModelActionLog.status.in_(allowed_action_statuses),
-                )
-                .with_for_update()
-                .order_by(ModelActionLog.id.asc())
-                .first()
-            )
-            if active_action is not None:
-                raise RuntimeError(
-                    "진행 중이거나 알 수 없는 삭제 작업이 있어 스캔 결과를 "
-                    "삭제할 수 없습니다. "
-                    "(action=%s, status=%s)"
-                    % (active_action.id, active_action.status)
-                )
-
-            active_post_scan = (
-                session.query(ModelPostDeleteScanJob)
-                .filter(
-                    ModelPostDeleteScanJob.run_id == target_id,
-                    ~ModelPostDeleteScanJob.status.in_(
-                        _SAFE_POST_SCAN_TERMINAL_STATUSES
-                    ),
-                )
-                .with_for_update()
-                .order_by(ModelPostDeleteScanJob.id.asc())
-                .first()
-            )
-            if active_post_scan is not None:
-                raise RuntimeError(
-                    "삭제 후 Plex 부분 스캔이 진행 중이거나 상태를 알 수 없어 "
-                    "결과를 삭제할 수 없습니다. "
-                    "(job=%s, status=%s)"
-                    % (active_post_scan.id, active_post_scan.status)
-                )
-
-            for journal_type, label in (
-                (ModelQuarantineJournal, "격리"),
-                (ModelDirectDeleteJournal, "직접 삭제"),
-            ):
-                allowed_journal_statuses = _SAFE_JOURNAL_TERMINAL_STATUSES
-                if force:
-                    allowed_journal_statuses = (
-                        allowed_journal_statuses | _FORCE_JOURNAL_REVIEW_STATUSES
-                    )
-                unfinished = (
-                    session.query(journal_type)
-                    .filter(
-                        journal_type.run_id == target_id,
-                        ~journal_type.status.in_(allowed_journal_statuses),
-                    )
-                    .with_for_update()
-                    .order_by(journal_type.id.asc())
-                    .first()
-                )
-                if unfinished is not None:
-                    raise RuntimeError(
-                        "%s 작업 이력이 아직 완결되지 않아 스캔 결과를 삭제할 수 "
-                        "없습니다. (journal=%s, status=%s)"
-                        % (label, unfinished.id, unfinished.status or "unknown")
-                    )
-
-            preserved = {
-                "action_logs": session.query(ModelActionLog)
-                .filter(ModelActionLog.run_id == target_id)
-                .count(),
-                "batch_runs": session.query(ModelBatchRun)
-                .filter(ModelBatchRun.scan_run_id == target_id)
-                .count(),
-                "batch_items": session.query(ModelBatchItem)
-                .filter(ModelBatchItem.scan_run_id == target_id)
-                .count(),
-                "batch_exclusions": len(batch_exclusions),
-                "post_delete_scan_jobs": session.query(ModelPostDeleteScanJob)
-                .filter(ModelPostDeleteScanJob.run_id == target_id)
-                .count(),
-                "quarantine_journals": session.query(ModelQuarantineJournal)
-                .filter(ModelQuarantineJournal.run_id == target_id)
-                .count(),
-                "direct_delete_journals": session.query(ModelDirectDeleteJournal)
-                .filter(ModelDirectDeleteJournal.run_id == target_id)
-                .count(),
-            }
-            forced_review_records = {
-                "quarantine_journals": session.query(ModelQuarantineJournal)
-                .filter(
-                    ModelQuarantineJournal.run_id == target_id,
-                    ModelQuarantineJournal.status.in_(
-                        _FORCE_JOURNAL_REVIEW_STATUSES
-                    ),
-                )
-                .count(),
-                "direct_delete_journals": session.query(ModelDirectDeleteJournal)
-                .filter(
-                    ModelDirectDeleteJournal.run_id == target_id,
-                    ModelDirectDeleteJournal.status.in_(
-                        _FORCE_JOURNAL_REVIEW_STATUSES
-                    ),
-                )
-                .count(),
-            }
-
-            group_ids = session.query(ModelDuplicateGroup.id).filter(
-                ModelDuplicateGroup.run_id == target_id
-            )
-            candidate_query = session.query(ModelMediaCandidate).filter(
-                ModelMediaCandidate.group_id.in_(group_ids)
-            )
-            candidate_count = candidate_query.count()
-            group_count = (
-                session.query(ModelDuplicateGroup)
-                .filter(ModelDuplicateGroup.run_id == target_id)
-                .count()
-            )
-
-            candidate_tombstones = candidate_query.update(
-                {
-                    ModelMediaCandidate.media_id: "",
-                    ModelMediaCandidate.created_at: now,
-                    ModelMediaCandidate.duration: 0,
-                    ModelMediaCandidate.bitrate: 0,
-                    ModelMediaCandidate.width: 0,
-                    ModelMediaCandidate.height: 0,
-                    ModelMediaCandidate.video_resolution: "",
-                    ModelMediaCandidate.video_codec: "",
-                    ModelMediaCandidate.audio_codec: "",
-                    ModelMediaCandidate.audio_channels: 0,
-                    ModelMediaCandidate.container: "",
-                    ModelMediaCandidate.total_size: 0,
-                    ModelMediaCandidate.parts_json: "[]",
-                    ModelMediaCandidate.audio_tracks_json: "[]",
-                    ModelMediaCandidate.fingerprint: (
-                        _SCAN_CANDIDATE_TOMBSTONE_FINGERPRINT
-                    ),
-                    ModelMediaCandidate.score: 0,
-                    ModelMediaCandidate.score_breakdown_json: "{}",
-                    ModelMediaCandidate.deleted: True,
-                    ModelMediaCandidate.deleted_at: now,
-                },
-                synchronize_session=False,
-            )
-            group_tombstones = (
-                session.query(ModelDuplicateGroup)
-                .filter(ModelDuplicateGroup.run_id == target_id)
-                .update(
-                    {
-                        ModelDuplicateGroup.created_at: now,
-                        ModelDuplicateGroup.section_key: "",
-                        ModelDuplicateGroup.section_title: "",
-                        ModelDuplicateGroup.rating_key: "",
-                        ModelDuplicateGroup.guid: "",
-                        ModelDuplicateGroup.media_type: "",
-                        ModelDuplicateGroup.title: "",
-                        ModelDuplicateGroup.year: None,
-                        ModelDuplicateGroup.grandparent_title: "",
-                        ModelDuplicateGroup.grandparent_rating_key: "",
-                        ModelDuplicateGroup.parent_index: None,
-                        ModelDuplicateGroup.media_index: None,
-                        ModelDuplicateGroup.identity_fingerprint: "",
-                        ModelDuplicateGroup.candidate_count: 0,
-                        ModelDuplicateGroup.safe_to_delete: False,
-                        ModelDuplicateGroup.safety_flags_json: "[]",
-                        ModelDuplicateGroup.safety_details_json: "{}",
-                        ModelDuplicateGroup.recommended_candidate_id: None,
-                        ModelDuplicateGroup.resolution_status: (
-                            _SCAN_RESULT_TOMBSTONE_STATUS
-                        ),
-                    },
-                    synchronize_session=False,
-                )
-            )
-            if (
-                candidate_tombstones != candidate_count
-                or group_tombstones != group_count
-            ):
-                raise RuntimeError("스캔 결과 tombstone 수가 예상과 일치하지 않습니다.")
-            tombstoned_run = (
-                session.query(cls)
-                .filter(
-                    cls.id == target_id,
-                    cls.status == _SCAN_RESULT_DELETE_CLAIM_STATUS,
-                )
-                .update(
-                    {
-                        cls.created_at: now,
-                        cls.started_at: None,
-                        cls.finished_at: now,
-                        cls.status: _SCAN_RESULT_TOMBSTONE_STATUS,
-                        cls.progress: 0,
-                        cls.status_message: "",
-                        cls.section_ids_json: "[]",
-                        cls.settings_snapshot_json: "{}",
-                        cls.server_machine_id: "",
-                        cls.server_version: "",
-                        cls.total_sections: 0,
-                        cls.completed_sections: 0,
-                        cls.total_groups: 0,
-                        cls.safe_groups: 0,
-                        cls.unsafe_groups: 0,
-                        cls.successful_deletions: 0,
-                        cls.deletion_attempts: 0,
-                        cls.cancellation_requested: False,
-                        cls.error_summary: "",
-                    },
-                    synchronize_session=False,
-                )
-            )
-            if tombstoned_run != 1:
-                raise RuntimeError("스캔 결과 삭제 소유권을 확인할 수 없습니다.")
-            expire = getattr(session, "expire", None)
-            if callable(expire):
-                # Bulk CAS updates intentionally skip session synchronization;
-                # expire the originally loaded row so this worker cannot later
-                # serialize the pre-tombstone snapshot from its identity map.
-                expire(run)
-            session.commit()
-            # Bulk tombstone updates deliberately avoid synchronizing an
-            # arbitrarily large identity map.  Expire any objects the caller
-            # loaded before cleanup so raw opt-in reads cannot expose the old
-            # result snapshot in long-lived/test sessions with commit expiry
-            # disabled.
-            expire_all = getattr(session, "expire_all", None)
-            if callable(expire_all):
-                expire_all()
-            return {
-                "run_id": target_id,
-                "forced": bool(force),
-                "forced_review_records": forced_review_records,
-                "deleted": {
-                    "run": 1,
-                    "run_tombstone": 1,
-                    "groups": group_count,
-                    "candidates": candidate_count,
-                },
-                "preserved": preserved,
-            }
-        except Exception:
-            session.rollback()
-            raise
-
-
-class ModelDuplicateGroup(ModelBase):
-    P = P
-    __tablename__ = "duplicate_group"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    run_id = db.Column(db.Integer, nullable=False, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    section_key = db.Column(db.String(32), nullable=False)
-    section_title = db.Column(db.String(255), default="")
-    rating_key = db.Column(db.String(64), nullable=False)
-    guid = db.Column(db.String(512), default="")
-    media_type = db.Column(db.String(32), default="")
-    title = db.Column(db.String(512), default="")
-    year = db.Column(db.Integer)
-    grandparent_title = db.Column(db.String(512), default="")
-    grandparent_rating_key = db.Column(db.String(64), default="")
-    parent_index = db.Column(db.Integer)
-    media_index = db.Column(db.Integer)
-    identity_fingerprint = db.Column(db.String(64), nullable=False)
-    candidate_count = db.Column(db.Integer, default=0)
-    safe_to_delete = db.Column(db.Boolean, default=False, index=True)
-    safety_flags_json = db.Column(db.Text, default="[]")
-    safety_details_json = db.Column(db.Text, default="{}")
-    recommended_candidate_id = db.Column(db.Integer)
-    resolution_status = db.Column(db.String(32), default="open")
-
-    def as_api(self) -> Dict[str, Any]:
-        if self.resolution_status == _SCAN_RESULT_TOMBSTONE_STATUS:
-            return {
-                "id": self.id,
-                "run_id": self.run_id,
-                "status": _SCAN_RESULT_TOMBSTONE_STATUS,
-                "results_deleted": True,
-            }
-        return {
-            "id": self.id,
-            "run_id": self.run_id,
-            "created_at": _iso(self.created_at),
-            "section_key": self.section_key,
-            "section_title": self.section_title or "",
-            "rating_key": self.rating_key,
-            "guid": self.guid or "",
-            "media_type": self.media_type or "",
-            "title": self.title or "",
-            "year": self.year,
-            "grandparent_title": self.grandparent_title or "",
-            "grandparent_rating_key": self.grandparent_rating_key or "",
-            "parent_index": self.parent_index,
-            "index": self.media_index,
-            "identity_fingerprint": self.identity_fingerprint,
-            "candidate_count": self.candidate_count or 0,
-            "safe_to_delete": bool(self.safe_to_delete),
-            "safety_flags": _json_load(self.safety_flags_json, []),
-            "safety_details": _json_load(self.safety_details_json, {}),
-            "recommended_candidate_id": self.recommended_candidate_id,
-            "resolution_status": self.resolution_status or "open",
-        }
-
-    @classmethod
-    def get(
-        cls, group_id: Any, include_results_deleted: bool = False
-    ) -> Optional["ModelDuplicateGroup"]:
-        query = db.session.query(cls).filter_by(id=int(group_id))
-        if not include_results_deleted:
-            query = query.filter(
-                or_(
-                    cls.resolution_status.is_(None),
-                    cls.resolution_status != _SCAN_RESULT_TOMBSTONE_STATUS,
-                )
-            )
-        return query.first()
-
-    @classmethod
-    def claim_for_delete(cls, group_id: Any) -> bool:
-        """Atomically transition an eligible group to delete_in_progress."""
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == int(group_id),
-                cls.safe_to_delete == True,  # noqa: E712 - SQLAlchemy expression
-                cls.resolution_status == "open",
-            )
-            .update(
-                {
-                    cls.safe_to_delete: False,
-                    cls.resolution_status: "delete_in_progress",
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def by_run(
-        cls,
-        run_id: Any,
-        limit: int = 500,
-        include_results_deleted: bool = False,
-    ) -> List["ModelDuplicateGroup"]:
-        query = db.session.query(cls).filter_by(run_id=int(run_id))
-        if not include_results_deleted:
-            query = query.filter(
-                or_(
-                    cls.resolution_status.is_(None),
-                    cls.resolution_status != _SCAN_RESULT_TOMBSTONE_STATUS,
-                )
-            )
-        return (
-            query
-            .order_by(cls.id.asc())
-            .limit(max(1, min(limit, 2000)))
-            .all()
-        )
-
-    @classmethod
-    def safe_open_by_run(cls, run_id: Any) -> List["ModelDuplicateGroup"]:
-        """Return batch-plan candidates in a deterministic order.
-
-        Candidate-count and recommendation checks intentionally happen against
-        active ``media_candidate`` rows in the batch planner, rather than trusting
-        the denormalized snapshot columns on this table.
-        """
-        return (
-            db.session.query(cls)
-            .filter_by(
-                run_id=int(run_id),
-                safe_to_delete=True,
-                resolution_status="open",
-            )
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-    @classmethod
-    def all_by_run(cls, run_id: Any) -> List["ModelDuplicateGroup"]:
-        return (
-            db.session.query(cls)
-            .filter_by(run_id=int(run_id))
-            .filter(
-                or_(
-                    cls.resolution_status.is_(None),
-                    cls.resolution_status != _SCAN_RESULT_TOMBSTONE_STATUS,
-                )
-            )
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-    @classmethod
-    def search(
-        cls,
-        run_id: Any,
-        page: int = 1,
-        page_size: int = 50,
-        media_type: str = "",
-        safety: str = "",
-        keyword: str = "",
-    ) -> Dict[str, Any]:
-        query = (
-            db.session.query(cls)
-            .filter_by(run_id=int(run_id))
-            .filter(
-                or_(
-                    cls.resolution_status.is_(None),
-                    cls.resolution_status != _SCAN_RESULT_TOMBSTONE_STATUS,
-                )
-            )
-        )
-        if media_type in ("movie", "episode"):
-            query = query.filter_by(media_type=media_type)
-        if safety == "safe":
-            query = query.filter_by(safe_to_delete=True)
-        elif safety == "blocked":
-            query = query.filter_by(safe_to_delete=False)
-        keyword = (keyword or "").strip()
-        if keyword:
-            pattern = "%" + keyword + "%"
-            query = query.filter(
-                cls.title.like(pattern)
-                | cls.grandparent_title.like(pattern)
-                | cls.section_title.like(pattern)
-                | cls.guid.like(pattern)
-            )
-        total = query.count()
-        items = (
-            query.order_by(cls.id.asc())
-            .limit(page_size)
-            .offset((page - 1) * page_size)
-            .all()
-        )
-        return {"items": items, "total": total}
-
-
-class ModelMediaCandidate(ModelBase):
-    P = P
-    __tablename__ = "media_candidate"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    group_id = db.Column(db.Integer, nullable=False, index=True)
-    media_id = db.Column(db.String(64), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    duration = db.Column(db.Integer, default=0)
-    bitrate = db.Column(db.Integer, default=0)
-    width = db.Column(db.Integer, default=0)
-    height = db.Column(db.Integer, default=0)
-    video_resolution = db.Column(db.String(32), default="")
-    video_codec = db.Column(db.String(32), default="")
-    audio_codec = db.Column(db.String(32), default="")
-    audio_channels = db.Column(db.Integer, default=0)
-    container = db.Column(db.String(32), default="")
-    total_size = db.Column(db.BigInteger, default=0)
-    parts_json = db.Column(db.Text, default="[]")
-    audio_tracks_json = db.Column(db.Text, default="[]")
-    fingerprint = db.Column(db.String(64), nullable=False)
-    score = db.Column(db.Float, default=0)
-    score_breakdown_json = db.Column(db.Text, default="{}")
-    deleted = db.Column(db.Boolean, default=False)
-    deleted_at = db.Column(db.DateTime)
-
-    def as_api(self) -> Dict[str, Any]:
-        if self.fingerprint == _SCAN_CANDIDATE_TOMBSTONE_FINGERPRINT:
-            return {
-                "id": self.id,
-                "group_id": self.group_id,
-                "status": _SCAN_RESULT_TOMBSTONE_STATUS,
-                "results_deleted": True,
-            }
-        return {
-            "id": self.id,
-            "group_id": self.group_id,
-            "media_id": self.media_id,
-            "created_at": _iso(self.created_at),
-            "duration": self.duration or 0,
-            "bitrate": self.bitrate or 0,
-            "width": self.width or 0,
-            "height": self.height or 0,
-            "video_resolution": self.video_resolution or "",
-            "video_codec": self.video_codec or "",
-            "audio_codec": self.audio_codec or "",
-            "audio_channels": self.audio_channels or 0,
-            "container": self.container or "",
-            "total_size": self.total_size or 0,
-            "parts": _json_load(self.parts_json, []),
-            "audio_tracks": _json_load(self.audio_tracks_json, []),
-            "fingerprint": self.fingerprint,
-            "score": round(self.score or 0, 3),
-            "score_breakdown": _json_load(self.score_breakdown_json, {}),
-            "deleted": bool(self.deleted),
-            "deleted_at": _iso(self.deleted_at),
-        }
-
-    @classmethod
-    def get(
-        cls, candidate_id: Any, include_results_deleted: bool = False
-    ) -> Optional["ModelMediaCandidate"]:
-        query = db.session.query(cls).filter_by(id=int(candidate_id))
-        if not include_results_deleted:
-            query = query.filter(
-                cls.fingerprint != _SCAN_CANDIDATE_TOMBSTONE_FINGERPRINT
-            )
-        return query.first()
-
-    @classmethod
-    def by_group(
-        cls,
-        group_id: Any,
-        include_deleted: bool = True,
-        include_results_deleted: bool = False,
-    ) -> List["ModelMediaCandidate"]:
-        query = db.session.query(cls).filter_by(group_id=int(group_id))
-        if not include_results_deleted:
-            query = query.filter(
-                cls.fingerprint != _SCAN_CANDIDATE_TOMBSTONE_FINGERPRINT
-            )
-        if not include_deleted:
-            query = query.filter_by(deleted=False)
-        return query.order_by(cls.score.desc(), cls.id.asc()).all()
-
-
-class ModelActionLog(ModelBase):
-    P = P
-    __tablename__ = "action_log"
+    __tablename__ = "plex_dupefinder_ff_cleanup_run"
     __table_args__ = {"mysql_collate": "utf8_general_ci"}
     __bind_key__ = P.package_name
 
     id = db.Column(db.Integer, primary_key=True)
     created_at = db.Column(db.DateTime, default=datetime.now, nullable=False, index=True)
-    run_id = db.Column(db.Integer, index=True)
-    group_id = db.Column(db.Integer, index=True)
-    candidate_id = db.Column(db.Integer)
-    keep_candidate_id = db.Column(db.Integer)
-    action = db.Column(db.String(32), nullable=False)
-    status = db.Column(db.String(32), nullable=False)
-    message = db.Column(db.Text, default="")
-    response_status = db.Column(db.Integer)
-    before_json = db.Column(db.Text, default="{}")
-    after_json = db.Column(db.Text, default="{}")
+    started_at = db.Column(db.DateTime)
+    finished_at = db.Column(db.DateTime)
+    mode = db.Column(db.String(16), nullable=False, index=True)
+    status = db.Column(db.String(32), nullable=False, index=True)
+    stop_requested = db.Column(db.Boolean, default=False, nullable=False)
+    current_json = db.Column(db.Text, default="{}")
+    settings_json = db.Column(db.Text, default="{}")
+    processed_groups = db.Column(db.Integer, default=0, nullable=False)
+    total_groups = db.Column(db.Integer, default=0, nullable=False)
+    groups_found = db.Column(db.Integer, default=0, nullable=False)
+    would_delete_count = db.Column(db.Integer, default=0, nullable=False)
+    would_delete_bytes = db.Column(db.BigInteger, default=0, nullable=False)
+    deleted_bytes = db.Column(db.BigInteger, default=0, nullable=False)
+    deleted_count = db.Column(db.Integer, default=0, nullable=False)
+    partial_count = db.Column(db.Integer, default=0, nullable=False)
+    error_count = db.Column(db.Integer, default=0, nullable=False)
+    status_message = db.Column(db.Text, default="")
+    error_message = db.Column(db.Text, default="")
 
-    def as_api(self, include_snapshots: bool = True) -> Dict[str, Any]:
-        if self.status == _HISTORY_TOMBSTONE_STATUS:
-            return {
-                "id": self.id,
-                "status": _HISTORY_TOMBSTONE_STATUS,
-                "history_deleted": True,
-            }
+    @classmethod
+    def create(cls, mode: str, settings: Dict[str, Any]) -> "ModelCleanupRun":
+        item = cls()
+        item.created_at = datetime.now()
+        item.mode = str(mode)
+        item.status = "queued"
+        item.stop_requested = False
+        item.current_json = "{}"
+        item.settings_json = _json_dump(settings)
+        item.processed_groups = 0
+        item.total_groups = 0
+        item.groups_found = 0
+        item.would_delete_count = 0
+        item.would_delete_bytes = 0
+        item.deleted_bytes = 0
+        item.deleted_count = 0
+        item.partial_count = 0
+        item.error_count = 0
+        item.status_message = "대기"
+        item.error_message = ""
+        db.session.add(item)
+        db.session.commit()
+        return item
+
+    def as_api(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "mode": self.mode or "",
+            "status": self.status or "",
+            "created_at": _iso(self.created_at),
+            "started_at": _iso(self.started_at),
+            "finished_at": _iso(self.finished_at),
+            "stop_requested": bool(self.stop_requested),
+            "current": _json_load(self.current_json, {}),
+            "progress": {
+                "processed": self.processed_groups or 0,
+                "total": self.total_groups or 0,
+            },
+            "summary": {
+                "groups": self.groups_found or 0,
+                "would_delete": self.would_delete_count or 0,
+                "bytes": self.deleted_bytes or 0,
+                "would_delete_bytes": self.would_delete_bytes or 0,
+                "deleted": self.deleted_count or 0,
+                "partial": self.partial_count or 0,
+                "errors": self.error_count or 0,
+            },
+            "message": self.error_message or self.status_message or "",
+        }
+
+    @classmethod
+    def get(cls, run_id: Any) -> Optional["ModelCleanupRun"]:
+        return db.session.query(cls).filter_by(id=int(run_id)).first()
+
+    @classmethod
+    def active(cls) -> Optional["ModelCleanupRun"]:
+        return (
+            db.session.query(cls)
+            .filter(cls.status.in_(ACTIVE_RUN_STATUSES))
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    @classmethod
+    def latest(cls) -> Optional["ModelCleanupRun"]:
+        return db.session.query(cls).order_by(cls.id.desc()).first()
+
+    @classmethod
+    def recent(cls, limit: int = 30) -> List["ModelCleanupRun"]:
+        return (
+            db.session.query(cls)
+            .order_by(cls.id.desc())
+            .limit(max(1, min(int(limit), 100)))
+            .all()
+        )
+
+    @classmethod
+    def recover_interrupted(cls) -> int:
+        """Never resume an immediate-delete run whose process disappeared."""
+
+        now = datetime.now()
+        count = (
+            db.session.query(cls)
+            .filter(cls.status.in_(ACTIVE_RUN_STATUSES))
+            .update(
+                {
+                    cls.status: "interrupted",
+                    cls.finished_at: now,
+                    cls.status_message: "플러그인 재시작으로 중단됨",
+                },
+                synchronize_session=False,
+            )
+        )
+        return int(count or 0)
+
+
+class ModelCleanupAction(ModelBase):
+    """One candidate that was reported or sent to Plex DELETE."""
+
+    P = P
+    __tablename__ = "plex_dupefinder_ff_cleanup_action"
+    __table_args__ = {"mysql_collate": "utf8_general_ci"}
+    __bind_key__ = P.package_name
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.Integer, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False, index=True)
+    finished_at = db.Column(db.DateTime)
+    mode = db.Column(db.String(16), nullable=False, index=True)
+    section_id = db.Column(db.String(64), default="", index=True)
+    rating_key = db.Column(db.String(64), default="", index=True)
+    media_type = db.Column(db.String(32), default="")
+    title = db.Column(db.Text, default="")
+    keep_media_id = db.Column(db.String(64), default="")
+    delete_media_id = db.Column(db.String(64), default="")
+    keep_score = db.Column(db.Float, default=0)
+    delete_score = db.Column(db.Float, default=0)
+    file_size = db.Column(db.BigInteger, default=0)
+    file_path = db.Column(db.Text, default="")
+    sidecars_json = db.Column(db.Text, default="[]")
+    candidate_snapshot_json = db.Column(db.Text, default="{}")
+    status = db.Column(db.String(32), nullable=False, index=True)
+    response_status = db.Column(db.Integer)
+    message = db.Column(db.Text, default="")
+
+    @classmethod
+    def create(cls, **values: Any) -> "ModelCleanupAction":
+        item = cls()
+        item.created_at = datetime.now()
+        item.finished_at = None
+        item.run_id = int(values.get("run_id"))
+        item.mode = str(values.get("mode") or "")
+        item.section_id = str(values.get("section_id") or "")
+        item.rating_key = str(values.get("rating_key") or "")
+        item.media_type = str(values.get("media_type") or "")
+        item.title = str(values.get("title") or "")
+        item.keep_media_id = str(values.get("keep_media_id") or "")
+        item.delete_media_id = str(values.get("delete_media_id") or "")
+        item.keep_score = float(values.get("keep_score") or 0)
+        item.delete_score = float(values.get("delete_score") or 0)
+        item.file_size = max(0, int(values.get("file_size") or 0))
+        item.file_path = str(values.get("file_path") or "")
+        item.sidecars_json = _json_dump(values.get("sidecars") or [])
+        item.candidate_snapshot_json = _json_dump(values.get("candidate_snapshot") or {})
+        item.status = str(values.get("status") or "discovered")
+        item.response_status = values.get("response_status")
+        item.message = str(values.get("message") or "")
+        db.session.add(item)
+        db.session.commit()
+        return item
+
+    def as_api(self, include_snapshot: bool = False) -> Dict[str, Any]:
         value = {
             "id": self.id,
-            "created_at": _iso(self.created_at),
             "run_id": self.run_id,
-            "group_id": self.group_id,
-            "candidate_id": self.candidate_id,
-            "keep_candidate_id": self.keep_candidate_id,
-            "action": self.action,
-            "status": self.status,
-            "message": self.message or "",
+            "created_at": _iso(self.created_at),
+            "finished_at": _iso(self.finished_at),
+            "mode": self.mode or "",
+            "section_id": self.section_id or "",
+            "rating_key": self.rating_key or "",
+            "media_type": self.media_type or "",
+            "title": self.title or "",
+            "keep_media_id": self.keep_media_id or "",
+            "delete_media_id": self.delete_media_id or "",
+            "keep_score": self.keep_score or 0,
+            "delete_score": self.delete_score or 0,
+            "file_size": self.file_size or 0,
+            "file_path": self.file_path or "",
+            "sidecars": _json_load(self.sidecars_json, []),
+            "status": self.status or "",
             "response_status": self.response_status,
+            "message": self.message or "",
         }
-        if include_snapshots:
-            value["before"] = _json_load(self.before_json, {})
-            value["after"] = _json_load(self.after_json, {})
-        try:
-            journal = (
-                ModelQuarantineJournal.for_action(self.id)
-                if self.id is not None
-                else None
+        if include_snapshot:
+            value["candidate_snapshot"] = _json_load(
+                self.candidate_snapshot_json, {}
             )
-            if journal is None and self.id is not None:
-                journal = ModelDirectDeleteJournal.for_action(self.id)
-        except Exception:
-            # Stub/unit-test DBs and a pre-create_all startup window must not
-            # break legacy audit serialization.
-            journal = None
-        if journal is not None:
-            cleanup = journal.cleanup_api(include_paths=include_snapshots)
-            value["subtitle_cleanup"] = cleanup
-            value["subtitle_cleanup_summary"] = journal.cleanup_api(False)
         return value
 
     @classmethod
-    def get(cls, action_id: Any) -> Optional["ModelActionLog"]:
+    def get(cls, action_id: Any) -> Optional["ModelCleanupAction"]:
         return db.session.query(cls).filter_by(id=int(action_id)).first()
 
     @classmethod
-    def recent(cls, limit: int = 100) -> List["ModelActionLog"]:
-        return (
-            db.session.query(cls)
-            .filter(cls.status != _HISTORY_TOMBSTONE_STATUS)
-            .order_by(cls.id.desc())
-            .limit(max(1, min(limit, 500)))
-            .all()
-        )
-
-    @classmethod
-    def interrupted(cls) -> List["ModelActionLog"]:
-        return (
-            db.session.query(cls)
-            .filter(
-                cls.status.in_(
-                    ["validating", "deleting", "quarantining", "direct_deleting"]
-                )
-            )
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-    @classmethod
-    def active_delete(cls) -> Optional["ModelActionLog"]:
-        return (
-            db.session.query(cls)
-            .filter(
-                cls.action == "delete_media",
-                cls.status.in_(
-                    ["validating", "deleting", "quarantining", "direct_deleting"]
-                ),
-            )
-            .order_by(cls.id.asc())
-            .first()
-        )
-
-    @classmethod
-    def latest_for_delete(
-        cls, run_id: Any, group_id: Any, candidate_id: Any
-    ) -> Optional["ModelActionLog"]:
-        return (
-            db.session.query(cls)
-            .filter_by(
-                run_id=int(run_id),
-                group_id=int(group_id),
-                candidate_id=int(candidate_id),
-                action="delete_media",
-            )
-            .order_by(cls.id.desc())
-            .first()
-        )
-
-    @classmethod
-    def force_delete_history(cls, action_id: Any) -> Dict[str, Any]:
-        """Logically delete one inactive action and its private DB evidence.
-
-        This is intentionally a database-only operation.  It does not invoke
-        Plex, unlink media/subtitles, or remove quarantine/protection files.
-        The action tombstone reserves its numeric ID. Linked journals, batch
-        rows, and post-scan jobs remain intact so recovery data is never
-        orphaned merely because a visible history row was removed.
-        """
-
-        target_id = int(action_id)
-        session = db.session
-        try:
-            action = (
-                session.query(cls)
-                .filter(cls.id == target_id)
-                .with_for_update()
-                .first()
-            )
-            if action is None or action.status == _HISTORY_TOMBSTONE_STATUS:
-                raise ValueError("삭제 감사 이력을 찾을 수 없습니다.")
-
-            now = datetime.now()
-            _assert_no_live_deletion_lease(session, now)
-            original_status = str(action.status or "")
-            if original_status not in _FORCE_ACTION_TERMINAL_STATUSES:
-                raise RuntimeError(
-                    "실행 중이거나 상태를 확인할 수 없는 삭제 감사 이력은 "
-                    "강제로 삭제할 수 없습니다. (action=%s, status=%s)"
-                    % (action.id, action.status or "unknown")
-                )
-            claimed = (
-                session.query(cls)
-                .filter(cls.id == target_id, cls.status == original_status)
-                .update(
-                    {cls.status: _HISTORY_DELETE_CLAIM_STATUS},
-                    synchronize_session=False,
-                )
-            )
-            if claimed != 1:
-                raise RuntimeError("다른 작업이 삭제 감사 이력의 상태를 변경했습니다.")
-            session.flush()
-
-            quarantine_journals = (
-                session.query(ModelQuarantineJournal)
-                .filter(ModelQuarantineJournal.action_log_id == target_id)
-                .with_for_update()
-                .all()
-            )
-            direct_journals = (
-                session.query(ModelDirectDeleteJournal)
-                .filter(ModelDirectDeleteJournal.action_log_id == target_id)
-                .with_for_update()
-                .all()
-            )
-            allowed_journal_statuses = (
-                _SAFE_JOURNAL_TERMINAL_STATUSES | _FORCE_JOURNAL_REVIEW_STATUSES
-            )
-            for journal in quarantine_journals + direct_journals:
-                if str(journal.status or "") not in allowed_journal_statuses:
-                    raise RuntimeError(
-                        "연결된 파일 처리 작업이 아직 실행 중이어서 감사 이력을 "
-                        "삭제할 수 없습니다. (journal=%s, status=%s)"
-                        % (journal.id, journal.status or "unknown")
-                    )
-
-            job_query = session.query(ModelPostDeleteScanJob)
-            if action.run_id is None:
-                job_query = job_query.filter(
-                    ModelPostDeleteScanJob.action_log_id == target_id
-                )
-            else:
-                job_query = job_query.filter(
-                    or_(
-                        ModelPostDeleteScanJob.action_log_id == target_id,
-                        ModelPostDeleteScanJob.run_id == int(action.run_id),
-                    )
-                )
-            candidate_jobs = job_query.with_for_update().all()
-            linked_jobs = [
-                job for job in candidate_jobs if target_id in _post_scan_action_ids(job)
-            ]
-            for job in linked_jobs:
-                if (
-                    str(job.status or "") not in _SAFE_POST_SCAN_TERMINAL_STATUSES
-                    or job.lease_key is not None
-                    or bool(job.worker_token)
-                    or job.lease_expires_at is not None
-                ):
-                    raise RuntimeError(
-                        "연결된 Plex 부분 스캔 작업이 실행 중이거나 잠겨 있어 감사 "
-                        "이력을 삭제할 수 없습니다. (job=%s, status=%s)"
-                        % (job.id, job.status or "unknown")
-                    )
-
-            batch_ids = {
-                int(journal.batch_run_id)
-                for journal in quarantine_journals + direct_journals
-                if journal.batch_run_id is not None
-            }
-            linked_items = (
-                session.query(ModelBatchItem)
-                .filter(ModelBatchItem.action_log_id == target_id)
-                .with_for_update()
-                .all()
-            )
-            batch_ids.update(int(item.batch_run_id) for item in linked_items)
-            for item in linked_items:
-                if str(item.status or "") not in _SAFE_BATCH_ITEM_TERMINAL_STATUSES:
-                    raise RuntimeError(
-                        "연결된 일괄 삭제 항목이 아직 실행 중이어서 감사 이력을 "
-                        "삭제할 수 없습니다. (item=%s, status=%s)"
-                        % (item.id, item.status or "unknown")
-                    )
-            if batch_ids:
-                batches = (
-                    session.query(ModelBatchRun)
-                    .filter(ModelBatchRun.id.in_(batch_ids))
-                    .with_for_update()
-                    .all()
-                )
-                for batch in batches:
-                    if (
-                        str(batch.status or "") not in _SAFE_BATCH_TERMINAL_STATUSES
-                        or batch.lease_key is not None
-                        or bool(batch.deletion_lease_token)
-                    ):
-                        raise RuntimeError(
-                            "연결된 일괄 삭제 계획이 실행 중이거나 잠겨 있어 감사 "
-                            "이력을 삭제할 수 없습니다. (plan=%s, status=%s)"
-                            % (batch.id, batch.status or "unknown")
-                        )
-
-            action.action = _HISTORY_TOMBSTONE_STATUS
-            action.status = _HISTORY_TOMBSTONE_STATUS
-            action.message = ""
-            action.response_status = None
-            action.before_json = "{}"
-            action.after_json = "{}"
-            session.commit()
-            return {
-                "item_type": "action",
-                "item_id": target_id,
-                "history_deleted": True,
-                "journals_preserved": len(quarantine_journals)
-                + len(direct_journals),
-                "post_scan_jobs_preserved": len(linked_jobs),
-                "files_touched": False,
-                "plex_called": False,
-            }
-        except Exception:
-            session.rollback()
-            raise
-
-    @classmethod
-    def search(
-        cls,
-        page: int = 1,
-        page_size: int = 50,
-        run_id: Optional[int] = None,
-        status: str = "",
-        subtitle_filter: str = "",
-    ) -> Dict[str, Any]:
-        query = db.session.query(cls).filter(
-            cls.status != _HISTORY_TOMBSTONE_STATUS
-        )
+    def recent(
+        cls, limit: int = 100, run_id: Optional[Any] = None
+    ) -> List["ModelCleanupAction"]:
+        query = db.session.query(cls)
         if run_id is not None:
             query = query.filter_by(run_id=int(run_id))
-        if status:
-            query = query.filter_by(status=status)
-        if subtitle_filter == "excluded":
-            quarantine_has_excluded = db.session.query(
-                ModelQuarantineJournal.id
-            ).filter(
-                ModelQuarantineJournal.action_log_id == cls.id,
-                ModelQuarantineJournal.excluded_count > 0,
-            ).exists()
-            direct_has_excluded = db.session.query(
-                ModelDirectDeleteJournal.id
-            ).filter(
-                ModelDirectDeleteJournal.action_log_id == cls.id,
-                ModelDirectDeleteJournal.excluded_count > 0,
-            ).exists()
-            query = query.filter(or_(quarantine_has_excluded, direct_has_excluded))
-        elif subtitle_filter == "quarantined":
-            query = query.join(
-                ModelQuarantineJournal,
-                ModelQuarantineJournal.action_log_id == cls.id,
-            ).filter(ModelQuarantineJournal.quarantined_count > 0)
-        elif subtitle_filter == "deleted":
-            query = query.join(
-                ModelDirectDeleteJournal,
-                ModelDirectDeleteJournal.action_log_id == cls.id,
-            ).filter(ModelDirectDeleteJournal.deleted_count > 0)
-        total = query.count()
-        items = (
-            query.order_by(cls.id.desc())
-            .limit(page_size)
-            .offset((page - 1) * page_size)
-            .all()
-        )
-        return {"items": items, "total": total}
-
-
-class ModelPostDeleteScanJob(ModelBase):
-    """Durable, non-destructive scan work created by a confirmed DELETE.
-
-    ``dedupe_key`` is scoped to an action for manual deletes and to a batch for
-    batch deletes.  The latter lets several confirmed deletes in the same
-    folder share one physical scan while retaining every ActionLog id in
-    ``action_ids_json``.  ``lease_key`` is nullable/unique so SQLite and MySQL
-    both enforce a single active scan worker across FlaskFarm processes.
-    """
-
-    P = P
-    __tablename__ = "post_delete_scan_job"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    started_at = db.Column(db.DateTime)
-    finished_at = db.Column(db.DateTime)
-    action_log_id = db.Column(db.Integer, nullable=False, index=True)
-    action_ids_json = db.Column(db.Text, default="[]", nullable=False)
-    batch_run_id = db.Column(db.Integer, index=True)
-    run_id = db.Column(db.Integer, nullable=False, index=True)
-    group_id = db.Column(db.Integer, nullable=False, index=True)
-    candidate_id = db.Column(db.Integer, nullable=False)
-    server_machine_id = db.Column(db.String(128), nullable=False)
-    mode = db.Column(db.String(16), nullable=False)
-    section_key = db.Column(db.String(32), nullable=False)
-    media_type = db.Column(db.String(32), nullable=False)
-    target_path = db.Column(db.Text, nullable=False)
-    target_key = db.Column(db.String(64), nullable=False, index=True)
-    dedupe_key = db.Column(db.String(64), nullable=False, unique=True)
-    status = db.Column(db.String(32), nullable=False, index=True)
-    attempts = db.Column(db.Integer, default=0, nullable=False)
-    max_attempts = db.Column(db.Integer, default=3, nullable=False)
-    next_attempt_at = db.Column(db.DateTime, nullable=False, index=True)
-    response_status = db.Column(db.Integer)
-    last_error = db.Column(db.Text, default="")
-    # Cross-process worker internals.  None of these values is serialized.
-    lease_key = db.Column(db.String(32), unique=True, nullable=True)
-    worker_token = db.Column(db.String(128), default="", nullable=False)
-    lease_expires_at = db.Column(db.DateTime)
-
-    def as_api(self) -> Dict[str, Any]:
-        if self.status == _HISTORY_TOMBSTONE_STATUS:
-            return {
-                "id": self.id,
-                "status": _HISTORY_TOMBSTONE_STATUS,
-                "history_deleted": True,
-            }
-        return {
-            "id": self.id,
-            "created_at": _iso(self.created_at),
-            "updated_at": _iso(self.updated_at),
-            "started_at": _iso(self.started_at),
-            "finished_at": _iso(self.finished_at),
-            "action_id": self.action_log_id,
-            "action_ids": _json_load(self.action_ids_json, []),
-            "batch_id": self.batch_run_id,
-            "run_id": self.run_id,
-            "group_id": self.group_id,
-            "candidate_id": self.candidate_id,
-            "mode": self.mode,
-            "section_key": self.section_key,
-            "media_type": self.media_type,
-            "target_path": self.target_path,
-            "status": self.status,
-            "attempts": self.attempts or 0,
-            "max_attempts": self.max_attempts or 0,
-            "next_attempt_at": _iso(self.next_attempt_at),
-            "response_status": self.response_status,
-            "last_error": self.last_error or "",
-        }
-
-    @classmethod
-    def get(cls, job_id: Any) -> Optional["ModelPostDeleteScanJob"]:
-        return db.session.query(cls).filter_by(id=int(job_id)).first()
-
-    @classmethod
-    def by_dedupe_key(cls, dedupe_key: str) -> Optional["ModelPostDeleteScanJob"]:
-        return db.session.query(cls).filter_by(dedupe_key=str(dedupe_key)).first()
-
-    @classmethod
-    def recent(cls, limit: int = 100) -> List["ModelPostDeleteScanJob"]:
         return (
-            db.session.query(cls)
-            .filter(cls.status != _HISTORY_TOMBSTONE_STATUS)
-            .order_by(cls.id.desc())
+            query.order_by(cls.id.desc())
             .limit(max(1, min(int(limit), 500)))
             .all()
         )
 
     @classmethod
-    def search(
-        cls, page: int = 1, page_size: int = 50
-    ) -> Dict[str, Any]:
-        """Return one stable page of visible post-delete scan jobs."""
+    def recover_interrupted(cls) -> int:
+        """A DELETE in flight at process loss has an unknowable outcome."""
 
-        page_size = max(10, min(100, int(page_size)))
-        page = max(1, int(page))
-        query = db.session.query(cls).filter(
-            cls.status != _HISTORY_TOMBSTONE_STATUS
-        )
-        total = query.count()
-        pages = max(1, (total + page_size - 1) // page_size)
-        page = min(page, pages)
-        items = (
-            query.order_by(cls.id.desc())
-            .limit(page_size)
-            .offset((page - 1) * page_size)
-            .all()
-        )
-        return {
-            "items": items,
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "pages": pages,
-        }
-
-    @classmethod
-    def force_delete_history(cls, job_id: Any) -> Dict[str, Any]:
-        """Hide and scrub one terminal post-scan DB row, never rerun it."""
-
-        target_id = int(job_id)
-        session = db.session
-        try:
-            job = (
-                session.query(cls)
-                .filter(cls.id == target_id)
-                .with_for_update()
-                .first()
-            )
-            if job is None or job.status == _HISTORY_TOMBSTONE_STATUS:
-                raise ValueError("삭제 후 부분 스캔 작업을 찾을 수 없습니다.")
-
-            now = datetime.now()
-            _assert_no_live_deletion_lease(session, now)
-            original_status = str(job.status or "")
-            if (
-                original_status not in _SAFE_POST_SCAN_TERMINAL_STATUSES
-                or job.lease_key is not None
-                or bool(job.worker_token)
-                or job.lease_expires_at is not None
-            ):
-                raise RuntimeError(
-                    "실행 중이거나 잠긴 Plex 부분 스캔 작업은 강제로 삭제할 수 "
-                    "없습니다. (job=%s, status=%s)"
-                    % (job.id, job.status or "unknown")
-                )
-            claimed = (
-                session.query(cls)
-                .filter(cls.id == target_id, cls.status == original_status)
-                .update(
-                    {cls.status: _HISTORY_DELETE_CLAIM_STATUS},
-                    synchronize_session=False,
-                )
-            )
-            if claimed != 1:
-                raise RuntimeError(
-                    "다른 작업이 Plex 부분 스캔 작업의 상태를 변경했습니다."
-                )
-            session.flush()
-
-            action_ids = _post_scan_action_ids(job)
-            if action_ids:
-                actions = (
-                    session.query(ModelActionLog)
-                    .filter(ModelActionLog.id.in_(action_ids))
-                    .with_for_update()
-                    .all()
-                )
-                for action in actions:
-                    if (
-                        str(action.status or "")
-                        not in _FORCE_ACTION_TERMINAL_STATUSES
-                    ):
-                        raise RuntimeError(
-                            "연결된 삭제 감사 이력이 실행 중이거나 상태를 확인할 수 "
-                            "없어 부분 스캔 작업을 삭제할 수 없습니다. "
-                            "(action=%s, status=%s)"
-                            % (action.id, action.status or "unknown")
-                        )
-                allowed_journal_statuses = (
-                    _SAFE_JOURNAL_TERMINAL_STATUSES
-                    | _FORCE_JOURNAL_REVIEW_STATUSES
-                )
-                for journal_type in (
-                    ModelQuarantineJournal,
-                    ModelDirectDeleteJournal,
-                ):
-                    journals = (
-                        session.query(journal_type)
-                        .filter(journal_type.action_log_id.in_(action_ids))
-                        .with_for_update()
-                        .all()
-                    )
-                    for journal in journals:
-                        if (
-                            str(journal.status or "")
-                            not in allowed_journal_statuses
-                        ):
-                            raise RuntimeError(
-                                "연결된 파일 처리 작업이 아직 실행 중이어서 부분 "
-                                "스캔 작업을 삭제할 수 없습니다. "
-                                "(journal=%s, status=%s)"
-                                % (journal.id, journal.status or "unknown")
-                            )
-
-            if job.batch_run_id is not None:
-                batch = (
-                    session.query(ModelBatchRun)
-                    .filter(ModelBatchRun.id == int(job.batch_run_id))
-                    .with_for_update()
-                    .first()
-                )
-                if batch is not None and (
-                    str(batch.status or "") not in _SAFE_BATCH_TERMINAL_STATUSES
-                    or batch.lease_key is not None
-                    or bool(batch.deletion_lease_token)
-                ):
-                    raise RuntimeError(
-                        "연결된 일괄 삭제 계획이 실행 중이거나 잠겨 있어 부분 스캔 "
-                        "작업을 삭제할 수 없습니다. (plan=%s, status=%s)"
-                        % (batch.id, batch.status or "unknown")
-                    )
-
-            _tombstone_post_scan_job(job, now)
-            session.commit()
-            return {
-                "item_type": "post_scan",
-                "item_id": target_id,
-                "history_deleted": True,
-                "files_touched": False,
-                "plex_called": False,
-            }
-        except Exception:
-            session.rollback()
-            raise
-
-    @classmethod
-    def by_batch(cls, batch_id: Any) -> List["ModelPostDeleteScanJob"]:
-        return (
+        now = datetime.now()
+        count = (
             db.session.query(cls)
-            .filter_by(batch_run_id=int(batch_id))
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-    @classmethod
-    def active_for_action(cls, action_id: Any) -> Optional["ModelPostDeleteScanJob"]:
-        target = int(action_id)
-        jobs = (
-            db.session.query(cls)
-            .filter(cls.status.in_(["queued", "running", "retry_wait"]))
-            .order_by(cls.id.asc())
-            .all()
-        )
-        for job in jobs:
-            if int(job.action_log_id or 0) == target:
-                return job
-            values = _json_load(job.action_ids_json, [])
-            for value in values if isinstance(values, list) else []:
-                try:
-                    if int(value) == target:
-                        return job
-                except (TypeError, ValueError):
-                    continue
-        return None
-
-    @classmethod
-    def eligible_next(cls, now: datetime) -> Optional["ModelPostDeleteScanJob"]:
-        return (
-            db.session.query(cls)
-            .filter(
-                cls.status.in_(["queued", "retry_wait"]),
-                cls.next_attempt_at <= now,
-            )
-            .order_by(cls.id.asc())
-            .first()
-        )
-
-    @classmethod
-    def claim_for_worker(
-        cls, job_id: Any, worker_token: str, now: datetime, lease_expires_at: datetime
-    ) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == int(job_id),
-                cls.status.in_(["queued", "retry_wait"]),
-                cls.next_attempt_at <= now,
-            )
+            .filter(cls.status == "deleting")
             .update(
                 {
-                    cls.status: "running",
-                    cls.started_at: now,
-                    cls.updated_at: now,
-                    cls.attempts: cls.attempts + 1,
-                    cls.lease_key: "global",
-                    cls.worker_token: str(worker_token),
-                    cls.lease_expires_at: lease_expires_at,
-                    cls.last_error: "",
+                    cls.status: "unknown",
+                    cls.finished_at: now,
+                    cls.message: "플러그인 재시작으로 DELETE 결과를 확인할 수 없음",
                 },
                 synchronize_session=False,
             )
         )
-        return updated == 1
+        return int(count or 0)
 
-    @classmethod
-    def stale_running(cls, now: datetime) -> List["ModelPostDeleteScanJob"]:
-        return (
-            db.session.query(cls)
-            .filter(
-                cls.status == "running",
-                cls.lease_expires_at < now,
-            )
-            .order_by(cls.id.asc())
-            .all()
-        )
 
-    @classmethod
-    def recover_stale_one(cls, job_id: Any, worker_token: str, now: datetime) -> bool:
-        job = cls.get(job_id)
-        if job is None:
-            return False
-        terminal = int(job.attempts or 0) >= int(job.max_attempts or 3)
-        values = {
-            cls.status: "failed" if terminal else "retry_wait",
-            cls.updated_at: now,
-            cls.finished_at: now if terminal else None,
-            cls.next_attempt_at: now,
-            cls.last_error: "작업 worker 응답이 없어 만료 복구되었습니다.",
-            cls.lease_key: None,
-            cls.worker_token: "",
-            cls.lease_expires_at: None,
-        }
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == int(job_id),
-                cls.status == "running",
-                cls.worker_token == str(worker_token),
-                cls.lease_expires_at < now,
-            )
-            .update(values, synchronize_session=False)
-        )
-        return updated == 1
-
-
-class ModelQuarantineJournal(ModelBase):
-    """Durable manifest for the opt-in filesystem quarantine backend.
-
-    A new table preserves v1.2 upgrade compatibility because FlaskFarm's
-    ``create_all`` lifecycle does not ALTER existing plugin tables.
-    """
-
-    P = P
-    __tablename__ = "quarantine_journal"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    finished_at = db.Column(db.DateTime)
-    action_log_id = db.Column(db.Integer, index=True)
-    batch_run_id = db.Column(db.Integer, index=True)
-    run_id = db.Column(db.Integer, nullable=False, index=True)
-    group_id = db.Column(db.Integer, nullable=False, index=True)
-    candidate_id = db.Column(db.Integer, nullable=False)
-    keep_candidate_id = db.Column(db.Integer, nullable=False)
-    operation_key = db.Column(db.String(64), nullable=False, unique=True)
-    status = db.Column(db.String(32), nullable=False, index=True)
-    plan_digest = db.Column(db.String(64), nullable=False, index=True)
-    manifest_json = db.Column(db.Text, default="{}", nullable=False)
-    moved_json = db.Column(db.Text, default="[]", nullable=False)
-    backups_json = db.Column(db.Text, default="[]", nullable=False)
-    operation_path = db.Column(db.Text, default="")
-    eligible_count = db.Column(db.Integer, default=0, nullable=False)
-    excluded_count = db.Column(db.Integer, default=0, nullable=False, index=True)
-    protected_count = db.Column(db.Integer, default=0, nullable=False)
-    quarantined_count = db.Column(db.Integer, default=0, nullable=False, index=True)
-    last_error = db.Column(db.Text, default="")
-
-    def cleanup_api(self, include_paths: bool = True) -> Dict[str, Any]:
-        manifest = _json_load(self.manifest_json, {})
-        moved = _json_load(self.moved_json, [])
-        eligible = manifest.get("eligible", []) if isinstance(manifest, dict) else []
-        excluded = manifest.get("excluded", []) if isinstance(manifest, dict) else []
-        moved_subtitles = {
-            str(raw.get("source_path") or ""): str(
-                raw.get("destination_path") or ""
-            )
-            for raw in moved
-            if isinstance(raw, dict)
-            and raw.get("kind") == "subtitle"
-            and raw.get("source_path")
-        } if isinstance(moved, list) else {}
-
-        def public_entries(values: Any) -> List[Dict[str, Any]]:
-            result: List[Dict[str, Any]] = []
-            if not isinstance(values, list):
-                return result
-            for raw in values:
-                if not isinstance(raw, dict):
-                    continue
-                path = str(raw.get("path") or raw.get("source_path") or "")
-                result.append(
-                    {
-                        "path": path,
-                        "source_path": path,
-                        "reason": str(raw.get("reason") or ""),
-                    }
-                )
-                destination = moved_subtitles.get(path, "")
-                if destination:
-                    result[-1]["quarantine_path"] = destination
-            return result
-
-        value: Dict[str, Any] = {
-            "enabled": True,
-            "backend": "quarantine",
-            "status": self.status or "",
-            "operation_id": self.operation_key,
-            "eligible": public_entries(eligible) if include_paths else [],
-            "excluded": public_entries(excluded) if include_paths else [],
-            "counts": {
-                "eligible": self.eligible_count or 0,
-                "excluded": self.excluded_count or 0,
-                "protected": self.protected_count or 0,
-                "quarantined": self.quarantined_count or 0,
-            },
-        }
-        if include_paths and self.operation_path:
-            value["quarantine_dir"] = self.operation_path
-        if self.last_error:
-            value["message"] = self.last_error
-        return value
-
-    def as_api(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "created_at": _iso(self.created_at),
-            "updated_at": _iso(self.updated_at),
-            "finished_at": _iso(self.finished_at),
-            "action_id": self.action_log_id,
-            "batch_id": self.batch_run_id,
-            "run_id": self.run_id,
-            "group_id": self.group_id,
-            "candidate_id": self.candidate_id,
-            "keep_candidate_id": self.keep_candidate_id,
-            "plan_digest": str(self.plan_digest or ""),
-            "subtitle_cleanup": self.cleanup_api(True),
-        }
-
-    @classmethod
-    def get(cls, journal_id: Any) -> Optional["ModelQuarantineJournal"]:
-        return db.session.query(cls).filter_by(id=int(journal_id)).first()
-
-    @classmethod
-    def for_action(cls, action_id: Any) -> Optional["ModelQuarantineJournal"]:
-        return (
-            db.session.query(cls)
-            .filter_by(action_log_id=int(action_id))
-            .order_by(cls.id.desc())
-            .first()
-        )
-
-    @classmethod
-    def for_plan(
-        cls, run_id: Any, group_id: Any, candidate_id: Any, plan_digest: str
-    ) -> Optional["ModelQuarantineJournal"]:
-        return (
-            db.session.query(cls)
-            .filter_by(
-                run_id=int(run_id),
-                group_id=int(group_id),
-                candidate_id=int(candidate_id),
-                plan_digest=str(plan_digest),
-            )
-            .order_by(cls.id.desc())
-            .first()
-        )
-
-    @classmethod
-    def for_batch_candidate(
-        cls, batch_id: Any, candidate_id: Any, status: str = ""
-    ) -> Optional["ModelQuarantineJournal"]:
-        query = db.session.query(cls).filter_by(
-            batch_run_id=int(batch_id), candidate_id=int(candidate_id)
-        )
-        if status:
-            query = query.filter_by(status=str(status))
-        return query.order_by(cls.id.desc()).first()
-
-    @classmethod
-    def unfinished(cls) -> List["ModelQuarantineJournal"]:
-        return (
-            db.session.query(cls)
-            .filter(
-                cls.status.in_(
-                    [
-                        "planned",
-                        "backing_up",
-                        "quarantining",
-                        "quarantined_pending_scan",
-                        "scan_running",
-                    ]
-                )
-            )
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-
-class ModelDirectDeleteJournal(ModelBase):
-    """Durable, append-style evidence for the opt-in direct filesystem backend.
-
-    This is intentionally a new table: FlaskFarm's create_all upgrade path does
-    not ALTER existing plugin tables.
-    """
-
-    P = P
-    __tablename__ = "direct_delete_journal"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    finished_at = db.Column(db.DateTime)
-    action_log_id = db.Column(db.Integer, index=True)
-    batch_run_id = db.Column(db.Integer, index=True)
-    run_id = db.Column(db.Integer, nullable=False, index=True)
-    group_id = db.Column(db.Integer, nullable=False, index=True)
-    candidate_id = db.Column(db.Integer, nullable=False)
-    keep_candidate_id = db.Column(db.Integer, nullable=False)
-    operation_key = db.Column(db.String(64), nullable=False, unique=True)
-    status = db.Column(db.String(32), nullable=False, index=True)
-    plan_digest = db.Column(db.String(64), nullable=False, index=True)
-    manifest_json = db.Column(db.Text, default="{}", nullable=False)
-    unlink_json = db.Column(db.Text, default="[]", nullable=False)
-    operation_paths_json = db.Column(db.Text, default="[]", nullable=False)
-    eligible_count = db.Column(db.Integer, default=0, nullable=False)
-    excluded_count = db.Column(db.Integer, default=0, nullable=False, index=True)
-    protected_count = db.Column(db.Integer, default=0, nullable=False)
-    deleted_count = db.Column(db.Integer, default=0, nullable=False, index=True)
-    last_error = db.Column(db.Text, default="")
-
-    def cleanup_api(self, include_paths: bool = True) -> Dict[str, Any]:
-        manifest = _json_load(self.manifest_json, {})
-        operations = _json_load(self.unlink_json, [])
-        eligible = manifest.get("eligible", []) if isinstance(manifest, dict) else []
-        excluded = manifest.get("excluded", []) if isinstance(manifest, dict) else []
-        protected = manifest.get("protected", []) if isinstance(manifest, dict) else []
-        blocking = [
-            raw
-            for raw in excluded
-            if isinstance(raw, dict)
-            and str(raw.get("reason") or "").startswith(
-                "required_backup_unavailable:"
-            )
-        ] if isinstance(excluded, list) else []
-        deleted_paths = {
-            str(raw.get("source_path") or "")
-            for raw in operations
-            if isinstance(raw, dict)
-            and raw.get("kind") == "subtitle"
-            and raw.get("state") in (
-                "deleted",
-                "removed_by_plex",
-                "deleted_by_plugin",
-            )
-        } if isinstance(operations, list) else set()
-
-        def public_entries(values: Any, included: bool) -> List[Dict[str, Any]]:
-            result: List[Dict[str, Any]] = []
-            if not isinstance(values, list):
-                return result
-            for raw in values:
-                if not isinstance(raw, dict):
-                    continue
-                path = str(raw.get("path") or raw.get("source_path") or "")
-                entry = {
-                    "path": path,
-                    "source_path": path,
-                    "reason": str(raw.get("reason") or ""),
-                }
-                if included:
-                    entry["deleted"] = path in deleted_paths
-                result.append(entry)
-            return result
-
-        value: Dict[str, Any] = {
-            "enabled": True,
-            "backend": "direct",
-            "status": self.status or "",
-            "executable": not bool(blocking),
-            # The random operation key is also part of the private backup
-            # directory name.  Expose the journal row id instead so API/history
-            # responses never disclose internal protection paths or tokens.
-            "operation_id": self.id,
-            "plan_digest": str(self.plan_digest or ""),
-            "eligible": public_entries(eligible, True) if include_paths else [],
-            "excluded": public_entries(excluded, False) if include_paths else [],
-            "protected": public_entries(protected, False) if include_paths else [],
-            "protected_subtitles": (
-                public_entries(protected, False) if include_paths else []
-            ),
-            "blocking": public_entries(blocking, False) if include_paths else [],
-            "counts": {
-                "eligible": self.eligible_count or 0,
-                "excluded": self.excluded_count or 0,
-                "protected": self.protected_count or 0,
-                "deleted": self.deleted_count or 0,
-                "blocking": len(blocking),
-            },
-        }
-        if self.status == "recovery_required" and isinstance(operations, list):
-            recovery_items: List[Dict[str, Any]] = []
-            recovery_counts = {
-                "source_only": 0,
-                "tombstone_only": 0,
-                "both_absent": 0,
-                "conflict": 0,
-                "unreadable": 0,
-            }
-            for index, raw in enumerate(operations):
-                if not isinstance(raw, dict):
-                    continue
-                source = str(raw.get("source_path") or "")
-                tombstone = str(raw.get("tombstone_path") or "")
-                try:
-                    if not source or not tombstone:
-                        raise ValueError("missing recovery path")
-                    source_exists = bool(source and os.path.lexists(source))
-                    tombstone_exists = bool(
-                        tombstone and os.path.lexists(tombstone)
-                    )
-                    if source_exists and not tombstone_exists:
-                        observed = "source_only"
-                    elif not source_exists and tombstone_exists:
-                        observed = "tombstone_only"
-                    elif not source_exists and not tombstone_exists:
-                        observed = "both_absent"
-                    else:
-                        observed = "conflict"
-                except (OSError, ValueError):
-                    source_exists = False
-                    tombstone_exists = False
-                    observed = "unreadable"
-                recovery_counts[observed] += 1
-                recovery_items.append(
-                    {
-                        "index": index,
-                        "kind": str(raw.get("kind") or "unknown"),
-                        "recorded_state": str(raw.get("state") or "unknown"),
-                        "state": observed,
-                        "source_exists": source_exists,
-                        "handoff_exists": tombstone_exists,
-                    }
-                )
-            value["recovery_diagnostics"] = recovery_items
-            value["recovery_diagnostic_summary"] = {
-                "mode": "read_only",
-                "automatic_action": False,
-                "legacy_layout": bool(
-                    _json_load(self.operation_paths_json, [])
-                ),
-                "counts": recovery_counts,
-            }
-        if self.last_error:
-            value["message"] = self.last_error
-        return value
-
-    def as_api(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "created_at": _iso(self.created_at),
-            "updated_at": _iso(self.updated_at),
-            "finished_at": _iso(self.finished_at),
-            "action_id": self.action_log_id,
-            "batch_id": self.batch_run_id,
-            "run_id": self.run_id,
-            "group_id": self.group_id,
-            "candidate_id": self.candidate_id,
-            "keep_candidate_id": self.keep_candidate_id,
-            "plan_digest": self.plan_digest,
-            "subtitle_cleanup": self.cleanup_api(True),
-        }
-
-    @classmethod
-    def get(cls, journal_id: Any) -> Optional["ModelDirectDeleteJournal"]:
-        return db.session.query(cls).filter_by(id=int(journal_id)).first()
-
-    @classmethod
-    def for_action(cls, action_id: Any) -> Optional["ModelDirectDeleteJournal"]:
-        return (
-            db.session.query(cls)
-            .filter_by(action_log_id=int(action_id))
-            .order_by(cls.id.desc())
-            .first()
-        )
-
-    @classmethod
-    def for_batch_candidate(
-        cls, batch_id: Any, candidate_id: Any, status: str = ""
-    ) -> Optional["ModelDirectDeleteJournal"]:
-        query = db.session.query(cls).filter_by(
-            batch_run_id=int(batch_id), candidate_id=int(candidate_id)
-        )
-        if status:
-            query = query.filter_by(status=str(status))
-        return query.order_by(cls.id.desc()).first()
-
-    @classmethod
-    def unfinished(cls) -> List["ModelDirectDeleteJournal"]:
-        return (
-            db.session.query(cls)
-            .filter(
-                cls.status.in_(
-                    [
-                        "planned",
-                        "preparing",
-                        "deleting",
-                        "deleted_pending_scan",
-                        "scan_running",
-                    ]
-                )
-            )
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-    @classmethod
-    def completed_with_backups(
-        cls, limit: int = 100
-    ) -> List["ModelDirectDeleteJournal"]:
-        """Return verified hybrid journals whose private copies may need cleanup."""
-
-        return (
-            db.session.query(cls)
-            .filter(
-                cls.status.in_(("verified", "trash_pending")),
-                cls.operation_paths_json != "[]",
-            )
-            .order_by(cls.id.asc())
-            .limit(max(1, min(int(limit), 500)))
-            .all()
-        )
-
-
-class ModelBatchRun(ModelBase):
-    P = P
-    __tablename__ = "batch_run"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    scan_run_id = db.Column(db.Integer, nullable=False, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    approved_at = db.Column(db.DateTime)
-    started_at = db.Column(db.DateTime)
-    finished_at = db.Column(db.DateTime)
-    expires_at = db.Column(db.DateTime, nullable=False)
-    status = db.Column(db.String(32), nullable=False, index=True)
-    # A nullable unique value provides a cross-process/global batch lease on
-    # both SQLite and MySQL. Preview rows keep NULL; only an approved batch owns
-    # the literal ``global`` value until it reaches a terminal state.
-    lease_key = db.Column(db.String(32), unique=True, nullable=True)
-    deletion_lease_token = db.Column(db.String(128), default="")
-    confirmation = db.Column(db.String(128), default="")
-    # Only a SHA-256 digest is persisted. The raw nonce exists in the user's
-    # signed Flask session for the short preview window and is never stored here.
-    nonce_hash = db.Column(db.String(64), default="")
-    total_items = db.Column(db.Integer, default=0, nullable=False)
-    processed_items = db.Column(db.Integer, default=0, nullable=False)
-    succeeded_items = db.Column(db.Integer, default=0, nullable=False)
-    failed_items = db.Column(db.Integer, default=0, nullable=False)
-    skipped_items = db.Column(db.Integer, default=0, nullable=False)
-    cancellation_requested = db.Column(db.Boolean, default=False, nullable=False)
-    current_message = db.Column(db.String(512), default="")
-    error_summary = db.Column(db.Text, default="")
-
-    def as_api(self) -> Dict[str, Any]:
-        value = {
-            "plan_id": self.id,
-            "run_id": self.scan_run_id,
-            "created_at": _iso(self.created_at),
-            "approved_at": _iso(self.approved_at),
-            "started_at": _iso(self.started_at),
-            "finished_at": _iso(self.finished_at),
-            "expires_at": _iso(self.expires_at),
-            "status": self.status,
-            "total": self.total_items or 0,
-            "processed": self.processed_items or 0,
-            "succeeded": self.succeeded_items or 0,
-            "failed": self.failed_items or 0,
-            "skipped": self.skipped_items or 0,
-            "cancel_requested": bool(self.cancellation_requested),
-            "current_message": self.current_message or "",
-            "error_summary": self.error_summary or "",
-        }
-        return value
-
-    @classmethod
-    def get(cls, batch_id: Any) -> Optional["ModelBatchRun"]:
-        return db.session.query(cls).filter_by(id=int(batch_id)).first()
-
-    @classmethod
-    def active(cls) -> Optional["ModelBatchRun"]:
-        return (
-            db.session.query(cls)
-            .filter(cls.status.in_(["queued", "running", "cancelling"]))
-            .order_by(cls.id.desc())
-            .first()
-        )
-
-    @classmethod
-    def latest_for_scan(cls, run_id: Any) -> Optional["ModelBatchRun"]:
-        return (
-            db.session.query(cls)
-            .filter_by(scan_run_id=int(run_id))
-            .order_by(cls.id.desc())
-            .first()
-        )
-
-    @classmethod
-    def claim_for_approval(
-        cls,
-        batch_id: Any,
-        nonce_hash: str,
-        deletion_lease_token: str,
-        now: datetime,
-    ) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == int(batch_id),
-                cls.status == "preview",
-                cls.expires_at >= now,
-                cls.nonce_hash == str(nonce_hash),
-            )
-            .update(
-                {
-                    cls.status: "queued",
-                    cls.approved_at: now,
-                    cls.current_message: "승인됨 · 백그라운드 작업 대기 중",
-                    cls.nonce_hash: "",
-                    cls.lease_key: "global",
-                    cls.deletion_lease_token: str(deletion_lease_token),
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def claim_for_worker(cls, batch_id: Any, now: datetime) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(cls.id == int(batch_id), cls.status == "queued")
-            .update(
-                {
-                    cls.status: "running",
-                    cls.started_at: now,
-                    cls.current_message: "일괄 승인 삭제 시작",
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def unfinished(cls) -> List["ModelBatchRun"]:
-        return (
-            db.session.query(cls)
-            .filter(cls.status.in_(["queued", "running", "cancelling"]))
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-
-class ModelBatchExclusion(ModelBase):
-    """Durable, review-only reason why one group was omitted from a batch.
-
-    Exclusions are deliberately separate from :class:`ModelBatchItem`: they
-    never contribute to progress counters, approval completeness checks, or
-    worker mutation queues.  A dedicated table also lets existing FlaskFarm
-    installations receive the schema through ``create_all`` without requiring
-    an ALTER TABLE migration on ``batch_run``.
-    """
-
-    P = P
-    __tablename__ = "batch_exclusion"
-    __table_args__ = (
-        UniqueConstraint(
-            "batch_run_id",
-            "group_id",
-            name="uq_pdff_batch_exclusion_group",
-        ),
-        {"mysql_collate": "utf8_general_ci"},
-    )
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    batch_run_id = db.Column(db.Integer, nullable=False, index=True)
-    scan_run_id = db.Column(db.Integer, nullable=False, index=True)
-    group_id = db.Column(db.Integer, nullable=False, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    title = db.Column(db.String(512), default="")
-    media_type = db.Column(db.String(32), default="")
-    reason = db.Column(db.String(64), nullable=False)
-    message = db.Column(db.Text, default="")
-
-    def as_api(self) -> Dict[str, Any]:
-        return {
-            "group_id": self.group_id,
-            "title": self.title or "",
-            "media_type": self.media_type or "",
-            "reason": self.reason or "",
-            "message": self.message or "",
-        }
-
-    @classmethod
-    def by_batch(cls, batch_id: Any) -> List["ModelBatchExclusion"]:
-        return (
-            db.session.query(cls)
-            .filter_by(batch_run_id=int(batch_id))
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-
-class ModelBatchItem(ModelBase):
-    P = P
-    __tablename__ = "batch_item"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    batch_run_id = db.Column(db.Integer, nullable=False, index=True)
-    scan_run_id = db.Column(db.Integer, nullable=False, index=True)
-    group_id = db.Column(db.Integer, nullable=False, index=True)
-    keep_candidate_id = db.Column(db.Integer, nullable=False)
-    delete_candidate_id = db.Column(db.Integer, nullable=False)
-    action_log_id = db.Column(db.Integer)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
-    started_at = db.Column(db.DateTime)
-    finished_at = db.Column(db.DateTime)
-    status = db.Column(db.String(32), nullable=False, index=True)
-    message = db.Column(db.Text, default="")
-    title = db.Column(db.String(512), default="")
-    media_type = db.Column(db.String(32), default="")
-    keep_media_id = db.Column(db.String(64), nullable=False)
-    delete_media_id = db.Column(db.String(64), nullable=False)
-    keep_score = db.Column(db.Float, default=0)
-    delete_score = db.Column(db.Float, default=0)
-    keep_paths_json = db.Column(db.Text, default="[]")
-    delete_paths_json = db.Column(db.Text, default="[]")
-
-    def as_api(self) -> Dict[str, Any]:
-        value = {
-            "id": self.id,
-            "plan_id": self.batch_run_id,
-            "run_id": self.scan_run_id,
-            "group_id": self.group_id,
-            "title": self.title or "",
-            "media_type": self.media_type or "",
-            "keep": {
-                "candidate_id": self.keep_candidate_id,
-                "media_id": self.keep_media_id,
-                "score": round(self.keep_score or 0, 3),
-                "paths": _json_load(self.keep_paths_json, []),
-            },
-            "delete": {
-                "candidate_id": self.delete_candidate_id,
-                "media_id": self.delete_media_id,
-                "score": round(self.delete_score or 0, 3),
-                "paths": _json_load(self.delete_paths_json, []),
-            },
-            "status": self.status,
-            "message": self.message or "",
-            "action_id": self.action_log_id,
-            "created_at": _iso(self.created_at),
-            "started_at": _iso(self.started_at),
-            "finished_at": _iso(self.finished_at),
-        }
-        try:
-            journal = ModelQuarantineJournal.for_batch_candidate(
-                self.batch_run_id, self.delete_candidate_id
-            )
-            if journal is None:
-                journal = ModelDirectDeleteJournal.for_batch_candidate(
-                    self.batch_run_id, self.delete_candidate_id
-                )
-        except Exception:
-            # Serialization of a legacy v1.2 row must remain available even if
-            # the new journal table has not yet been created in this process.
-            journal = None
-        if journal is not None:
-            value["plan_digest"] = journal.plan_digest
-            value["subtitle_cleanup"] = journal.cleanup_api(True)
-        return value
-
-    @classmethod
-    def get(cls, item_id: Any) -> Optional["ModelBatchItem"]:
-        return db.session.query(cls).filter_by(id=int(item_id)).first()
-
-    @classmethod
-    def by_batch(cls, batch_id: Any) -> List["ModelBatchItem"]:
-        return (
-            db.session.query(cls)
-            .filter_by(batch_run_id=int(batch_id))
-            .order_by(cls.id.asc())
-            .all()
-        )
-
-    @classmethod
-    def claim_for_worker(cls, item_id: Any, now: datetime) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(cls.id == int(item_id), cls.status == "planned")
-            .update(
-                {
-                    cls.status: "running",
-                    cls.started_at: now,
-                    cls.message: "삭제 전 재검증 중",
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-
-class ModelDeletionLease(ModelBase):
-    """Singleton cross-process mutex for every Plex deletion transaction."""
-
-    P = P
-    __tablename__ = "deletion_lease"
-    __table_args__ = {"mysql_collate": "utf8_general_ci"}
-    __bind_key__ = P.package_name
-
-    id = db.Column(db.Integer, primary_key=True)
-    owner_token = db.Column(db.String(128), default="", nullable=False)
-    owner_kind = db.Column(db.String(32), default="", nullable=False)
-    owner_ref = db.Column(db.String(128), default="", nullable=False)
-    acquired_at = db.Column(db.DateTime)
-    heartbeat_at = db.Column(db.DateTime)
-    expires_at = db.Column(db.DateTime)
-
-    @classmethod
-    def get_singleton(cls) -> Optional["ModelDeletionLease"]:
-        return db.session.query(cls).filter_by(id=1).first()
-
-    @classmethod
-    def claim_free(
-        cls,
-        owner_token: str,
-        owner_kind: str,
-        owner_ref: str,
-        now: datetime,
-        expires_at: datetime,
-    ) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(cls.id == 1, cls.owner_token == "")
-            .update(
-                {
-                    cls.owner_token: owner_token,
-                    cls.owner_kind: owner_kind,
-                    cls.owner_ref: owner_ref,
-                    cls.acquired_at: now,
-                    cls.heartbeat_at: now,
-                    cls.expires_at: expires_at,
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def renew(
-        cls,
-        owner_token: str,
-        owner_kind: str,
-        owner_ref: str,
-        now: datetime,
-        expires_at: datetime,
-    ) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == 1,
-                cls.owner_token == owner_token,
-                cls.owner_kind == owner_kind,
-                cls.owner_ref == owner_ref,
-                cls.expires_at >= now,
-            )
-            .update(
-                {cls.heartbeat_at: now, cls.expires_at: expires_at},
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def release(cls, owner_token: str) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(cls.id == 1, cls.owner_token == owner_token)
-            .update(
-                {
-                    cls.owner_token: "",
-                    cls.owner_kind: "",
-                    cls.owner_ref: "",
-                    cls.acquired_at: None,
-                    cls.heartbeat_at: None,
-                    cls.expires_at: None,
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def claim_expired_for_recovery(
-        cls,
-        previous_owner_token: str,
-        recovery_token: str,
-        owner_ref: str,
-        now: datetime,
-        expires_at: datetime,
-    ) -> bool:
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == 1,
-                cls.owner_token == previous_owner_token,
-                cls.owner_token != "",
-                cls.expires_at < now,
-            )
-            .update(
-                {
-                    cls.owner_token: recovery_token,
-                    cls.owner_kind: "recovery",
-                    cls.owner_ref: owner_ref,
-                    cls.acquired_at: now,
-                    cls.heartbeat_at: now,
-                    cls.expires_at: expires_at,
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
-
-    @classmethod
-    def clear_expired_owner(
-        cls, owner_kind: str, owner_ref: str, now: datetime
-    ) -> bool:
-        """Release only the named expired owner; never steal a live lease."""
-
-        updated = (
-            db.session.query(cls)
-            .filter(
-                cls.id == 1,
-                cls.owner_token != "",
-                cls.owner_kind == str(owner_kind),
-                cls.owner_ref == str(owner_ref),
-                cls.expires_at < now,
-            )
-            .update(
-                {
-                    cls.owner_token: "",
-                    cls.owner_kind: "",
-                    cls.owner_ref: "",
-                    cls.acquired_at: None,
-                    cls.heartbeat_at: None,
-                    cls.expires_at: None,
-                },
-                synchronize_session=False,
-            )
-        )
-        return updated == 1
+__all__ = [
+    "ACTIVE_RUN_STATUSES",
+    "ModelCleanupAction",
+    "ModelCleanupRun",
+]

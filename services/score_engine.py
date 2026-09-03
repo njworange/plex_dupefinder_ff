@@ -1,224 +1,230 @@
+"""Deterministic, configurable scoring for Plex duplicate candidates."""
+
 from __future__ import annotations
 
 import fnmatch
-import json
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Iterable, Mapping, Optional, Pattern, Tuple
 
-from .domain import MediaVersion, ScoreResult
+from .domain import DuplicateGroup, MediaCandidate, ScoreResult
 
 
-DEFAULT_VIDEO_CODEC_SCORES: Dict[str, float] = {
-    "av1": 5000,
-    "hevc": 4000,
-    "h265": 4000,
-    "vp9": 3000,
-    "h264": 2000,
-    "mpeg4": 1000,
-    "mpeg2video": 500,
+DEFAULT_AUDIO_CODEC_SCORES = {
+    "mp3": 500.0,
+    "aac": 1000.0,
+    "ac3": 2500.0,
+    "eac3": 3000.0,
+    "dca": 4000.0,
+    "dts": 4000.0,
+    "flac": 4500.0,
+    "truehd": 5000.0,
+}
+DEFAULT_VIDEO_CODEC_SCORES = {
+    "mpeg2video": 500.0,
+    "mpeg4": 750.0,
+    "vc1": 1000.0,
+    "h264": 2000.0,
+    "hevc": 4000.0,
+    "av1": 5000.0,
+}
+DEFAULT_RESOLUTION_SCORES = {
+    "480": 3000.0,
+    "576": 5000.0,
+    "720": 10000.0,
+    "1080": 20000.0,
+    "2k": 25000.0,
+    "4k": 40000.0,
+    "2160": 40000.0,
+}
+DEFAULT_FILENAME_SCORES = {
+    "*remux*": 10000.0,
+    "*bluray*": 4000.0,
+    "*blu-ray*": 4000.0,
+    "*web-dl*": 2500.0,
+    "*webdl*": 2500.0,
+    "*webrip*": 1500.0,
 }
 
-DEFAULT_AUDIO_CODEC_SCORES: Dict[str, float] = {
-    "truehd": 5000,
-    "dca": 4000,
-    "dts": 4000,
-    "eac3": 3000,
-    "ac3": 2000,
-    "aac": 1000,
-    "mp3": 500,
-}
 
-DEFAULT_RESOLUTION_SCORES: Dict[str, float] = {
-    "4k": 40000,
-    "2160": 40000,
-    "1080": 20000,
-    "720": 10000,
-    "576": 6000,
-    "480": 5000,
-    "sd": 1000,
-}
+@dataclass(frozen=True)
+class ScoreConfig:
+    """Weights retain the original project's score-family, but are injectable."""
 
-DEFAULT_FILENAME_RULES: Tuple[Tuple[str, float], ...] = (
-    ("*remux*", 10000),
-    ("*bluray*", 4000),
-    ("*web-dl*", 2500),
-    ("*webrip*", 1500),
-)
+    audio_codec_scores: Mapping[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_AUDIO_CODEC_SCORES)
+    )
+    video_codec_scores: Mapping[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_VIDEO_CODEC_SCORES)
+    )
+    resolution_scores: Mapping[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_RESOLUTION_SCORES)
+    )
+    filename_scores: Mapping[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_FILENAME_SCORES)
+    )
+    bitrate_weight: float = 2.0
+    duration_divisor: float = 300.0
+    dimensions_weight: float = 2.0
+    audio_channels_weight: float = 1000.0
+    include_size: bool = False
+    size_divisor: float = 100000.0
 
 
-def stable_media_id_key(value: object) -> tuple:
-    """Return a deterministic ordering key for Plex Media IDs.
+@dataclass(frozen=True)
+class RankedCandidate:
+    candidate: MediaCandidate
+    score: ScoreResult
 
-    Plex normally uses decimal identifiers.  Numeric ordering avoids choosing
-    ``"10"`` before ``"2"`` while the text fallback keeps unusual IDs stable.
-    """
 
-    text = str(value or "").strip()
+@dataclass(frozen=True)
+class ScoreDecision:
+    group: DuplicateGroup
+    ranked: Tuple[RankedCandidate, ...]
+
+    @property
+    def keep(self) -> MediaCandidate:
+        if not self.ranked:
+            raise ValueError("cannot select a keep candidate from an empty group")
+        return self.ranked[0].candidate
+
+    @property
+    def delete_candidates(self) -> Tuple[MediaCandidate, ...]:
+        return tuple(item.candidate for item in self.ranked[1:])
+
+    @property
+    def duplicates(self) -> Tuple[MediaCandidate, ...]:
+        return self.delete_candidates
+
+    @property
+    def scores(self) -> Tuple[ScoreResult, ...]:
+        return tuple(item.score for item in self.ranked)
+
+    def as_dict(self):
+        return {
+            "keep": self.keep.as_dict(),
+            "delete_candidates": [item.as_dict() for item in self.delete_candidates],
+            "scores": [item.as_dict() for item in self.scores],
+        }
+
+
+def stable_media_id_key(media_id: object) -> tuple:
+    """Numeric Plex ids sort numerically; non-numeric ids remain deterministic."""
+
+    text = str(media_id)
     try:
         return (0, int(text), text)
     except (TypeError, ValueError):
         return (1, text.casefold(), text)
 
 
-def serialize_score_map(values: Dict[str, float]) -> str:
-    return "\n".join(
-        "%s=%s" % (key, int(float(value)) if float(value).is_integer() else value)
-        for key, value in values.items()
-    )
-
-
-def serialize_filename_rules(values: Sequence[Tuple[str, float]]) -> str:
-    return "\n".join(
-        "%s=%s" % (pattern, int(float(score)) if float(score).is_integer() else score)
-        for pattern, score in values
-    )
-
-
-def parse_score_map(value: str, fallback: Dict[str, float]) -> Dict[str, float]:
-    raw = (value or "").strip()
-    if not raw:
-        return dict(fallback)
-    try:
-        decoded = json.loads(raw)
-        if isinstance(decoded, dict):
-            return {str(key).strip().lower(): float(score) for key, score in decoded.items()}
-    except (TypeError, ValueError):
-        pass
-
-    result: Dict[str, float] = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, score = line.rsplit("=", 1)
-        try:
-            result[key.strip().lower()] = float(score.strip())
-        except ValueError:
-            continue
-    return result or dict(fallback)
-
-
-def parse_filename_rules(value: str) -> Tuple[Tuple[str, float], ...]:
-    raw = (value or "").strip()
-    if not raw:
-        return DEFAULT_FILENAME_RULES
-    result: List[Tuple[str, float]] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        pattern, score = line.rsplit("=", 1)
-        try:
-            result.append((pattern.strip().lower(), float(score.strip())))
-        except ValueError:
-            continue
-    return tuple(result) if result else DEFAULT_FILENAME_RULES
-
-
-@dataclass(frozen=True)
-class ScoreConfig:
-    video_codec_scores: Dict[str, float]
-    audio_codec_scores: Dict[str, float]
-    resolution_scores: Dict[str, float]
-    filename_rules: Tuple[Tuple[str, float], ...]
-    bitrate_weight: float = 2.0
-    duration_weight: float = 1.0 / 300.0
-    dimension_weight: float = 2.0
-    audio_channel_weight: float = 1000.0
-    use_filesize: bool = False
-    filesize_weight: float = 1.0 / 100000.0
-
-    @classmethod
-    def defaults(cls) -> "ScoreConfig":
-        return cls(
-            video_codec_scores=dict(DEFAULT_VIDEO_CODEC_SCORES),
-            audio_codec_scores=dict(DEFAULT_AUDIO_CODEC_SCORES),
-            resolution_scores=dict(DEFAULT_RESOLUTION_SCORES),
-            filename_rules=DEFAULT_FILENAME_RULES,
-        )
-
-
-def _normalized_codec(codec: str) -> str:
-    value = (codec or "").strip().lower().replace("_", "").replace("-", "")
+def _normalise_codec(value: object) -> str:
+    text = str(value or "").casefold().replace("-", "").replace("_", "")
     aliases = {
+        "h265": "hevc",
         "x265": "hevc",
-        "h265": "h265",
-        "hev1": "hevc",
-        "hvc1": "hevc",
         "x264": "h264",
         "avc": "h264",
-        "avc1": "h264",
-        "dts": "dts",
-        "dtshd": "dca",
-        "dca": "dca",
-        "eac3": "eac3",
-        "ac3": "ac3",
+        "ddp": "eac3",
+        "ddplus": "eac3",
+        "dtshd": "dts",
     }
-    return aliases.get(value, value)
-
-
-def _resolution_keys(version: MediaVersion) -> List[str]:
-    value = (version.video_resolution or "").strip().lower().replace("p", "")
-    values = [value] if value else []
-    if version.height:
-        values.append(str(version.height))
-    if value in ("uhd", "2160") or version.height >= 2000:
-        values.extend(["4k", "2160"])
-    if not values:
-        values.append("sd")
-    return list(dict.fromkeys(values))
+    return aliases.get(text, text)
 
 
 class ScoreEngine:
-    def __init__(self, config: ScoreConfig) -> None:
-        self.config = config
-
-    def score(self, version: MediaVersion) -> ScoreResult:
-        resolution = max(
-            (self.config.resolution_scores.get(key, 0.0) for key in _resolution_keys(version)),
-            default=0.0,
+    def __init__(self, config: Optional[ScoreConfig] = None) -> None:
+        self.config = config or ScoreConfig()
+        self._audio_scores = {
+            _normalise_codec(key): float(value)
+            for key, value in self.config.audio_codec_scores.items()
+        }
+        self._video_scores = {
+            _normalise_codec(key): float(value)
+            for key, value in self.config.video_codec_scores.items()
+        }
+        self._resolution_scores = {
+            str(key).casefold(): float(value)
+            for key, value in self.config.resolution_scores.items()
+        }
+        self._filename_rules: Tuple[Tuple[Pattern[str], float], ...] = tuple(
+            (re.compile(fnmatch.translate(pattern), re.IGNORECASE), float(value))
+            for pattern, value in self.config.filename_scores.items()
         )
-        video_codec = self.config.video_codec_scores.get(_normalized_codec(version.video_codec), 0.0)
+        if self.config.duration_divisor <= 0:
+            raise ValueError("duration_divisor must be positive")
+        if self.config.size_divisor <= 0:
+            raise ValueError("size_divisor must be positive")
 
-        audio_codecs = [_normalized_codec(version.audio_codec)]
-        audio_codecs.extend(_normalized_codec(track.codec) for track in version.audio_tracks)
-        # Use the best audio track once. Summing tracks rewards commentary/language count.
-        audio_codec = max(
-            (self.config.audio_codec_scores.get(codec, 0.0) for codec in audio_codecs),
-            default=0.0,
-        )
-        channels = max(
-            [version.audio_channels] + [track.channels for track in version.audio_tracks],
-            default=0,
-        )
+    def score(self, candidate: MediaCandidate) -> ScoreResult:
+        audio_codecs = [_normalise_codec(candidate.audio_codec)]
+        audio_codecs.extend(_normalise_codec(track.codec) for track in candidate.audio_tracks)
+        audio_codec = max((self._audio_scores.get(item, 0.0) for item in audio_codecs), default=0.0)
 
-        filename = 0.0
-        lowered_paths = [path.lower() for path in version.paths]
-        for pattern, rule_score in self.config.filename_rules:
-            # Each rule is applied once even when a multipart version has several matching parts.
-            if any(fnmatch.fnmatch(path, pattern) for path in lowered_paths):
-                filename += rule_score
+        resolution_text = str(candidate.video_resolution or "").casefold()
+        resolution = self._resolution_scores.get(resolution_text, 0.0)
+        if not resolution:
+            numeric = re.search(r"\d+", resolution_text)
+            if numeric:
+                resolution = self._resolution_scores.get(numeric.group(0), 0.0)
+
+        # Each configured filename rule contributes at most once, even when a
+        # Plex Media is multipart.
+        filename = sum(
+            value
+            for pattern, value in self._filename_rules
+            if any(pattern.search(os.path.basename(path)) for path in candidate.paths)
+        )
 
         breakdown = {
-            "resolution": resolution,
-            "video_codec": video_codec,
             "audio_codec": audio_codec,
-            "bitrate": max(0, version.bitrate) * self.config.bitrate_weight,
-            "duration": max(0, version.duration) * self.config.duration_weight,
-            "dimensions": (max(0, version.width) + max(0, version.height)) * self.config.dimension_weight,
-            "audio_channels": max(0, channels) * self.config.audio_channel_weight,
+            "video_codec": self._video_scores.get(_normalise_codec(candidate.video_codec), 0.0),
+            "resolution": resolution,
             "filename": filename,
-            "filesize": (
-                version.total_size * self.config.filesize_weight if self.config.use_filesize else 0.0
+            "bitrate": candidate.bitrate * float(self.config.bitrate_weight),
+            "duration": candidate.duration / float(self.config.duration_divisor),
+            "dimensions": (candidate.width + candidate.height)
+            * float(self.config.dimensions_weight),
+            "audio_channels": candidate.best_audio_channels
+            * float(self.config.audio_channels_weight),
+            "size": (
+                candidate.total_size / float(self.config.size_divisor)
+                if self.config.include_size
+                else 0.0
             ),
         }
-        rounded = {key: round(value, 3) for key, value in breakdown.items()}
-        return ScoreResult(total=round(sum(breakdown.values()), 3), breakdown=rounded)
+        total = float(sum(breakdown.values()))
+        return ScoreResult(candidate.media_id, total, breakdown)
 
-    def recommended_media_id(self, versions: Iterable[MediaVersion]) -> str:
-        scored = [(version.media_id, self.score(version).total) for version in versions]
-        if not scored:
-            return ""
-        highest = max(score for _, score in scored)
-        winners = [media_id for media_id, score in scored if abs(score - highest) < 0.0001]
-        return str(min(winners, key=stable_media_id_key))
+    score_candidate = score
+
+    def rank(self, candidates: Iterable[MediaCandidate]) -> Tuple[RankedCandidate, ...]:
+        ranked = [RankedCandidate(item, self.score(item)) for item in candidates]
+        ranked.sort(
+            key=lambda item: (
+                -item.score.total,
+                stable_media_id_key(item.candidate.media_id),
+            )
+        )
+        return tuple(ranked)
+
+    def select_keep(self, group: DuplicateGroup) -> ScoreDecision:
+        if not group.candidates:
+            raise ValueError("duplicate group has no media candidates")
+        return ScoreDecision(group=group, ranked=self.rank(group.candidates))
+
+    score_group = select_keep
+
+
+__all__ = [
+    "DEFAULT_AUDIO_CODEC_SCORES",
+    "DEFAULT_FILENAME_SCORES",
+    "DEFAULT_RESOLUTION_SCORES",
+    "DEFAULT_VIDEO_CODEC_SCORES",
+    "RankedCandidate",
+    "ScoreConfig",
+    "ScoreDecision",
+    "ScoreEngine",
+    "stable_media_id_key",
+]

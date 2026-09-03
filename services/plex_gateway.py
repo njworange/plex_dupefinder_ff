@@ -1,377 +1,466 @@
+"""A small Plex HTTP boundary with deterministic request semantics.
+
+Authentication is sent only in headers, redirects are never followed, and a
+DELETE is issued at most once.  The module can be imported without requests;
+tests or alternative runtimes may inject a session implementing ``request``.
+"""
+
 from __future__ import annotations
 
-import json
 import xml.etree.ElementTree as ET
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
+from urllib.parse import quote
 
-import requests
-
-from .safety import is_absolute_remote_path, normalize_remote_path
 from .domain import (
     AudioTrack,
+    DuplicateGroup,
     LibrarySection,
+    MediaCandidate,
     MediaPart,
-    MediaVersion,
-    MetadataItem,
     PlexConnection,
     PlexIdentity,
 )
+
+try:  # Optional at import time: FlaskFarm normally supplies requests.
+    import requests as _requests
+except ImportError:  # pragma: no cover - exercised in minimal deployments
+    _requests = None
 
 
 class PlexGatewayError(RuntimeError):
     pass
 
 
-class PlexHTTPError(PlexGatewayError):
-    def __init__(self, message: str, status_code: int) -> None:
-        super(PlexHTTPError, self).__init__(message)
-        self.status_code = int(status_code)
-
-
-class PlexAuthenticationError(PlexGatewayError):
+class PlexTransportError(PlexGatewayError):
     pass
 
 
-class PlexMetadataNotFound(PlexGatewayError):
-    """The requested metadata item no longer exists on an otherwise live PMS."""
+class PlexDeleteUncertainError(PlexTransportError):
+    """The server may have received a DELETE whose response was not observed."""
 
 
-class PlexDeleteOutcomeUnknown(PlexGatewayError):
-    """A timeout occurred after sending DELETE. The caller must re-read state."""
+class PlexHttpError(PlexGatewayError):
+    def __init__(self, status_code: int, url: str, body: str = "") -> None:
+        self.status_code = int(status_code)
+        self.url = url
+        self.body = body
+        super().__init__(f"Plex returned HTTP {self.status_code} for {url}")
 
 
-def _as_list(value: Any) -> List[Any]:
+class PlexProtocolError(PlexGatewayError):
+    pass
+
+
+class PlexIdentityMismatch(PlexGatewayError):
+    pass
+
+
+@dataclass(frozen=True)
+class DeleteReceipt:
+    rating_key: str
+    media_id: str
+    status_code: Optional[int]
+    dry_run: bool = False
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "rating_key": self.rating_key,
+            "media_id": self.media_id,
+            "status_code": self.status_code,
+            "dry_run": self.dry_run,
+        }
+
+
+def _list(value: Any) -> List[Any]:
     if value is None:
         return []
     if isinstance(value, list):
         return value
+    if isinstance(value, tuple):
+        return list(value)
     return [value]
 
 
-def _as_int(value: Any, default: int = 0) -> int:
+def _number(value: Any, cast: Callable[[Any], Any], default: Any = 0) -> Any:
     try:
-        return int(float(value))
+        return cast(value)
     except (TypeError, ValueError):
         return default
 
 
-def _as_optional_int(value: Any) -> Optional[int]:
-    if value in (None, ""):
+def _optional_bool(value: Any) -> Optional[bool]:
+    if value is None or value == "":
         return None
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"1", "true", "yes", "on"}
 
 
-def _as_bool(value: Any) -> Optional[bool]:
-    if value in (None, ""):
-        return None
-    return str(value).strip().lower() in ("1", "true", "yes")
+def _xml_mapping(element: ET.Element) -> Dict[str, Any]:
+    data: Dict[str, Any] = dict(element.attrib)
+    for child in element:
+        value = _xml_mapping(child)
+        existing = data.get(child.tag)
+        if existing is None:
+            data[child.tag] = value
+        elif isinstance(existing, list):
+            existing.append(value)
+        else:
+            data[child.tag] = [existing, value]
+    if element.text and element.text.strip() and not data:
+        data["text"] = element.text.strip()
+    return data
 
 
-def _xml_node(node: ET.Element) -> Dict[str, Any]:
-    result: Dict[str, Any] = dict(node.attrib)
-    for child in node:
-        result.setdefault(child.tag, []).append(_xml_node(child))
-    return result
+def _container(payload: Any) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise PlexProtocolError("Plex response is not an object")
+    value = payload.get("MediaContainer", payload)
+    if not isinstance(value, Mapping):
+        raise PlexProtocolError("Plex MediaContainer is not an object")
+    return value
 
 
-def _decode_container(response: requests.Response) -> Dict[str, Any]:
-    content_type = (response.headers.get("Content-Type") or "").lower()
-    if "json" in content_type:
-        payload = response.json()
-        return payload.get("MediaContainer", payload)
-
-    text = response.text or ""
-    try:
-        payload = json.loads(text)
-        return payload.get("MediaContainer", payload)
-    except (TypeError, ValueError):
-        pass
-
-    try:
-        return _xml_node(ET.fromstring(text))
-    except ET.ParseError as exc:
-        raise PlexGatewayError("Plex 응답을 JSON 또는 XML로 해석할 수 없습니다.") from exc
-
-
-def _first_guid(item: Dict[str, Any]) -> str:
-    direct = str(item.get("guid") or "").strip()
-    if direct:
-        return direct
-    for guid in _as_list(item.get("Guid")):
-        if isinstance(guid, dict) and guid.get("id"):
-            return str(guid["id"])
-    return ""
-
-
-def parse_metadata(item: Dict[str, Any]) -> MetadataItem:
-    media_versions: List[MediaVersion] = []
-    for media in _as_list(item.get("Media")):
-        if not isinstance(media, dict):
-            continue
-        parts: List[MediaPart] = []
-        audio_tracks: List[AudioTrack] = []
-        for part in _as_list(media.get("Part")):
-            if not isinstance(part, dict):
-                continue
-            parts.append(
-                MediaPart(
-                    part_id=str(part.get("id") or ""),
-                    file=str(part.get("file") or ""),
-                    size=_as_int(part.get("size")),
-                    duration=_as_int(part.get("duration")),
-                    container=str(part.get("container") or ""),
-                    exists=_as_bool(part.get("exists")),
-                )
-            )
-            for stream in _as_list(part.get("Stream")):
-                if not isinstance(stream, dict) or _as_int(stream.get("streamType")) != 2:
-                    continue
-                audio_tracks.append(
-                    AudioTrack(
-                        codec=str(stream.get("codec") or ""),
-                        channels=_as_int(stream.get("channels")),
-                        language=str(stream.get("language") or ""),
-                        title=str(stream.get("title") or stream.get("displayTitle") or ""),
-                    )
-                )
-
-        media_versions.append(
-            MediaVersion(
-                media_id=str(media.get("id") or ""),
-                duration=_as_int(media.get("duration")),
-                bitrate=_as_int(media.get("bitrate")),
-                width=_as_int(media.get("width")),
-                height=_as_int(media.get("height")),
-                video_resolution=str(media.get("videoResolution") or ""),
-                video_codec=str(media.get("videoCodec") or ""),
-                audio_codec=str(media.get("audioCodec") or ""),
-                audio_channels=_as_int(media.get("audioChannels")),
-                container=str(media.get("container") or ""),
-                parts=tuple(parts),
-                audio_tracks=tuple(audio_tracks),
-            )
-        )
-
-    return MetadataItem(
-        rating_key=str(item.get("ratingKey") or item.get("rating_key") or ""),
-        guid=_first_guid(item),
-        media_type=str(item.get("type") or ""),
-        title=str(item.get("title") or ""),
-        year=_as_optional_int(item.get("year")),
-        grandparent_title=str(item.get("grandparentTitle") or ""),
-        grandparent_rating_key=str(item.get("grandparentRatingKey") or ""),
-        parent_index=_as_optional_int(item.get("parentIndex")),
-        index=_as_optional_int(item.get("index")),
-        media=tuple(media_versions),
-    )
+def _metadata_rows(container: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    rows: List[Any] = []
+    for key in ("Metadata", "Video", "Track", "Photo"):
+        rows.extend(_list(container.get(key)))
+    return [item for item in rows if isinstance(item, Mapping)]
 
 
 class PlexGateway:
-    PRODUCT = "Plex DupeFinder FF"
-    VERSION = "1.6.1"
-
     def __init__(
         self,
         connection: PlexConnection,
-        timeout: Tuple[int, int] = (5, 20),
-        session: Optional[requests.Session] = None,
+        *,
+        timeout: Tuple[float, float] = (5.0, 30.0),
+        session: Any = None,
+        product: str = "FlaskFarm Plex Dupefinder",
+        version: str = "2.0.0",
+        client_identifier: str = "flaskfarm-plex-dupefinder-v2",
     ) -> None:
+        if not isinstance(connection, PlexConnection):
+            raise TypeError("connection must be a PlexConnection")
+        if len(timeout) != 2 or timeout[0] <= 0 or timeout[1] <= 0:
+            raise ValueError("timeout must contain positive connect/read values")
         self.connection = connection
-        self.timeout = timeout
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "Accept": "application/json",
-                "X-Plex-Token": connection.token,
-                "X-Plex-Product": self.PRODUCT,
-                "X-Plex-Version": self.VERSION,
-                "X-Plex-Client-Identifier": "plex-dupefinder-ff",
-            }
-        )
+        self.base_url = connection.base_url.rstrip("/")
+        self.timeout = (float(timeout[0]), float(timeout[1]))
+        if session is None:
+            if _requests is None:
+                raise RuntimeError("requests is unavailable; inject an HTTP session")
+            session = _requests.Session()
+        self.session = session
+        self.headers = {
+            "Accept": "application/json",
+            "X-Plex-Token": connection.token,
+            "X-Plex-Product": product,
+            "X-Plex-Version": version,
+            "X-Plex-Client-Identifier": client_identifier,
+        }
+        session_headers = getattr(self.session, "headers", None)
+        if session_headers is not None and hasattr(session_headers, "update"):
+            session_headers.update(self.headers)
+
+    @staticmethod
+    def _id(value: object, label: str) -> str:
+        text = str(value)
+        if not text.isdigit():
+            raise ValueError(f"{label} must be a numeric Plex id")
+        return text
+
+    def _url(self, path: str) -> str:
+        return self.base_url + "/" + path.lstrip("/")
 
     def _request(
-        self,
-        method: str,
-        path: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout: Optional[Tuple[int, int]] = None,
-    ) -> requests.Response:
-        url = "%s/%s" % (self.connection.base_url.rstrip("/"), path.lstrip("/"))
+        self, method: str, path: str, *, params: Optional[Mapping[str, Any]] = None
+    ) -> Any:
+        url = self._url(path)
         try:
             response = self.session.request(
-                method=method,
-                url=url,
-                params=params or {},
-                timeout=timeout or self.timeout,
+                method.upper(),
+                url,
+                params=dict(params or {}),
+                headers=dict(self.headers),
+                timeout=self.timeout,
                 allow_redirects=False,
             )
-        except requests.Timeout as exc:
+        except Exception as exc:
             if method.upper() == "DELETE":
-                raise PlexDeleteOutcomeUnknown(
-                    "삭제 요청이 시간 초과되었습니다. 재시도하지 말고 Plex 상태를 다시 확인해야 합니다."
+                raise PlexDeleteUncertainError(
+                    "Plex DELETE response was not observed; request was not retried"
                 ) from exc
-            raise PlexGatewayError("Plex 요청 시간이 초과되었습니다.") from exc
-        except requests.RequestException as exc:
-            if method.upper() == "DELETE":
-                raise PlexDeleteOutcomeUnknown(
-                    "삭제 요청의 연결 결과를 확정할 수 없습니다. 재시도하지 말고 Plex 상태를 확인해야 합니다."
-                ) from exc
-            raise PlexGatewayError("Plex 서버에 연결할 수 없습니다: %s" % exc.__class__.__name__) from exc
+            raise PlexTransportError(f"Plex request failed: {method.upper()} {url}") from exc
 
-        if not 200 <= response.status_code < 300:
-            if method.upper() == "DELETE":
-                raise PlexDeleteOutcomeUnknown(
-                    "Plex가 삭제 요청에 HTTP %s를 반환했습니다. 상태 재확인이 필요합니다."
-                    % response.status_code
-                )
-            if response.status_code in (401, 403):
-                raise PlexAuthenticationError("Plex 토큰이 거부되었습니다.")
-            raise PlexHTTPError(
-                "Plex 요청이 실패했습니다. HTTP %s" % response.status_code,
-                response.status_code,
-            )
+        status = int(getattr(response, "status_code", 0))
+        if status < 200 or status >= 300:
+            body = str(getattr(response, "text", ""))[:1000]
+            raise PlexHttpError(status, url, body)
         return response
 
+    @staticmethod
+    def _payload(response: Any) -> Mapping[str, Any]:
+        try:
+            payload = response.json()
+            if isinstance(payload, Mapping):
+                return payload
+        except (AttributeError, TypeError, ValueError):
+            pass
+        raw = getattr(response, "content", None)
+        if raw is None:
+            raw = getattr(response, "text", "")
+        try:
+            root = ET.fromstring(raw)
+        except (ET.ParseError, TypeError, ValueError) as exc:
+            raise PlexProtocolError("Plex response is neither JSON nor XML") from exc
+        return {root.tag: _xml_mapping(root)}
+
     def identity(self) -> PlexIdentity:
-        container = _decode_container(self._request("GET", "/identity"))
+        container = _container(self._payload(self._request("GET", "/identity")))
         return PlexIdentity(
             machine_id=str(container.get("machineIdentifier") or ""),
             version=str(container.get("version") or ""),
+            allow_media_deletion=_optional_bool(container.get("allowMediaDeletion")),
         )
 
-    def validate_identity(self, expected_machine_id: str, require_match: bool = True) -> PlexIdentity:
-        identity = self.identity()
-        if require_match and not expected_machine_id:
-            raise PlexGatewayError("plex_mate의 Machine ID가 비어 있습니다.")
-        if (
-            require_match
-            and expected_machine_id
-            and identity.machine_id != expected_machine_id
-        ):
-            raise PlexGatewayError("Plex Machine ID가 plex_mate 설정과 일치하지 않습니다.")
-        return identity
+    def validate_identity(
+        self, expected: object = None, *, require_match: bool = False
+    ) -> PlexIdentity:
+        actual = self.identity()
+        if isinstance(expected, PlexConnection):
+            expected_id = expected.machine_id
+        elif expected is None:
+            expected_id = self.connection.machine_id
+        else:
+            expected_id = str(expected)
+        if require_match and expected_id and actual.machine_id != expected_id:
+            raise PlexIdentityMismatch(
+                f"expected Plex machine {expected_id!r}, got {actual.machine_id!r}"
+            )
+        return actual
 
-    def list_sections(self) -> List[LibrarySection]:
-        container = _decode_container(self._request("GET", "/library/sections"))
+    def list_sections(self) -> Tuple[LibrarySection, ...]:
+        container = _container(
+            self._payload(self._request("GET", "/library/sections"))
+        )
+        rows = [item for item in _list(container.get("Directory")) if isinstance(item, Mapping)]
         sections: List[LibrarySection] = []
-        for item in _as_list(container.get("Directory")):
-            if not isinstance(item, dict):
-                continue
-            section_type = str(item.get("type") or "")
-            if section_type not in ("movie", "show"):
-                continue
-            key = str(item.get("key") or "")
-            if key:
-                locations = []
-                for location in _as_list(item.get("Location")):
-                    if not isinstance(location, dict):
-                        continue
-                    value = str(location.get("path") or "")
-                    if value and value not in locations:
-                        locations.append(value)
-                sections.append(
-                    LibrarySection(
-                        key=key,
-                        title=str(item.get("title") or key),
-                        section_type=section_type,
-                        locations=tuple(locations),
-                    )
+        for row in rows:
+            locations = tuple(
+                str(item.get("path"))
+                for item in _list(row.get("Location"))
+                if isinstance(item, Mapping) and item.get("path")
+            )
+            sections.append(
+                LibrarySection(
+                    key=str(row.get("key") or ""),
+                    title=str(row.get("title") or ""),
+                    section_type=str(row.get("type") or ""),
+                    locations=locations,
                 )
-        return sections
+            )
+        return tuple(sections)
 
-    def section_locations(self, section_key: str) -> List[str]:
-        key = str(section_key or "")
-        if not key.isdigit():
-            raise PlexGatewayError("잘못된 Plex library section ID입니다.")
-        for section in self.list_sections():
-            if section.key == key:
-                return list(section.locations)
-        raise PlexGatewayError("Plex library section을 찾을 수 없습니다.")
+    def resolve_section(
+        self, section: Union[LibrarySection, str, int]
+    ) -> LibrarySection:
+        """Resolve a library id to its Plex type before duplicate lookup.
+
+        Plex requires ``type=1`` for movie items and ``type=4`` for episodes.
+        Querying ``/all?duplicate=1`` without that type is ambiguous, so a raw
+        section id is looked up rather than silently sent as an untyped query.
+        """
+
+        if isinstance(section, LibrarySection):
+            resolved = section
+        else:
+            section_key = self._id(section, "section key")
+            resolved = next(
+                (item for item in self.list_sections() if item.key == section_key),
+                None,
+            )
+            if resolved is None:
+                raise PlexProtocolError(
+                    f"Plex library section {section_key} was not found"
+                )
+        if resolved.plex_item_type is None:
+            raise PlexProtocolError(
+                f"unsupported Plex library type {resolved.section_type!r} "
+                f"for section {resolved.key}"
+            )
+        return resolved
 
     def duplicate_rating_keys(
         self,
-        section: LibrarySection,
+        section: Union[LibrarySection, str, int],
         cancel_check: Optional[Callable[[], bool]] = None,
+        *,
         page_size: int = 200,
-    ) -> List[str]:
-        libtype = "1" if section.section_type == "movie" else "4"
+    ) -> Tuple[str, ...]:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        resolved_section = self.resolve_section(section)
+        section_key = self._id(resolved_section.key, "section key")
+        item_type = resolved_section.plex_item_type
+
         start = 0
-        rating_keys: List[str] = []
-        seen = set()
+        keys: List[str] = []
+        seen: Set[str] = set()
         while True:
-            if cancel_check and cancel_check():
+            if cancel_check is not None and cancel_check():
                 break
-            params = {
-                "duplicate": "1",
-                "type": libtype,
-                "includeGuids": "1",
-                "includeMedia": "1",
-                "X-Plex-Container-Start": str(start),
-                "X-Plex-Container-Size": str(page_size),
+            params: Dict[str, Any] = {
+                "duplicate": 1,
+                "includeGuids": 1,
+                "includeMedia": 1,
+                "X-Plex-Container-Start": start,
+                "X-Plex-Container-Size": page_size,
             }
-            container = _decode_container(
-                self._request("GET", "/library/sections/%s/all" % section.key, params=params)
+            params["type"] = item_type
+            response = self._request(
+                "GET", f"/library/sections/{quote(section_key)}/all", params=params
             )
-            items = _as_list(container.get("Metadata")) + _as_list(container.get("Video"))
-            page_count = 0
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                key = str(item.get("ratingKey") or "")
+            container = _container(self._payload(response))
+            rows = _metadata_rows(container)
+            for row in rows:
+                key = str(row.get("ratingKey") or row.get("rating_key") or "")
                 if key and key not in seen:
                     seen.add(key)
-                    rating_keys.append(key)
-                page_count += 1
-
-            total_value = container.get("totalSize")
-            total = _as_int(total_value) if total_value not in (None, "") else None
-            start += page_count
-            if page_count == 0 or (total is not None and start >= total) or page_count < page_size:
+                    keys.append(key)
+            returned = _number(container.get("size"), int, len(rows))
+            total = _number(container.get("totalSize"), int, start + returned)
+            if returned <= 0 or start + returned >= total:
                 break
-        return rating_keys
+            start += returned
+        return tuple(keys)
 
-    def get_metadata(self, rating_key: str) -> MetadataItem:
-        if not str(rating_key).isdigit():
-            raise PlexGatewayError("잘못된 Plex ratingKey입니다.")
-        params = {"includeGuids": "1", "includeMedia": "1"}
-        try:
-            response = self._request(
-                "GET", "/library/metadata/%s" % rating_key, params=params
+    @staticmethod
+    def _parse_group(row: Mapping[str, Any]) -> DuplicateGroup:
+        candidates: List[MediaCandidate] = []
+        media_rows = [item for item in _list(row.get("Media")) if isinstance(item, Mapping)]
+        for media in media_rows:
+            parts: List[MediaPart] = []
+            tracks: List[AudioTrack] = []
+            for part in [item for item in _list(media.get("Part")) if isinstance(item, Mapping)]:
+                parts.append(
+                    MediaPart(
+                        part_id=str(part.get("id") or ""),
+                        path=str(part.get("file") or ""),
+                        size=_number(part.get("size"), int),
+                        duration=_number(part.get("duration"), int),
+                        container=str(part.get("container") or ""),
+                        exists=_optional_bool(part.get("exists")),
+                    )
+                )
+                for stream in [
+                    item for item in _list(part.get("Stream")) if isinstance(item, Mapping)
+                ]:
+                    if _number(stream.get("streamType"), int) != 2:
+                        continue
+                    tracks.append(
+                        AudioTrack(
+                            codec=str(stream.get("codec") or ""),
+                            channels=_number(stream.get("channels"), float, 0.0),
+                            language=str(stream.get("language") or ""),
+                            title=str(stream.get("title") or ""),
+                        )
+                    )
+            candidates.append(
+                MediaCandidate(
+                    media_id=str(media.get("id") or ""),
+                    parts=tuple(parts),
+                    duration=_number(media.get("duration"), int),
+                    bitrate=_number(media.get("bitrate"), int),
+                    width=_number(media.get("width"), int),
+                    height=_number(media.get("height"), int),
+                    video_resolution=str(media.get("videoResolution") or ""),
+                    video_codec=str(media.get("videoCodec") or ""),
+                    audio_codec=str(media.get("audioCodec") or ""),
+                    audio_channels=_number(media.get("audioChannels"), float, 0.0),
+                    container=str(media.get("container") or ""),
+                    audio_tracks=tuple(tracks),
+                )
             )
-        except PlexHTTPError as exc:
-            if exc.status_code in (404, 410):
-                raise PlexMetadataNotFound(
-                    "Plex metadata 항목이 더 이상 존재하지 않습니다."
-                ) from exc
-            raise
-        container = _decode_container(response)
-        items = _as_list(container.get("Metadata")) + _as_list(container.get("Video"))
-        if not items or not isinstance(items[0], dict):
-            raise PlexMetadataNotFound("Plex metadata를 찾을 수 없습니다.")
-        return parse_metadata(items[0])
-
-    def delete_media(self, rating_key: str, media_id: str) -> int:
-        if not str(rating_key).isdigit() or not str(media_id).isdigit():
-            raise PlexGatewayError("잘못된 Plex metadata 또는 media ID입니다.")
-        response = self._request(
-            "DELETE",
-            "/library/metadata/%s/media/%s" % (rating_key, media_id),
+        return DuplicateGroup(
+            rating_key=str(row.get("ratingKey") or row.get("rating_key") or ""),
+            candidates=tuple(candidates),
+            title=str(row.get("title") or ""),
+            media_type=str(row.get("type") or ""),
+            guid=str(row.get("guid") or ""),
+            year=_number(row.get("year"), int, None),
+            parent_title=str(row.get("parentTitle") or ""),
+            grandparent_title=str(row.get("grandparentTitle") or ""),
         )
-        return response.status_code
 
-    def refresh_section_path(self, section_key: str, path: str) -> int:
-        key = str(section_key or "")
-        target = normalize_remote_path(str(path or ""))
-        if not key.isdigit():
-            raise PlexGatewayError("잘못된 Plex library section ID입니다.")
-        if not target or not is_absolute_remote_path(target):
-            raise PlexGatewayError("Plex 부분 스캔 경로는 절대 경로여야 합니다.")
+    def get_metadata(self, rating_key: object) -> DuplicateGroup:
+        key = self._id(rating_key, "rating key")
         response = self._request(
             "GET",
-            "/library/sections/%s/refresh" % key,
-            params={"path": target},
+            f"/library/metadata/{quote(key)}",
+            params={"includeGuids": 1, "includeMedia": 1},
         )
-        return response.status_code
+        rows = _metadata_rows(_container(self._payload(response)))
+        if not rows:
+            raise PlexProtocolError(f"metadata {key} was absent from the Plex response")
+        return self._parse_group(rows[0])
+
+    get_group = get_metadata
+    reload_group = get_metadata
+
+    def duplicate_groups(
+        self,
+        section: Union[LibrarySection, str, int],
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[DuplicateGroup, ...]:
+        return tuple(self.iter_duplicate_groups(section, cancel_check))
+
+    def iter_duplicate_groups(
+        self,
+        section: Union[LibrarySection, str, int],
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Iterator[DuplicateGroup]:
+        # Fetching the rating-key list is paginated, but each full metadata
+        # record is loaded and yielded independently so the worker can decide
+        # and delete before the next group is read.
+        for rating_key in self.duplicate_rating_keys(section, cancel_check):
+            if cancel_check is not None and cancel_check():
+                break
+            group = self.get_metadata(rating_key)
+            if group.is_duplicate:
+                yield group
+
+    def media_exists(self, rating_key: object, media_id: object) -> bool:
+        wanted = str(media_id)
+        try:
+            group = self.get_metadata(rating_key)
+        except PlexHttpError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+        return group.candidate(wanted) is not None
+
+    def delete_media(
+        self, rating_key: object, media_id: object, *, dry_run: bool = False
+    ) -> DeleteReceipt:
+        key = self._id(rating_key, "rating key")
+        candidate = self._id(media_id, "media id")
+        if dry_run:
+            return DeleteReceipt(key, candidate, None, dry_run=True)
+        # Deliberately one request and no retry: a timeout has unknown outcome.
+        response = self._request(
+            "DELETE", f"/library/metadata/{quote(key)}/media/{quote(candidate)}"
+        )
+        return DeleteReceipt(key, candidate, int(response.status_code), dry_run=False)
+
+
+__all__ = [
+    "DeleteReceipt",
+    "PlexDeleteUncertainError",
+    "PlexGateway",
+    "PlexGatewayError",
+    "PlexHttpError",
+    "PlexIdentityMismatch",
+    "PlexProtocolError",
+    "PlexTransportError",
+]

@@ -1,145 +1,194 @@
 from __future__ import annotations
 
-import traceback
-from typing import Any, Dict
+import json
+import math
+import re
+from typing import Any, Dict, List
 
 from flask import jsonify, render_template
 from plugin import PluginModuleBase
 
-from .services.plex_gateway import PlexGateway
-from .services.plex_mate_provider import PlexMateProvider
 from .setup import P
 
 
 name = "setting"
 
-POST_DELETE_SCAN_MODES = frozenset(("none", "binary", "web"))
+
+def parse_library_ids(value: Any) -> List[str]:
+    """Accept the UI's single value, CSV, semicolon, or multiline input."""
+
+    values: List[str] = []
+    for raw in re.split(r"[,;\r\n]+", str(value or "")):
+        item = raw.strip()
+        if item and item not in values:
+            values.append(item)
+    return values
 
 
-def _mask_machine(value: str) -> str:
-    value = value or ""
-    if len(value) <= 8:
-        return value
-    return "%s…%s" % (value[:4], value[-4:])
+def _setting_bool(key: str, default: bool = False, strict: bool = False) -> bool:
+    value = P.ModelSetting.get(key)
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    if strict:
+        raise ValueError("%s 값은 True 또는 False여야 합니다." % key)
+    return default
 
 
-def _request_timeout() -> int:
+def _json_object_setting(key: str) -> Dict[str, Any]:
+    raw = P.ModelSetting.get(key) or "{}"
     try:
-        return max(5, min(120, int(P.ModelSetting.get("setting_request_timeout") or "20")))
-    except (TypeError, ValueError):
-        return 20
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("%s 값은 올바른 JSON 객체여야 합니다." % key) from exc
+    if not isinstance(value, dict):
+        raise ValueError("%s 값은 JSON 객체여야 합니다." % key)
+    return value
 
 
-def _normalize_post_delete_scan_mode(value: Any) -> str:
-    mode = str(value or "none").strip().lower()
-    return mode if mode in POST_DELETE_SCAN_MODES else "none"
+def _finite_score_mapping(key: str) -> Dict[str, float]:
+    value = _json_object_setting(key)
+    result: Dict[str, float] = {}
+    for pattern, raw_score in value.items():
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError("%s의 pattern은 비어 있지 않은 문자열이어야 합니다." % key)
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("%s의 score는 숫자여야 합니다." % key) from exc
+        if not math.isfinite(score):
+            raise ValueError("%s의 score는 유한한 숫자여야 합니다." % key)
+        result[pattern] = score
+    return result
 
 
-def _post_delete_scan_capabilities(web_connection_validated: bool = False) -> Dict[str, Any]:
-    """Inspect configuration/call surfaces without issuing a scan."""
-    mode = _normalize_post_delete_scan_mode(
-        P.ModelSetting.get("setting_post_delete_scan_mode")
-    )
-    delete_backend = str(
-        P.ModelSetting.get("setting_delete_backend") or "plex"
-    ).strip().lower()
-    plex_mate = None
-    try:
-        from framework import F
-
-        plex_mate = F.PluginManager.get_plugin_instance("plex_mate")
-    except Exception:
-        # Connection validation reports load/configuration errors separately.
-        pass
-
-    binary_scanner = getattr(plex_mate, "PlexBinaryScanner", None)
-    binary_helper_exported = callable(getattr(binary_scanner, "scan_refresh", None))
-    binary_scanner_configured = False
-    try:
-        plex_mate_setting = getattr(plex_mate, "ModelSetting", None)
-        binary_scanner_configured = bool(
-            str(plex_mate_setting.get("base_bin_scanner") or "").strip()
+def runtime_config() -> Dict[str, Any]:
+    score_json = _json_object_setting("setting_score_json")
+    filename_scores = _finite_score_mapping("setting_filename_score")
+    library_ids = parse_library_ids(P.ModelSetting.get("setting_library_id"))
+    invalid_library_ids = [value for value in library_ids if not value.isdigit()]
+    if invalid_library_ids:
+        raise ValueError(
+            "Plex Library ID는 숫자여야 합니다: %s"
+            % ", ".join(invalid_library_ids)
         )
-    except Exception:
-        pass
 
-    selected_supported = (
-        (mode == "none" and delete_backend not in ("quarantine", "direct"))
-        or (mode == "web" and web_connection_validated)
-        or (mode == "binary" and binary_helper_exported and binary_scanner_configured)
-    )
+    try:
+        timeout = int(P.ModelSetting.get("setting_timeout") or "20")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("setting_timeout 값은 정수여야 합니다.") from exc
+    timeout = max(5, min(timeout, 120))
+
+    extensions = []
+    for raw in re.split(
+        r"[,;\s]+", P.ModelSetting.get("setting_subtitle_extensions") or ""
+    ):
+        ext = raw.strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = "." + ext
+        if ext not in extensions:
+            extensions.append(ext)
+    if not extensions:
+        raise ValueError("setting_subtitle_extensions에 확장자를 하나 이상 설정하세요.")
+
     return {
-        "mode": mode,
-        "delete_backend": delete_backend,
-        "web_connection_validated": bool(web_connection_validated),
-        "binary_helper_exported": binary_helper_exported,
-        "binary_scanner_configured": binary_scanner_configured,
-        "selected_supported": selected_supported,
+        "library_ids": library_ids,
+        "score": score_json,
+        "filename_scores": filename_scores,
+        "include_size": _setting_bool("setting_size_score", False, strict=True),
+        "subtitle_extensions": extensions,
+        "subs_search": _setting_bool("setting_subs_search", True),
+        "timeout": timeout,
+        "score_profile": "v2.0.0",
     }
+
+
+def sync_scheduler_settings() -> bool:
+    mode = str(
+        P.ModelSetting.get("setting_scheduler_mode") or "off"
+    ).strip().lower()
+    raw_interval = str(
+        P.ModelSetting.get("setting_scheduler_interval") or "60"
+    ).strip()
+    try:
+        interval = int(raw_interval)
+        if interval <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        interval = 60
+        mode = "off"
+        P.logger.warning("scheduler interval은 양의 정수(분)여야 합니다.")
+
+    enabled = mode in ("dry_run", "live")
+    setter = getattr(P.ModelSetting, "set", None)
+    if callable(setter):
+        setter("cleanup_interval", str(interval))
+        setter("cleanup_auto_start", str(enabled))
+
+    logic = getattr(P, "logic", None)
+    if logic is not None:
+        try:
+            logic.scheduler_stop("cleanup")
+        except Exception:
+            pass
+        if enabled:
+            try:
+                logic.scheduler_start("cleanup")
+            except Exception as exc:
+                P.logger.warning(
+                    "Cleanup scheduler start failed: %s", exc.__class__.__name__
+                )
+    return enabled
 
 
 class ModuleSetting(PluginModuleBase):
     db_default = {
-        "setting_db_version": "1",
-        "setting_delete_enabled": "False",
-        "setting_batch_delete_enabled": "False",
-        "setting_allowed_roots": "",
-        "setting_delete_backend": "plex",
-        "setting_quarantine_root": "",
-        "setting_request_timeout": "20",
-        "setting_post_delete_scan_mode": "none",
-        "setting_require_guid": "True",
-        "setting_block_multipart": "True",
-        "setting_video_codec_scores": "av1=5000\nhevc=4000\nh265=4000\nvp9=3000\nh264=2000\nmpeg4=1000\nmpeg2video=500",
-        "setting_audio_codec_scores": "truehd=5000\ndca=4000\ndts=4000\neac3=3000\nac3=2000\naac=1000\nmp3=500",
-        "setting_resolution_scores": "4k=40000\n2160=40000\n1080=20000\n720=10000\n576=6000\n480=5000\nsd=1000",
-        "setting_filename_rules": "*remux*=10000\n*bluray*=4000\n*web-dl*=2500\n*webrip*=1500",
-        "setting_bitrate_weight": "2",
-        "setting_duration_weight": "0.0033333333",
-        "setting_dimension_weight": "2",
-        "setting_audio_channel_weight": "1000",
-        "setting_use_filesize": "False",
-        "setting_filesize_weight": "0.00001",
+        "setting_db_version": "2",
+        "setting_library_id": "",
+        "setting_score_json": "{}",
+        "setting_filename_score": "{}",
+        "setting_size_score": "False",
+        "setting_subtitle_extensions": ".srt,.ass,.ssa,.sub,.idx,.vtt,.smi,.sup",
+        "setting_subs_search": "True",
+        "setting_timeout": "20",
+        "setting_scheduler_mode": "off",
+        "setting_scheduler_interval": "60",
     }
 
     def __init__(self, plugin: Any) -> None:
         super(ModuleSetting, self).__init__(plugin, name=name, first_menu="setting")
 
     def process_menu(self, sub: str, req: Any) -> Any:
-        arg: Dict[str, Any] = P.ModelSetting.to_dict()
+        arg = P.ModelSetting.to_dict()
         arg["package_name"] = P.package_name
         arg["module_name"] = self.name
         arg["sub"] = sub
-        return render_template("%s_%s_setting.html" % (P.package_name, self.name), arg=arg)
+        return render_template(
+            "%s_%s_setting.html" % (P.package_name, self.name), arg=arg
+        )
 
-    def _connection_payload(self, include_sections: bool = False) -> Dict[str, Any]:
-        connection = PlexMateProvider().resolve(require_machine_id=False)
-        timeout = _request_timeout()
-        gateway = PlexGateway(connection, timeout=(5, timeout))
-        identity = gateway.validate_identity(connection.machine_id, require_match=False)
-        if connection.machine_id and identity.machine_id != connection.machine_id:
-            raise RuntimeError("Plex Machine ID가 plex_mate 설정과 일치하지 않습니다.")
+    def process_command(
+        self, command: str, arg1: str, arg2: str, arg3: str, req: Any
+    ) -> Any:
+        del arg1, arg2, arg3, req
+        if command == "runtime_config":
+            return jsonify({"ret": "success", "data": runtime_config()})
+        return jsonify({"ret": "warning", "msg": "지원하지 않는 명령입니다."})
 
-        payload: Dict[str, Any] = {
-            "base_url": connection.base_url,
-            "configured_machine": _mask_machine(connection.machine_id),
-            "server_machine": _mask_machine(identity.machine_id),
-            "machine_match": bool(connection.machine_id and connection.machine_id == identity.machine_id),
-            "server_version": identity.version,
-            "post_delete_scan": _post_delete_scan_capabilities(web_connection_validated=True),
-        }
-        if include_sections:
-            payload["sections"] = [section.as_dict() for section in gateway.list_sections()]
-        return payload
+    def setting_save_after(self, change_list: Any) -> None:
+        del change_list
+        sync_scheduler_settings()
 
-    def process_ajax(self, sub: str, req: Any) -> Any:
-        try:
-            if sub == "connection_status":
-                return jsonify({"ret": "success", "data": self._connection_payload(False)})
-            if sub == "libraries":
-                return jsonify({"ret": "success", "data": self._connection_payload(True)})
-            return jsonify({"ret": "danger", "msg": "지원하지 않는 요청입니다."}), 400
-        except Exception as exc:
-            P.logger.warning("PlexMate connection check failed: %s", exc.__class__.__name__)
-            P.logger.debug(traceback.format_exc())
-            return jsonify({"ret": "danger", "msg": str(exc)}), 400
+
+__all__ = [
+    "ModuleSetting",
+    "parse_library_ids",
+    "runtime_config",
+    "sync_scheduler_settings",
+]

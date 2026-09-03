@@ -1,3 +1,9 @@
+"""Lazy Plex Mate settings adapter.
+
+Nothing from FlaskFarm is imported until ``resolve`` is called, keeping the
+core services importable in unit tests and standalone scripts.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -6,68 +12,101 @@ from urllib.parse import urlsplit, urlunsplit
 from .domain import PlexConnection
 
 
-class PlexMateUnavailable(RuntimeError):
+class PlexMateProviderError(RuntimeError):
     pass
 
 
-def normalize_base_url(value: str) -> str:
-    raw = (value or "").strip().rstrip("/")
-    parsed = urlsplit(raw)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise PlexMateUnavailable("plex_mate의 Plex URL이 올바르지 않습니다.")
+class PlexMateUnavailable(PlexMateProviderError):
+    pass
+
+
+class PlexMateConfigurationError(PlexMateProviderError):
+    pass
+
+
+def _normalise_url(value: object) -> str:
+    text = str(value or "").strip().rstrip("/")
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise PlexMateConfigurationError("Plex Mate base_url must be an http(s) URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise PlexMateUnavailable("Plex URL에는 인증정보, query, fragment를 넣을 수 없습니다.")
+        raise PlexMateConfigurationError(
+            "Plex Mate base_url may not contain credentials, query, or fragment"
+        )
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
 class PlexMateProvider:
-    """Resolve PlexMate only when an action starts, never at plugin import time."""
-
-    def __init__(self, plugin_manager: Optional[Any] = None) -> None:
+    def __init__(self, plugin_manager: Any = None, *, plugin_name: str = "plex_mate") -> None:
         self._plugin_manager = plugin_manager
+        self.plugin_name = plugin_name
 
     def _manager(self) -> Any:
         if self._plugin_manager is not None:
             return self._plugin_manager
-        from framework import F
+        try:
+            from framework import F  # type: ignore
+        except (ImportError, AttributeError) as exc:
+            raise PlexMateUnavailable("FlaskFarm framework is unavailable") from exc
+        manager = getattr(F, "PluginManager", None)
+        if manager is None:
+            raise PlexMateUnavailable("FlaskFarm PluginManager is unavailable")
+        return manager
 
-        return F.PluginManager
+    def _plugin(self) -> Any:
+        manager = self._manager()
+        for method_name in ("get_plugin_instance", "get_plugin", "get"):
+            method = getattr(manager, method_name, None)
+            if callable(method):
+                plugin = method(self.plugin_name)
+                if plugin is not None:
+                    return plugin
+        plugins = getattr(manager, "plugins", None)
+        if isinstance(plugins, dict) and self.plugin_name in plugins:
+            return plugins[self.plugin_name]
+        raise PlexMateUnavailable(f"{self.plugin_name!r} plugin is not installed or enabled")
 
-    def plugin_instance(self) -> Any:
-        plex_mate = self._manager().get_plugin_instance("plex_mate")
-        if plex_mate is None or getattr(plex_mate, "ModelSetting", None) is None:
-            raise PlexMateUnavailable("plex_mate가 설치되어 로드된 상태여야 합니다.")
-        return plex_mate
+    @staticmethod
+    def _setting(plugin: Any, key: str) -> Any:
+        candidates = (
+            getattr(plugin, "ModelSetting", None),
+            getattr(plugin, "model_setting", None),
+            getattr(plugin, "settings", None),
+            plugin,
+        )
+        for source in candidates:
+            if source is None:
+                continue
+            if isinstance(source, dict) and key in source:
+                return source[key]
+            getter = getattr(source, "get", None)
+            if callable(getter):
+                value = getter(key)
+                if value is not None:
+                    return value
+        return None
 
     def resolve(self, require_machine_id: bool = False) -> PlexConnection:
-        plex_mate = self.plugin_instance()
-
-        setting = plex_mate.ModelSetting
-        base_url = normalize_base_url(setting.get("base_url") or "")
-        token = (setting.get("base_token") or "").strip()
-        machine_id = (setting.get("base_machine") or "").strip()
-
+        plugin = self._plugin()
+        base_url = _normalise_url(self._setting(plugin, "base_url"))
+        token = str(self._setting(plugin, "base_token") or "").strip()
+        machine_id = str(self._setting(plugin, "base_machine") or "").strip()
         if not token:
-            raise PlexMateUnavailable("plex_mate에 Plex 토큰이 설정되어 있지 않습니다.")
+            raise PlexMateConfigurationError("Plex Mate base_token is empty")
         if require_machine_id and not machine_id:
-            raise PlexMateUnavailable("삭제를 사용하려면 plex_mate의 Machine ID가 필요합니다.")
+            raise PlexMateConfigurationError("Plex Mate base_machine is empty")
+        return PlexConnection(base_url=base_url, token=token, machine_id=machine_id)
 
-        return PlexConnection(base_url=base_url, machine_id=machine_id, token=token)
-
-    def binary_scanner(self) -> Any:
-        """Resolve PlexMate's public scanner helper only when a job executes."""
-
-        plex_mate = self.plugin_instance()
-        scanner = getattr(plex_mate, "PlexBinaryScanner", None)
-        if scanner is None or not callable(getattr(scanner, "scan_refresh", None)):
-            raise PlexMateUnavailable(
-                "현재 plex_mate가 PlexBinaryScanner.scan_refresh를 제공하지 않습니다."
-            )
-        return plex_mate, scanner
+    get_connection = resolve
 
 
-def redact_secret(message: str, secret: str) -> str:
-    value = str(message or "")
-    if secret:
-        value = value.replace(secret, "***")
-    return value
+PlexMateConnectionProvider = PlexMateProvider
+
+
+__all__ = [
+    "PlexMateConfigurationError",
+    "PlexMateConnectionProvider",
+    "PlexMateProvider",
+    "PlexMateProviderError",
+    "PlexMateUnavailable",
+]

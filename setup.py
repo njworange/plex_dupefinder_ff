@@ -5,7 +5,7 @@ setting = {
     "filepath": __file__,
     "use_db": True,
     "use_default_setting": True,
-    "home_module": "scan",
+    "home_module": "cleanup",
     "menu": {
         "uri": __package__,
         "name": "PLEX DupeFinder",
@@ -16,22 +16,14 @@ setting = {
                 "list": [{"uri": "setting", "name": "설정"}],
             },
             {
-                "uri": "scan",
-                "name": "중복 검사",
-                "list": [
-                    {"uri": "list", "name": "스캔"},
-                    {"uri": "results", "name": "결과"},
-                ],
+                "uri": "cleanup",
+                "name": "중복 자동 정리",
+                "list": [{"uri": "run", "name": "실행"}],
             },
             {
                 "uri": "history",
                 "name": "작업 이력",
-                "list": [{"uri": "list", "name": "삭제 이력"}],
-            },
-            {
-                "uri": "manual",
-                "name": "매뉴얼",
-                "list": [{"uri": "README.md", "name": "README.md"}],
+                "list": [{"uri": "list", "name": "이력"}],
             },
             {"uri": "log", "name": "로그"},
         ],
@@ -40,43 +32,25 @@ setting = {
     "default_route": "normal",
 }
 
+
 from plugin import *  # noqa: E402,F401,F403
+
 
 P = create_plugin_instance(setting)
 
 try:
-    # Models must be imported before FlaskFarm calls db.create_all().
-    from .models import (
-        ModelActionLog,
-        ModelBatchExclusion,
-        ModelBatchItem,
-        ModelBatchRun,
-        ModelDeletionLease,
-        ModelDirectDeleteJournal,
-        ModelDuplicateGroup,
-        ModelMediaCandidate,
-        ModelPostDeleteScanJob,
-        ModelQuarantineJournal,
-        ModelScanRun,
-    )
+    # FlaskFarm must see the models before its create_all phase.
+    from .models import ModelCleanupAction, ModelCleanupRun
+    from .mod_cleanup import ModuleCleanup
     from .mod_history import ModuleHistory
-    from .mod_scan import ModuleScan
     from .mod_setting import ModuleSetting
 
-    P.ModelScanRun = ModelScanRun
-    P.ModelDuplicateGroup = ModelDuplicateGroup
-    P.ModelMediaCandidate = ModelMediaCandidate
-    P.ModelActionLog = ModelActionLog
-    P.ModelBatchRun = ModelBatchRun
-    P.ModelBatchExclusion = ModelBatchExclusion
-    P.ModelBatchItem = ModelBatchItem
-    P.ModelDeletionLease = ModelDeletionLease
-    P.ModelDirectDeleteJournal = ModelDirectDeleteJournal
-    P.ModelPostDeleteScanJob = ModelPostDeleteScanJob
-    P.ModelQuarantineJournal = ModelQuarantineJournal
-    P.set_module_list([ModuleSetting, ModuleScan, ModuleHistory])
+    P.ModelCleanupRun = ModelCleanupRun
+    P.ModelCleanupAction = ModelCleanupAction
+    P.set_module_list([ModuleSetting, ModuleCleanup, ModuleHistory])
 except Exception as exc:
     P.logger.error("Exception:%s", str(exc))
     P.logger.error(traceback.format_exc())
+
 
 logger = P.logger

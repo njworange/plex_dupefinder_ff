@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('plex_dupefinder_ff.static', filename='pdff.css') }}">
+
+<section class="pdff-panel">
+  <div class="pdff-heading">
+    <div>
+      <h3 class="pdff-title">중복 정리</h3>
+      <p class="pdff-muted mb-0">저장된 Library와 점수 설정으로 작업합니다.</p>
+    </div>
+    <button id="refresh_status_btn" type="button" class="btn btn-sm btn-outline-secondary">상태 새로고침</button>
+  </div>
+
+  <div class="pdff-actions" aria-label="정리 명령">
+    <button id="dry_run_btn" type="button" class="btn btn-primary">Dry Run 시작</button>
+    <button id="start_live_btn" type="button" class="btn btn-danger">즉시 자동 정리 시작</button>
+    <button id="stop_btn" type="button" class="btn btn-outline-secondary" disabled>중지</button>
+  </div>
+  <div id="command_message" class="pdff-message" role="status" aria-live="polite"></div>
+</section>
+
+<section class="pdff-panel">
+  <h3 class="pdff-title">현재 상태</h3>
+  <div class="pdff-status-grid">
+    <div><span class="pdff-label">상태</span><strong id="run_status">불러오는 중</strong></div>
+    <div><span class="pdff-label">모드</span><strong id="run_mode">-</strong></div>
+    <div><span class="pdff-label">시작 시각</span><strong id="run_started_at">-</strong></div>
+    <div><span class="pdff-label">현재 항목</span><strong id="run_current">-</strong></div>
+    <div><span class="pdff-label">작업 메시지</span><strong id="run_message">-</strong></div>
+  </div>
+
+  <div class="pdff-progress-wrap" aria-label="작업 진행률">
+    <div class="pdff-progress-copy">
+      <span>진행</span>
+      <span id="run_progress_text">0 / 0</span>
+    </div>
+    <div class="pdff-progress-track">
+      <div id="run_progress_bar" class="pdff-progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+    </div>
+  </div>
+
+  <div class="pdff-summary-grid">
+    <div><span class="pdff-label">중복 그룹</span><strong id="summary_groups">0</strong></div>
+    <div><span class="pdff-label">삭제</span><strong id="summary_deleted">0</strong></div>
+    <div><span class="pdff-label">삭제 용량</span><strong id="summary_bytes">0 B</strong></div>
+    <div><span class="pdff-label">Dry Run 대상</span><strong id="summary_would_delete">0</strong></div>
+    <div><span class="pdff-label">예상 확보 용량</span><strong id="summary_would_delete_bytes">0 B</strong></div>
+    <div><span class="pdff-label">부분 완료</span><strong id="summary_partial">0</strong></div>
+    <div><span class="pdff-label">오류</span><strong id="summary_errors">0</strong></div>
+  </div>
+</section>
+
+<section class="pdff-panel">
+  <h3 class="pdff-title">최근 작업</h3>
+  <div id="recent_actions" class="pdff-empty">최근 작업을 불러오는 중입니다.</div>
+</section>
+
+<script src="{{ url_for('plex_dupefinder_ff.static', filename='pdff.js') }}"></script>
+<script>
+'use strict';
+var package_name = {{ arg['package_name']|tojson }};
+var statusTimer = null;
+var statusPending = false;
+var commandPending = false;
+
+function renderStatus(value) {
+  var data = value && typeof value === 'object' ? value : {};
+  var progress = data.progress && typeof data.progress === 'object' ? data.progress : {};
+  var summary = data.summary && typeof data.summary === 'object' ? data.summary : {};
+  var processed = PDFF.number(progress.processed);
+  var total = PDFF.number(progress.total);
+  var percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+  var runningLabel = data.running ? '실행 중' : '대기';
+  if (data.stop_requested) runningLabel = '중지 요청됨';
+
+  PDFF.setText('run_status', runningLabel);
+  PDFF.setText('run_mode', PDFF.mode(data.mode));
+  PDFF.setText('run_started_at', PDFF.date(data.started_at));
+  PDFF.setText('run_current', PDFF.current(data.current));
+  PDFF.setText('run_message', data.message);
+  PDFF.setText('run_progress_text', processed + ' / ' + total);
+  PDFF.setProgress('run_progress_bar', percent);
+  PDFF.setText('summary_groups', PDFF.number(summary.groups));
+  PDFF.setText('summary_deleted', PDFF.number(summary.deleted));
+  PDFF.setText('summary_bytes', PDFF.bytes(summary.bytes));
+  PDFF.setText('summary_would_delete', PDFF.number(summary.would_delete));
+  PDFF.setText('summary_would_delete_bytes', PDFF.bytes(summary.would_delete_bytes));
+  PDFF.setText('summary_partial', PDFF.number(summary.partial));
+  PDFF.setText('summary_errors', PDFF.number(summary.errors));
+  PDFF.renderActions('recent_actions', data.recent_actions, 10);
+
+  document.getElementById('dry_run_btn').disabled = commandPending || Boolean(data.running);
+  document.getElementById('start_live_btn').disabled = commandPending || Boolean(data.running);
+  document.getElementById('stop_btn').disabled = commandPending || !data.running || Boolean(data.stop_requested);
+}
+
+function refreshStatus() {
+  if (statusPending) return;
+  statusPending = true;
+  globalSendCommand('status', '', '', '', function (ret) {
+    statusPending = false;
+    if (!PDFF.ok(ret)) {
+      PDFF.message('command_message', PDFF.messageText(ret, '상태를 불러오지 못했습니다.'), false);
+      return;
+    }
+    renderStatus(PDFF.payload(ret));
+  });
+}
+
+function runCommand(command) {
+  commandPending = true;
+  document.getElementById('dry_run_btn').disabled = true;
+  document.getElementById('start_live_btn').disabled = true;
+  document.getElementById('stop_btn').disabled = true;
+  PDFF.message('command_message', '명령을 전송했습니다.', true);
+  globalSendCommand(command, '', '', '', function (ret) {
+    commandPending = false;
+    PDFF.message('command_message', PDFF.messageText(ret, '명령을 처리했습니다.'), PDFF.ok(ret));
+    var responseData = PDFF.payload(ret);
+    if (PDFF.ok(ret) && Object.prototype.hasOwnProperty.call(responseData, 'running')) {
+      renderStatus(responseData);
+    }
+    refreshStatus();
+  });
+}
+
+document.getElementById('dry_run_btn').addEventListener('click', function () {
+  runCommand('dry_run');
+});
+document.getElementById('start_live_btn').addEventListener('click', function () {
+  runCommand('start_live');
+});
+document.getElementById('stop_btn').addEventListener('click', function () {
+  runCommand('stop');
+});
+document.getElementById('refresh_status_btn').addEventListener('click', refreshStatus);
+
+document.addEventListener('DOMContentLoaded', function () {
+  refreshStatus();
+  statusTimer = window.setInterval(refreshStatus, 2000);
+});
+window.addEventListener('pagehide', function () {
+  if (statusTimer !== null) window.clearInterval(statusTimer);
+});
+</script>
+{% endblock %}
