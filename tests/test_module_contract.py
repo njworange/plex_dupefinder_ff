@@ -383,6 +383,20 @@ class ModuleContractTests(unittest.TestCase):
             self.setting.ModuleSetting.db_default["setting_subtitle_extensions"],
             ".srt,.ass,.ssa,.sub,.idx,.vtt,.smi,.sup",
         )
+        self.assertEqual(
+            self.setting.ModuleSetting.db_default["setting_db_version"], "3"
+        )
+        self.assertIn(
+            '"h264": 10000',
+            self.setting.ModuleSetting.db_default["setting_score_json"],
+        )
+        self.assertIn(
+            '"*Remux*": 20000',
+            self.setting.ModuleSetting.db_default["setting_filename_score"],
+        )
+        self.assertEqual(
+            self.setting.ModuleSetting.db_default["setting_size_score"], "True"
+        )
         self.p.ModelSetting.values.update(
             {
                 "setting_library_id": "1, 2;3\n2",
@@ -417,6 +431,136 @@ class ModuleContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "숫자"):
             self.setting.runtime_config()
 
+    def test_library_lookup_command_returns_clickable_payload(self):
+        module = self.setting.ModuleSetting(self.p)
+        expected = [
+            {"id": "3", "name": "영화", "type": "movie"},
+            {"id": "7", "name": "드라마", "type": "show"},
+        ]
+        with mock.patch.object(self.setting, "library_sections", return_value=expected):
+            result = module.process_command("libraries", "", "", "", None)
+        self.assertEqual(result, {"ret": "success", "data": expected})
+
+    def test_setting_page_replaces_legacy_empty_json_for_display(self):
+        self.p.ModelSetting.values["setting_score_json"] = "{}"
+        self.p.ModelSetting.values["setting_filename_score"] = "{}"
+        template, values = self.setting.ModuleSetting(self.p).process_menu(
+            "setting", None
+        )
+        self.assertEqual(template, "plex_dupefinder_ff_setting_setting.html")
+        self.assertIn('"h264": 10000', values["arg"]["setting_score_json"])
+        self.assertIn(
+            '"*Remux*": 20000', values["arg"]["setting_filename_score"]
+        )
+
+    def test_library_lookup_matches_plex_mate_webhook_db_and_filters_music(self):
+        provider_module = __import__(
+            PACKAGE + ".services.plex_mate_provider",
+            fromlist=["PlexMateProvider"],
+        )
+
+        class Handle:
+            @staticmethod
+            def library_sections():
+                return [
+                    {"id": 12, "name": "드라마", "section_type": 2},
+                    {"id": 3, "name": "영화", "section_type": 1},
+                    {"id": 9, "name": "음악", "section_type": 8},
+                ]
+
+        provider = types.SimpleNamespace(
+            get_plugin=lambda: types.SimpleNamespace(PlexDBHandle=Handle)
+        )
+        with mock.patch.object(
+            provider_module, "PlexMateProvider", return_value=provider
+        ):
+            result = self.setting.library_sections()
+        self.assertEqual(
+            result,
+            [
+                {"id": "3", "name": "영화", "type": "movie"},
+                {"id": "12", "name": "드라마", "type": "show"},
+            ],
+        )
+
+    def test_library_lookup_falls_back_to_plex_web_when_mate_db_is_unavailable(self):
+        provider_module = __import__(
+            PACKAGE + ".services.plex_mate_provider",
+            fromlist=["PlexMateProvider"],
+        )
+        gateway_module = __import__(
+            PACKAGE + ".services.plex_gateway", fromlist=["PlexGateway"]
+        )
+
+        class Handle:
+            @staticmethod
+            def library_sections():
+                return None
+
+        provider = types.SimpleNamespace(
+            get_plugin=lambda: types.SimpleNamespace(PlexDBHandle=Handle),
+            resolve=lambda require_machine_id=False: "connection",
+        )
+
+        class Gateway:
+            def __init__(self, connection, timeout):
+                self.connection = connection
+                self.timeout = timeout
+
+            def list_sections(self):
+                return (
+                    types.SimpleNamespace(
+                        key="7", title="TV", section_type="show", plex_item_type=4
+                    ),
+                    types.SimpleNamespace(
+                        key="8", title="Music", section_type="artist", plex_item_type=None
+                    ),
+                )
+
+        with mock.patch.object(
+            provider_module, "PlexMateProvider", return_value=provider
+        ), mock.patch.object(gateway_module, "PlexGateway", Gateway):
+            result = self.setting.library_sections()
+        self.assertEqual(result, [{"id": "7", "name": "TV", "type": "show"}])
+
+    def test_v2_empty_scores_migrate_to_upstream_example(self):
+        self.p.ModelSetting.values.update(
+            {
+                "setting_db_version": "2",
+                "setting_score_json": "{}",
+                "setting_filename_score": "",
+                "setting_size_score": "False",
+            }
+        )
+        self.setting.ModuleSetting(self.p).migration()
+        self.assertEqual(self.p.ModelSetting.get("setting_db_version"), "3")
+        self.assertIn('"h264": 10000', self.p.ModelSetting.get("setting_score_json"))
+        self.assertIn(
+            '"*Remux*": 20000',
+            self.p.ModelSetting.get("setting_filename_score"),
+        )
+        self.assertEqual(self.p.ModelSetting.get("setting_size_score"), "True")
+
+    def test_v2_custom_scores_are_preserved_during_migration(self):
+        self.p.ModelSetting.values.update(
+            {
+                "setting_db_version": "2",
+                "setting_score_json": '{"bitrate_weight":9}',
+                "setting_filename_score": '{"*CUSTOM*":7}',
+                "setting_size_score": "False",
+            }
+        )
+        self.setting.ModuleSetting(self.p).migration()
+        self.assertEqual(
+            self.p.ModelSetting.get("setting_score_json"),
+            '{"bitrate_weight":9}',
+        )
+        self.assertEqual(
+            self.p.ModelSetting.get("setting_filename_score"),
+            '{"*CUSTOM*":7}',
+        )
+        self.assertEqual(self.p.ModelSetting.get("setting_size_score"), "False")
+
     def test_filename_glob_is_not_double_translated_and_empty_uses_defaults(self):
         score_module = __import__(
             PACKAGE + ".services.score_engine", fromlist=["ScoreEngine"]
@@ -427,7 +571,7 @@ class ModuleContractTests(unittest.TestCase):
             "include_size": False,
         }
         default_config = self.cleanup._score_config(base)
-        self.assertIn("*remux*", default_config.filename_scores)
+        self.assertEqual(default_config.filename_scores["*Remux*"], 20000)
         custom = dict(base, filename_scores={"*REMUX*": 10000.0})
         custom_config = self.cleanup._score_config(custom)
         self.assertEqual(custom_config.filename_scores, {"*REMUX*": 10000.0})

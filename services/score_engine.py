@@ -12,39 +12,62 @@ from .domain import DuplicateGroup, MediaCandidate, ScoreResult
 
 
 DEFAULT_AUDIO_CODEC_SCORES = {
-    "mp3": 500.0,
-    "aac": 1000.0,
-    "ac3": 2500.0,
-    "eac3": 3000.0,
-    "dca": 4000.0,
-    "dts": 4000.0,
-    "flac": 4500.0,
-    "truehd": 5000.0,
+    "Unknown": 0,
+    "aac": 1000,
+    "ac3": 1000,
+    "dca": 2000,
+    "dca-ma": 4000,
+    "eac3": 1250,
+    "flac": 2500,
+    "mp2": 500,
+    "mp3": 1000,
+    "pcm": 2500,
+    "truehd": 4500,
+    "wmapro": 200,
 }
 DEFAULT_VIDEO_CODEC_SCORES = {
-    "mpeg2video": 500.0,
-    "mpeg4": 750.0,
-    "vc1": 1000.0,
-    "h264": 2000.0,
-    "hevc": 4000.0,
-    "av1": 5000.0,
+    "Unknown": 0,
+    "h264": 10000,
+    "h265": 5000,
+    "hevc": 5000,
+    "mpeg1video": 250,
+    "mpeg2video": 250,
+    "mpeg4": 500,
+    "msmpeg4": 100,
+    "msmpeg4v2": 100,
+    "msmpeg4v3": 100,
+    "vc1": 3000,
+    "vp9": 1000,
+    "wmv2": 250,
+    "wmv3": 250,
 }
 DEFAULT_RESOLUTION_SCORES = {
-    "480": 3000.0,
-    "576": 5000.0,
-    "720": 10000.0,
-    "1080": 20000.0,
-    "2k": 25000.0,
-    "4k": 40000.0,
-    "2160": 40000.0,
+    "1080": 10000,
+    "480": 3000,
+    "4k": 20000,
+    "720": 5000,
+    "Unknown": 0,
+    "sd": 1000,
 }
 DEFAULT_FILENAME_SCORES = {
-    "*remux*": 10000.0,
-    "*bluray*": 4000.0,
-    "*blu-ray*": 4000.0,
-    "*web-dl*": 2500.0,
-    "*webdl*": 2500.0,
-    "*webrip*": 1500.0,
+    "*.avi": -1000,
+    "*.ts": -1000,
+    "*.vob": -5000,
+    "*1080p*BluRay*": 15000,
+    "*720p*BluRay*": 10000,
+    "*HDTV*": -1000,
+    "*PROPER*": 1500,
+    "*REPACK*": 1500,
+    "*Remux*": 20000,
+    "*WEB*CasStudio*": 5000,
+    "*WEB*KINGS*": 5000,
+    "*WEB*NTB*": 5000,
+    "*WEB*QOQ*": 5000,
+    "*WEB*SiGMA*": 5000,
+    "*WEB*TBS*": -1000,
+    "*WEB*TROLLHD*": 2500,
+    "*WEB*VISUM*": 5000,
+    "*dvd*": -1000,
 }
 
 
@@ -68,7 +91,7 @@ class ScoreConfig:
     duration_divisor: float = 300.0
     dimensions_weight: float = 2.0
     audio_channels_weight: float = 1000.0
-    include_size: bool = False
+    include_size: bool = True
     size_divisor: float = 100000.0
 
 
@@ -128,7 +151,8 @@ def _normalise_codec(value: object) -> str:
         "avc": "h264",
         "ddp": "eac3",
         "ddplus": "eac3",
-        "dtshd": "dts",
+        "dtshd": "dcama",
+        "dtsma": "dcama",
     }
     return aliases.get(text, text)
 

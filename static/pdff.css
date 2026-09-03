@@ -163,6 +163,22 @@
   padding-left: 20px;
 }
 
+.pdff-library-lookup {
+  margin: 0 0 18px;
+  min-height: 38px;
+  padding: 8px 12px 8px clamp(0px, 13vw, 210px);
+}
+
+.pdff-library-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pdff-library-button {
+  white-space: normal;
+}
+
 @media (max-width: 575px) {
   .pdff-heading {
     align-items: flex-start;
@@ -171,5 +187,9 @@
 
   .pdff-actions .btn {
     flex: 1 1 100%;
+  }
+
+  .pdff-library-lookup {
+    padding-left: 0;
   }
 }

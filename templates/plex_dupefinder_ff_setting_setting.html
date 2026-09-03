@@ -13,34 +13,38 @@
   <form id="setting" onsubmit="return false;">
     {{ macros.m_button_group([['globalSettingSaveBtn', '설정 저장']]) }}
 
-    {{ macros.setting_input_text(
+    {{ macros.setting_input_text_and_buttons(
       'setting_library_id',
-      '대상 Library ID',
+      '대상 라이브러리',
+      [['load_libraries_btn', '라이브러리 조회']],
       value=arg.get('setting_library_id', ''),
-      desc='Plex Library ID를 입력합니다. 여러 개는 쉼표로 구분합니다.'
+      desc=['plex_mate의 Plex 연결로 영화·TV 라이브러리를 조회합니다.', '아래 버튼을 눌러 선택하거나 해제할 수 있으며 ID는 쉼표로 구분됩니다.']
     ) }}
+    <div id="library_lookup_result" class="pdff-library-lookup pdff-muted" role="status" aria-live="polite">
+      라이브러리 조회 버튼을 눌러주세요.
+    </div>
 
     {{ macros.setting_input_textarea(
       'setting_score_json',
-      'Score JSON',
-      value=arg.get('setting_score_json', '{}'),
-      row='8',
-      desc='유지할 영상의 점수 규칙을 JSON 객체로 입력합니다.'
+      'Score JSON (원본 기본값)',
+      value=arg['setting_score_json'],
+      row='28',
+      desc='l3uddz/plex_dupefinder의 config_sample.json 점수표와 원본 계산 가중치입니다.'
     ) }}
 
     {{ macros.setting_input_textarea(
       'setting_filename_score',
-      '파일명 점수 규칙',
-      value=arg.get('setting_filename_score', '{}'),
-      row='6',
-      desc='glob pattern과 점수를 JSON 객체로 입력합니다. 예: {"*REMUX*": 10000, "*2160p*": 3000}'
+      '파일명 점수 규칙 (원본 기본값)',
+      value=arg['setting_filename_score'],
+      row='20',
+      desc='l3uddz/plex_dupefinder의 config_sample.json FILENAME_SCORES를 그대로 사용합니다.'
     ) }}
 
     {{ macros.setting_checkbox(
       'setting_size_score',
       '파일 크기 점수 사용',
-      value=arg.get('setting_size_score', 'False'),
-      desc='파일 크기를 중복 영상 점수에 반영합니다.'
+      value=arg.get('setting_size_score', 'True'),
+      desc='원본 예시의 SCORE_FILESIZE=true를 적용합니다.'
     ) }}
 
     {{ macros.setting_input_text(
@@ -86,4 +90,108 @@
   <strong>동작 안내</strong>
   <p class="mb-0">Dry Run은 삭제 없이 대상을 계산합니다. 즉시 자동 정리는 점수가 가장 높은 영상을 남기고 나머지 영상과 관련 외부 자막을 바로 삭제합니다.</p>
 </section>
+
+<script src="{{ url_for('plex_dupefinder_ff.static', filename='pdff.js') }}"></script>
+<script>
+'use strict';
+var packageName = {{ arg['package_name']|tojson }};
+var libraryLookupPending = false;
+var libraryButtons = {};
+
+function selectedLibraryIds() {
+  var input = document.getElementById('setting_library_id');
+  var values = input ? String(input.value || '').split(/[,;\r\n]+/) : [];
+  var result = [];
+  values.forEach(function (value) {
+    var item = value.trim();
+    if (/^\d+$/.test(item) && result.indexOf(item) < 0) result.push(item);
+  });
+  return result;
+}
+
+function syncLibraryButtons() {
+  var selected = selectedLibraryIds();
+  Object.keys(libraryButtons).forEach(function (id) {
+    var button = libraryButtons[id];
+    var active = selected.indexOf(id) >= 0;
+    button.classList.toggle('btn-primary', active);
+    button.classList.toggle('btn-outline-primary', !active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+}
+
+function toggleLibraryId(id) {
+  var input = document.getElementById('setting_library_id');
+  if (!input) return;
+  var values = selectedLibraryIds();
+  var index = values.indexOf(id);
+  if (index >= 0) values.splice(index, 1);
+  else values.push(id);
+  input.value = values.join(',');
+  input.dispatchEvent(new Event('change', {bubbles: true}));
+  syncLibraryButtons();
+}
+
+function renderLibraries(items) {
+  var target = document.getElementById('library_lookup_result');
+  while (target.firstChild) target.removeChild(target.firstChild);
+  libraryButtons = {};
+  if (!Array.isArray(items) || !items.length) {
+    target.className = 'pdff-library-lookup pdff-empty';
+    target.textContent = '선택 가능한 영화·TV 라이브러리가 없습니다.';
+    return;
+  }
+  target.className = 'pdff-library-lookup';
+  var grid = document.createElement('div');
+  grid.className = 'pdff-library-grid';
+  items.forEach(function (item) {
+    var id = String(item && item.id || '');
+    if (!/^\d+$/.test(id) || Object.prototype.hasOwnProperty.call(libraryButtons, id)) return;
+    var name = String(item && item.name || ('Library ' + id));
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-sm btn-outline-primary pdff-library-button';
+    button.textContent = name + ' (' + id + ')';
+    button.setAttribute('data-library-id', id);
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('click', function () { toggleLibraryId(id); });
+    libraryButtons[id] = button;
+    grid.appendChild(button);
+  });
+  if (!grid.childNodes.length) {
+    target.className = 'pdff-library-lookup pdff-empty';
+    target.textContent = 'Plex가 유효한 라이브러리 ID를 반환하지 않았습니다.';
+    return;
+  }
+  target.appendChild(grid);
+  syncLibraryButtons();
+}
+
+function requestLibraries() {
+  if (libraryLookupPending) return;
+  libraryLookupPending = true;
+  var button = document.getElementById('load_libraries_btn');
+  var target = document.getElementById('library_lookup_result');
+  if (button) button.disabled = true;
+  target.className = 'pdff-library-lookup pdff-muted';
+  target.textContent = 'plex_mate 연결로 라이브러리를 조회하는 중입니다.';
+  globalSendCommand('libraries', '', '', '', function (ret) {
+    libraryLookupPending = false;
+    if (button) button.disabled = false;
+    if (!PDFF.ok(ret)) {
+      target.className = 'pdff-library-lookup pdff-message pdff-message-error';
+      target.textContent = PDFF.messageText(ret, '라이브러리를 조회하지 못했습니다.');
+      return;
+    }
+    renderLibraries(ret.data);
+  });
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+  var lookupButton = document.getElementById('load_libraries_btn');
+  var input = document.getElementById('setting_library_id');
+  if (lookupButton) lookupButton.addEventListener('click', requestLibraries);
+  if (input) input.addEventListener('input', syncLibraryButtons);
+});
+</script>
 {% endblock %}

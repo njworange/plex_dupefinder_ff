@@ -137,7 +137,7 @@ class PlexGateway:
         timeout: Tuple[float, float] = (5.0, 30.0),
         session: Any = None,
         product: str = "FlaskFarm Plex Dupefinder",
-        version: str = "2.0.0",
+        version: str = "2.1.0",
         client_identifier: str = "flaskfarm-plex-dupefinder-v2",
     ) -> None:
         if not isinstance(connection, PlexConnection):

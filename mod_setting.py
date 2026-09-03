@@ -3,15 +3,40 @@ from __future__ import annotations
 import json
 import math
 import re
+import traceback
 from typing import Any, Dict, List
 
 from flask import jsonify, render_template
 from plugin import PluginModuleBase
 
+from .services.score_engine import (
+    DEFAULT_AUDIO_CODEC_SCORES,
+    DEFAULT_FILENAME_SCORES,
+    DEFAULT_RESOLUTION_SCORES,
+    DEFAULT_VIDEO_CODEC_SCORES,
+)
 from .setup import P
 
 
 name = "setting"
+SETTINGS_SCHEMA_VERSION = "3"
+
+ORIGINAL_SCORE_SETTINGS = {
+    "audio_codec_scores": DEFAULT_AUDIO_CODEC_SCORES,
+    "video_codec_scores": DEFAULT_VIDEO_CODEC_SCORES,
+    "resolution_scores": DEFAULT_RESOLUTION_SCORES,
+    "bitrate_weight": 2,
+    "duration_divisor": 300,
+    "dimensions_weight": 2,
+    "audio_channels_weight": 1000,
+    "size_divisor": 100000,
+}
+DEFAULT_SCORE_JSON = json.dumps(
+    ORIGINAL_SCORE_SETTINGS, ensure_ascii=False, indent=2
+)
+DEFAULT_FILENAME_SCORE_JSON = json.dumps(
+    DEFAULT_FILENAME_SCORES, ensure_ascii=False, indent=2
+)
 
 
 def parse_library_ids(value: Any) -> List[str]:
@@ -48,6 +73,16 @@ def _json_object_setting(key: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("%s 값은 JSON 객체여야 합니다." % key)
     return value
+
+
+def _is_empty_json_object(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    try:
+        return json.loads(text) == {}
+    except (TypeError, ValueError):
+        return False
 
 
 def _finite_score_mapping(key: str) -> Dict[str, float]:
@@ -101,12 +136,79 @@ def runtime_config() -> Dict[str, Any]:
         "library_ids": library_ids,
         "score": score_json,
         "filename_scores": filename_scores,
-        "include_size": _setting_bool("setting_size_score", False, strict=True),
+        "include_size": _setting_bool("setting_size_score", True, strict=True),
         "subtitle_extensions": extensions,
         "subs_search": _setting_bool("setting_subs_search", True),
         "timeout": timeout,
-        "score_profile": "v2.0.0",
+        "score_profile": "v2.1.0-upstream-example",
     }
+
+
+def library_sections() -> List[Dict[str, str]]:
+    """Read video libraries like plex_mate's webhook settings picker."""
+
+    from .services.plex_gateway import PlexGateway
+    from .services.plex_mate_provider import PlexMateProvider
+
+    try:
+        timeout = int(P.ModelSetting.get("setting_timeout") or "20")
+    except (TypeError, ValueError):
+        timeout = 20
+    timeout = max(5, min(timeout, 120))
+    provider = PlexMateProvider()
+    try:
+        plex_mate = provider.get_plugin()
+        db_handle = getattr(plex_mate, "PlexDBHandle", None)
+        db_loader = getattr(db_handle, "library_sections", None)
+        if callable(db_loader):
+            db_rows = db_loader()
+            if db_rows is not None:
+                db_result: List[Dict[str, str]] = []
+                type_names = {1: "movie", 2: "show"}
+                for row in db_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        section_type = int(row.get("section_type") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    section_id = str(row.get("id") or "").strip()
+                    if section_type not in type_names or not section_id.isdigit():
+                        continue
+                    db_result.append(
+                        {
+                            "id": section_id,
+                            "name": str(
+                                row.get("name") or "Library %s" % section_id
+                            ),
+                            "type": type_names[section_type],
+                        }
+                    )
+                db_result.sort(
+                    key=lambda item: (int(item["id"]), item["name"].casefold())
+                )
+                return db_result
+    except Exception as exc:
+        P.logger.debug(
+            "plex_mate DB library lookup unavailable (%s); using Plex Web API",
+            exc.__class__.__name__,
+        )
+
+    connection = provider.resolve(require_machine_id=False)
+    gateway = PlexGateway(connection, timeout=(5, timeout))
+    result: List[Dict[str, str]] = []
+    for section in gateway.list_sections():
+        if section.plex_item_type not in (1, 4) or not section.key.isdigit():
+            continue
+        result.append(
+            {
+                "id": section.key,
+                "name": section.title,
+                "type": section.section_type,
+            }
+        )
+    result.sort(key=lambda item: (int(item["id"]), item["name"].casefold()))
+    return result
 
 
 def sync_scheduler_settings() -> bool:
@@ -149,11 +251,11 @@ def sync_scheduler_settings() -> bool:
 
 class ModuleSetting(PluginModuleBase):
     db_default = {
-        "setting_db_version": "2",
+        "setting_db_version": SETTINGS_SCHEMA_VERSION,
         "setting_library_id": "",
-        "setting_score_json": "{}",
-        "setting_filename_score": "{}",
-        "setting_size_score": "False",
+        "setting_score_json": DEFAULT_SCORE_JSON,
+        "setting_filename_score": DEFAULT_FILENAME_SCORE_JSON,
+        "setting_size_score": "True",
         "setting_subtitle_extensions": ".srt,.ass,.ssa,.sub,.idx,.vtt,.smi,.sup",
         "setting_subs_search": "True",
         "setting_timeout": "20",
@@ -166,6 +268,10 @@ class ModuleSetting(PluginModuleBase):
 
     def process_menu(self, sub: str, req: Any) -> Any:
         arg = P.ModelSetting.to_dict()
+        if _is_empty_json_object(arg.get("setting_score_json")):
+            arg["setting_score_json"] = DEFAULT_SCORE_JSON
+        if _is_empty_json_object(arg.get("setting_filename_score")):
+            arg["setting_filename_score"] = DEFAULT_FILENAME_SCORE_JSON
         arg["package_name"] = P.package_name
         arg["module_name"] = self.name
         arg["sub"] = sub
@@ -179,7 +285,49 @@ class ModuleSetting(PluginModuleBase):
         del arg1, arg2, arg3, req
         if command == "runtime_config":
             return jsonify({"ret": "success", "data": runtime_config()})
+        if command == "libraries":
+            try:
+                return jsonify({"ret": "success", "data": library_sections()})
+            except Exception as exc:
+                P.logger.warning(
+                    "Plex library lookup failed: %s", exc.__class__.__name__
+                )
+                P.logger.debug(traceback.format_exc())
+                return jsonify(
+                    {
+                        "ret": "danger",
+                        "msg": "plex_mate를 통한 라이브러리 조회에 실패했습니다: %s"
+                        % str(exc),
+                    }
+                )
         return jsonify({"ret": "warning", "msg": "지원하지 않는 명령입니다."})
+
+    def process_ajax(self, sub: str, req: Any) -> Any:
+        return self.process_command(sub, "", "", "", req)
+
+    def migration(self) -> None:
+        try:
+            current = int(P.ModelSetting.get("setting_db_version") or "0")
+        except (TypeError, ValueError):
+            current = 0
+        if current >= int(SETTINGS_SCHEMA_VERSION):
+            return
+
+        score_was_empty = _is_empty_json_object(
+            P.ModelSetting.get("setting_score_json")
+        )
+        filename_was_empty = _is_empty_json_object(
+            P.ModelSetting.get("setting_filename_score")
+        )
+        if score_was_empty:
+            P.ModelSetting.set("setting_score_json", DEFAULT_SCORE_JSON)
+        if filename_was_empty:
+            P.ModelSetting.set(
+                "setting_filename_score", DEFAULT_FILENAME_SCORE_JSON
+            )
+        if score_was_empty and filename_was_empty:
+            P.ModelSetting.set("setting_size_score", "True")
+        P.ModelSetting.set("setting_db_version", SETTINGS_SCHEMA_VERSION)
 
     def setting_save_after(self, change_list: Any) -> None:
         del change_list
@@ -187,7 +335,11 @@ class ModuleSetting(PluginModuleBase):
 
 
 __all__ = [
+    "DEFAULT_FILENAME_SCORE_JSON",
+    "DEFAULT_SCORE_JSON",
     "ModuleSetting",
+    "ORIGINAL_SCORE_SETTINGS",
+    "library_sections",
     "parse_library_ids",
     "runtime_config",
     "sync_scheduler_settings",

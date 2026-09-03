@@ -2,7 +2,7 @@
 
 FlaskFarm에서 Plex 중복 영상을 점수화하고, **Dry Run으로 삭제 예정 목록을 확인하거나 Live Run으로 즉시 삭제**하는 플러그인입니다.
 
-버전: **2.0.0**
+버전: **2.1.0**
 
 > Live Run은 Plex Media DELETE를 호출하고 외부 자막을 영구 삭제합니다. quarantine, 백업, 승인 단계, 자동 복구 기능은 없습니다.
 
@@ -17,6 +17,7 @@ FlaskFarm에서 Plex 중복 영상을 점수화하고, **Dry Run으로 삭제 �
 - multipart Media의 모든 Part와 자막 처리
 - 수동 실행 및 FlaskFarm scheduler 실행
 - 실행 및 항목별 최소 이력
+- plex_mate 연결로 라이브러리를 조회하고 버튼으로 복수 선택
 
 ## 요구 사항
 
@@ -28,6 +29,10 @@ FlaskFarm에서 Plex 중복 영상을 점수화하고, **Dry Run으로 삭제 �
 - `requests>=2.25,<3`
 
 Plex URL, Token, Machine ID는 이 플러그인에 저장하지 않습니다. 실행할 때마다 `plex_mate`의 연결 설정을 읽습니다.
+
+## 대상 라이브러리
+
+설정 화면에서 `라이브러리 조회`를 누르면 plex_mate에 저장된 Plex 연결로 현재 영화·TV 라이브러리를 읽습니다. 표시된 버튼을 누르면 해당 Library ID가 대상 목록에 추가되고, 선택된 버튼을 다시 누르면 해제됩니다. 음악 등 중복 영상 정리를 지원하지 않는 라이브러리는 표시하지 않습니다.
 
 ## 실행 모드
 
@@ -61,27 +66,49 @@ Plex URL, Token, Machine ID는 이 플러그인에 저장하지 않습니다. �
 
 ## 점수 설정
 
-기본 점수 계열은 원본 [l3uddz/plex_dupefinder](https://github.com/l3uddz/plex_dupefinder)의 개념을 따릅니다.
+기본 점수는 원본 [l3uddz/plex_dupefinder](https://github.com/l3uddz/plex_dupefinder)의 `config_sample.json` 예시를 사용합니다. 2.0.0에서 `{}`였던 설정은 2.1.0으로 처음 로드할 때 이 값으로 자동 변경됩니다.
 
 `Score JSON`에서 필요한 값만 덮어쓸 수 있습니다.
 
 ```json
 {
   "video_codec_scores": {
-    "h264": 2000,
-    "hevc": 4000,
-    "av1": 5000
+    "Unknown": 0,
+    "h264": 10000,
+    "h265": 5000,
+    "hevc": 5000,
+    "mpeg1video": 250,
+    "mpeg2video": 250,
+    "mpeg4": 500,
+    "msmpeg4": 100,
+    "msmpeg4v2": 100,
+    "msmpeg4v3": 100,
+    "vc1": 3000,
+    "vp9": 1000,
+    "wmv2": 250,
+    "wmv3": 250
   },
   "audio_codec_scores": {
+    "Unknown": 0,
     "aac": 1000,
-    "dts": 4000,
-    "truehd": 5000
+    "ac3": 1000,
+    "dca": 2000,
+    "dca-ma": 4000,
+    "eac3": 1250,
+    "flac": 2500,
+    "mp2": 500,
+    "mp3": 1000,
+    "pcm": 2500,
+    "truehd": 4500,
+    "wmapro": 200
   },
   "resolution_scores": {
-    "720": 10000,
-    "1080": 20000,
-    "2160": 40000,
-    "4k": 40000
+    "1080": 10000,
+    "480": 3000,
+    "4k": 20000,
+    "720": 5000,
+    "Unknown": 0,
+    "sd": 1000
   },
   "bitrate_weight": 2,
   "duration_divisor": 300,
@@ -95,13 +122,28 @@ Plex URL, Token, Machine ID는 이 플러그인에 저장하지 않습니다. �
 
 ```json
 {
-  "*REMUX*": 10000,
-  "*BluRay*": 4000,
-  "*WEB-DL*": 2500
+  "*.avi": -1000,
+  "*.ts": -1000,
+  "*.vob": -5000,
+  "*1080p*BluRay*": 15000,
+  "*720p*BluRay*": 10000,
+  "*HDTV*": -1000,
+  "*PROPER*": 1500,
+  "*REPACK*": 1500,
+  "*Remux*": 20000,
+  "*WEB*CasStudio*": 5000,
+  "*WEB*KINGS*": 5000,
+  "*WEB*NTB*": 5000,
+  "*WEB*QOQ*": 5000,
+  "*WEB*SiGMA*": 5000,
+  "*WEB*TBS*": -1000,
+  "*WEB*TROLLHD*": 2500,
+  "*WEB*VISUM*": 5000,
+  "*dvd*": -1000
 }
 ```
 
-설정하지 않은 값은 내장 기본값을 사용합니다.
+원본 예시와 동일하게 파일 크기 점수도 기본으로 사용합니다. 설정하지 않은 값은 위 내장 기본값을 사용합니다.
 
 ## 외부 자막
 

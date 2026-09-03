@@ -38,21 +38,71 @@ def zero_config(**changes):
 
 
 class DomainAndScoreTests(unittest.TestCase):
-    def test_default_scores_use_the_v1_production_scale(self):
-        self.assertEqual(DEFAULT_RESOLUTION_SCORES["4k"], 40000)
-        self.assertEqual(DEFAULT_RESOLUTION_SCORES["1080"], 20000)
-        self.assertEqual(DEFAULT_RESOLUTION_SCORES["720"], 10000)
-        self.assertEqual(DEFAULT_VIDEO_CODEC_SCORES["av1"], 5000)
-        self.assertEqual(DEFAULT_VIDEO_CODEC_SCORES["hevc"], 4000)
-        self.assertEqual(DEFAULT_VIDEO_CODEC_SCORES["h264"], 2000)
-        self.assertEqual(DEFAULT_AUDIO_CODEC_SCORES["truehd"], 5000)
-        self.assertEqual(DEFAULT_AUDIO_CODEC_SCORES["dts"], 4000)
-        self.assertEqual(DEFAULT_AUDIO_CODEC_SCORES["eac3"], 3000)
-        self.assertEqual(DEFAULT_AUDIO_CODEC_SCORES["aac"], 1000)
-        self.assertEqual(DEFAULT_FILENAME_SCORES["*remux*"], 10000)
-        self.assertEqual(DEFAULT_FILENAME_SCORES["*bluray*"], 4000)
-        self.assertEqual(DEFAULT_FILENAME_SCORES["*web-dl*"], 2500)
-        self.assertEqual(DEFAULT_FILENAME_SCORES["*webrip*"], 1500)
+    def test_default_scores_match_upstream_config_sample(self):
+        self.assertEqual(
+            DEFAULT_AUDIO_CODEC_SCORES,
+            {
+                "Unknown": 0,
+                "aac": 1000,
+                "ac3": 1000,
+                "dca": 2000,
+                "dca-ma": 4000,
+                "eac3": 1250,
+                "flac": 2500,
+                "mp2": 500,
+                "mp3": 1000,
+                "pcm": 2500,
+                "truehd": 4500,
+                "wmapro": 200,
+            },
+        )
+        self.assertEqual(
+            DEFAULT_VIDEO_CODEC_SCORES,
+            {
+                "Unknown": 0,
+                "h264": 10000,
+                "h265": 5000,
+                "hevc": 5000,
+                "mpeg1video": 250,
+                "mpeg2video": 250,
+                "mpeg4": 500,
+                "msmpeg4": 100,
+                "msmpeg4v2": 100,
+                "msmpeg4v3": 100,
+                "vc1": 3000,
+                "vp9": 1000,
+                "wmv2": 250,
+                "wmv3": 250,
+            },
+        )
+        self.assertEqual(
+            DEFAULT_RESOLUTION_SCORES,
+            {"1080": 10000, "480": 3000, "4k": 20000, "720": 5000, "Unknown": 0, "sd": 1000},
+        )
+        self.assertEqual(
+            DEFAULT_FILENAME_SCORES,
+            {
+                "*.avi": -1000,
+                "*.ts": -1000,
+                "*.vob": -5000,
+                "*1080p*BluRay*": 15000,
+                "*720p*BluRay*": 10000,
+                "*HDTV*": -1000,
+                "*PROPER*": 1500,
+                "*REPACK*": 1500,
+                "*Remux*": 20000,
+                "*WEB*CasStudio*": 5000,
+                "*WEB*KINGS*": 5000,
+                "*WEB*NTB*": 5000,
+                "*WEB*QOQ*": 5000,
+                "*WEB*SiGMA*": 5000,
+                "*WEB*TBS*": -1000,
+                "*WEB*TROLLHD*": 2500,
+                "*WEB*VISUM*": 5000,
+                "*dvd*": -1000,
+            },
+        )
+        self.assertTrue(ScoreConfig().include_size)
 
     def test_media_candidate_supports_multipart_and_serialization(self):
         candidate = MediaCandidate(

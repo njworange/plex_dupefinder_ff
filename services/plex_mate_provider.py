@@ -66,6 +66,11 @@ class PlexMateProvider:
             return plugins[self.plugin_name]
         raise PlexMateUnavailable(f"{self.plugin_name!r} plugin is not installed or enabled")
 
+    def get_plugin(self) -> Any:
+        """Return the FlaskFarm plugin instance for read-only integrations."""
+
+        return self._plugin()
+
     @staticmethod
     def _setting(plugin: Any, key: str) -> Any:
         candidates = (

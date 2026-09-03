@@ -24,7 +24,7 @@ class MinimalUiContractTests(unittest.TestCase):
         cls.javascript = (STATIC / "pdff.js").read_text(encoding="utf-8")
         cls.stylesheet = (STATIC / "pdff.css").read_text(encoding="utf-8")
 
-    def test_setting_page_exposes_minimal_v2_fields(self) -> None:
+    def test_setting_page_exposes_v21_defaults_and_library_picker(self) -> None:
         for setting_id in (
             "setting_library_id",
             "setting_score_json",
@@ -43,15 +43,25 @@ class MinimalUiContractTests(unittest.TestCase):
         self.assertIn("['live', '즉시 자동 정리']", self.setting)
         self.assertIn(".smi,.sup", self.setting)
         self.assertIn("Subs 및 Subtitles", self.setting)
+        self.assertIn("setting_input_text_and_buttons", self.setting)
+        self.assertIn("'load_libraries_btn', '라이브러리 조회'", self.setting)
+        self.assertIn('id="library_lookup_result"', self.setting)
+        self.assertIn("globalSendCommand('libraries'", self.setting)
+        self.assertIn("toggleLibraryId", self.setting)
+        score_field = self.setting.split("'setting_score_json'", 1)[1].split(
+            ") }}", 1
+        )[0]
+        self.assertIn("value=arg['setting_score_json']", score_field)
+        self.assertIn("row='28'", score_field)
         filename_field = self.setting.split("'setting_filename_score'", 1)[1].split(
             ") }}", 1
         )[0]
-        self.assertIn("value=arg.get('setting_filename_score', '{}')", filename_field)
-        self.assertIn("row='6'", filename_field)
+        self.assertIn("value=arg['setting_filename_score']", filename_field)
+        self.assertIn("row='20'", filename_field)
         size_field = self.setting.split("'setting_size_score'", 1)[1].split(
             ") }}", 1
         )[0]
-        self.assertIn("value=arg.get('setting_size_score', 'False')", size_field)
+        self.assertIn("value=arg.get('setting_size_score', 'True')", size_field)
 
     def test_cleanup_commands_match_backend_contract(self) -> None:
         for command in ("dry_run", "start_live", "stop", "status"):
@@ -95,8 +105,9 @@ class MinimalUiContractTests(unittest.TestCase):
         self.assertIn("target.textContent", self.javascript)
         self.assertNotIn(".innerHTML", self.javascript)
         self.assertNotIn("insertAdjacentHTML", self.javascript)
-        for template in (self.cleanup, self.history):
+        for template in (self.setting, self.cleanup, self.history):
             self.assertIn("arg['package_name']|tojson", template)
+        self.assertNotIn(".innerHTML", self.setting)
 
     def test_removed_workflows_do_not_reappear(self) -> None:
         combined = "\n".join((self.setting, self.cleanup, self.history, self.javascript)).lower()
