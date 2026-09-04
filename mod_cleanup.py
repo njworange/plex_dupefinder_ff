@@ -294,6 +294,7 @@ def build_cleanup_adapter(config: Dict[str, Any]) -> CleanupServiceAdapter:
 def _empty_status() -> Dict[str, Any]:
     return {
         "running": False,
+        "status": "idle",
         "mode": "",
         "stop_requested": False,
         "started_at": None,
@@ -453,6 +454,7 @@ class ModuleCleanup(PluginModuleBase):
             self._status.update(
                 {
                     "running": True,
+                    "status": "queued",
                     "mode": mode,
                     "started_at": datetime.now().isoformat(timespec="seconds"),
                     "message": "대기",
@@ -483,29 +485,42 @@ class ModuleCleanup(PluginModuleBase):
         with self.worker_lock:
             worker = self.worker_thread
             run_id = self.current_run_id
-            if not worker or not worker.is_alive():
+            active_statuses = ("queued", "running", "stopping")
+            if (
+                not worker
+                or not worker.is_alive()
+                or self._status.get("status") not in active_statuses
+            ):
                 return {"ret": "warning", "msg": "실행 중인 작업이 없습니다."}
             self.stop_event.set()
+            self._status["status"] = "stopping"
             self._status["stop_requested"] = True
             self._status["message"] = "중지 요청됨"
         if run_id is not None:
             try:
                 with F.app.app_context():
-                    run = ModelCleanupRun.get(run_id)
-                    if run is not None:
-                        run.stop_requested = True
-                        run.status = "stopping"
-                        run.status_message = "중지 요청됨"
-                        F.db.session.commit()
+                    updated = ModelCleanupRun.request_stop(run_id)
+                    if not updated:
+                        run = ModelCleanupRun.get(run_id)
+                        if run is not None:
+                            self._set_status_from_run(run)
             except Exception:
                 _rollback_session()
-        return {"ret": "success", "msg": "현재 단계가 끝난 뒤 중지합니다."}
+        return {
+            "ret": "success",
+            "msg": "중지 요청을 접수했습니다. 이미 시작된 삭제 건을 마친 뒤 중지합니다.",
+            "data": self.status_payload(),
+        }
 
     def status_payload(self) -> Dict[str, Any]:
         with self.worker_lock:
             payload = copy.deepcopy(self._status)
+            status = str(payload.get("status") or "")
+            active_statuses = ("queued", "running", "stopping")
             payload["running"] = bool(
-                self.worker_thread and self.worker_thread.is_alive()
+                self.worker_thread
+                and self.worker_thread.is_alive()
+                and (not status or status in active_statuses)
             )
         return payload
 
@@ -513,17 +528,23 @@ class ModuleCleanup(PluginModuleBase):
         with self.worker_lock:
             actions = list(self._status.get("recent_actions", []))
             payload = run.as_api()
+            stop_requested = bool(run.stop_requested) or self.stop_event.is_set()
+            status = str(payload["status"])
+            if stop_requested and status in ("queued", "running"):
+                status = "stopping"
+            message = "중지 요청됨" if status == "stopping" else payload["message"]
             self._status.update(
                 {
-                    "running": run.status in ("queued", "running", "stopping"),
+                    "running": status in ("queued", "running", "stopping"),
+                    "status": status,
                     "mode": run.mode,
-                    "stop_requested": bool(run.stop_requested),
+                    "stop_requested": stop_requested,
                     "started_at": payload["started_at"],
                     "current": payload["current"],
                     "progress": payload["progress"],
                     "summary": dict(payload["summary"], skipped=self._status["summary"].get("skipped", 0)),
                     "recent_actions": actions[-20:],
-                    "message": payload["message"],
+                    "message": message,
                 }
             )
 
@@ -680,8 +701,10 @@ class ModuleCleanup(PluginModuleBase):
                             self._set_status_from_run(run)
                             continue
 
+                        group_interrupted = False
                         for original_candidate in duplicates:
                             if self.stop_event.is_set():
+                                group_interrupted = True
                                 break
                             media_id = _candidate_id(original_candidate)
                             current_objects = dict(expected_objects)
@@ -692,6 +715,9 @@ class ModuleCleanup(PluginModuleBase):
                             exclusive_sidecars, shared_sidecars = self._shared_sidecars(
                                 adapter, current_objects, media_id
                             )
+                            if self.stop_event.is_set():
+                                group_interrupted = True
+                                break
 
                             if mode == "live":
                                 try:
@@ -699,6 +725,9 @@ class ModuleCleanup(PluginModuleBase):
                                     current_map = _candidate_map(current_group)
                                     current_objects = _candidate_objects(current_group)
                                 except Exception:
+                                    if self.stop_event.is_set():
+                                        group_interrupted = True
+                                        break
                                     action = self._create_action(
                                         run,
                                         section_id,
@@ -716,6 +745,11 @@ class ModuleCleanup(PluginModuleBase):
                                         self._status["summary"]["skipped"] += 1
                                     continue
 
+                                # A stop received while the fresh metadata was
+                                # loading must prevent a new irreversible DELETE.
+                                if self.stop_event.is_set():
+                                    group_interrupted = True
+                                    break
                                 if current_map != expected or media_id not in current_objects:
                                     action = self._create_action(
                                         run,
@@ -734,6 +768,10 @@ class ModuleCleanup(PluginModuleBase):
                                         self._status["summary"]["skipped"] += 1
                                     continue
                                 current_candidate = current_objects[media_id]
+
+                            if self.stop_event.is_set():
+                                group_interrupted = True
+                                break
                             sidecar_note = (
                                 "shared_sidecars_preserved=%s" % len(shared_sidecars)
                                 if shared_sidecars
@@ -776,6 +814,27 @@ class ModuleCleanup(PluginModuleBase):
                             self._record_action_status(action)
                             response = None
                             delete_exception: Optional[Exception] = None
+                            # Action creation commits before the DELETE call.
+                            # Recheck immediately after that bookkeeping so a
+                            # stop received in this final window cannot start a
+                            # new irreversible request.
+                            if self.stop_event.is_set():
+                                action.status = "skipped"
+                                action.finished_at = datetime.now()
+                                action.message = ";".join(
+                                    item
+                                    for item in (
+                                        sidecar_note,
+                                        "stop_requested_before_delete",
+                                    )
+                                    if item
+                                )
+                                self._save_action(action)
+                                self._record_action_status(action)
+                                with self.worker_lock:
+                                    self._status["summary"]["skipped"] += 1
+                                group_interrupted = True
+                                break
                             try:
                                 response = adapter.delete_media(rating_key, media_id)
                                 action.response_status = _response_status(response)
@@ -897,9 +956,12 @@ class ModuleCleanup(PluginModuleBase):
                             self._record_action_status(action)
                             self._set_status_from_run(run)
 
-                        run.processed_groups += 1
+                        if not group_interrupted:
+                            run.processed_groups += 1
                         F.db.session.commit()
                         self._set_status_from_run(run)
+                        if group_interrupted:
+                            break
 
                 run.stop_requested = self.stop_event.is_set()
                 run.finished_at = datetime.now()

@@ -70,8 +70,21 @@ function renderStatus(value) {
   var processed = PDFF.number(progress.processed);
   var total = PDFF.number(progress.total);
   var percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
-  var runningLabel = data.running ? '실행 중' : '대기';
-  if (data.stop_requested) runningLabel = '중지 요청됨';
+  var statusLabels = {
+    idle: '대기',
+    queued: '시작 준비 중',
+    running: '실행 중',
+    stopping: '중지 요청됨',
+    stopped: '중지됨',
+    completed: '완료',
+    completed_with_errors: '오류 또는 부분 완료',
+    failed: '실패',
+    interrupted: '중단됨'
+  };
+  var statusKey = String(data.status || '').toLowerCase();
+  var runningLabel = statusLabels[statusKey] || (data.running ? '실행 중' : '대기');
+  if (data.running && data.stop_requested) runningLabel = '중지 요청됨';
+  if (!data.running && data.stop_requested && statusKey === '') runningLabel = '중지됨';
 
   PDFF.setText('run_status', runningLabel);
   PDFF.setText('run_mode', PDFF.mode(data.mode));

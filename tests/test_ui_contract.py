@@ -89,6 +89,10 @@ class MinimalUiContractTests(unittest.TestCase):
         ):
             self.assertIn('id="%s"' % element_id, self.cleanup)
         self.assertIn("window.setInterval(refreshStatus, 2000)", self.cleanup)
+        self.assertIn("stopping: '중지 요청됨'", self.cleanup)
+        self.assertIn("stopped: '중지됨'", self.cleanup)
+        self.assertIn("data.running && data.stop_requested", self.cleanup)
+        self.assertIn("!data.running && data.stop_requested", self.cleanup)
         self.assertIn("PDFF.bytes(summary.bytes)", self.cleanup)
         self.assertIn("PDFF.bytes(summary.would_delete_bytes)", self.cleanup)
         self.assertIn("hasOwnProperty.call(responseData, 'running')", self.cleanup)

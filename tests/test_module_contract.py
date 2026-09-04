@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import threading
 import types
 import unittest
 from contextlib import contextmanager
@@ -195,6 +196,16 @@ class _FakeRunModel:
     def get(cls, run_id):
         return cls.current if cls.current and cls.current.id == run_id else None
 
+    @classmethod
+    def request_stop(cls, run_id):
+        run = cls.get(run_id)
+        if run is None or run.status not in ("queued", "running", "stopping"):
+            return False
+        run.stop_requested = True
+        run.status = "stopping"
+        run.status_message = "중지 요청됨"
+        return True
+
 
 class _FakeAction:
     def __init__(self, action_id, values):
@@ -225,6 +236,8 @@ class _FakeAction:
 
 class _FakeActionModel:
     items = []
+    create_entered = None
+    create_release = None
 
     @classmethod
     def create(cls, **values):
@@ -232,6 +245,10 @@ class _FakeActionModel:
         values.setdefault("message", "")
         item = _FakeAction(len(cls.items) + 1, values)
         cls.items.append(item)
+        if cls.create_entered is not None:
+            cls.create_entered.set()
+            if not cls.create_release.wait(5):
+                raise RuntimeError("action-create test gate timed out")
         return item
 
 
@@ -274,12 +291,20 @@ class _Adapter:
         media_exists=False,
         sidecars=None,
         post_delete_group=None,
+        pre_delete_entered=None,
+        pre_delete_release=None,
+        delete_entered=None,
+        delete_release=None,
     ):
         self.group = group
         self.delete_error = delete_error
         self.exists_after_delete = media_exists
         self.sidecars = sidecars or {}
         self.post_delete_group = post_delete_group
+        self.pre_delete_entered = pre_delete_entered
+        self.pre_delete_release = pre_delete_release
+        self.delete_entered = delete_entered
+        self.delete_release = delete_release
         self.delete_calls = []
         self.sidecar_delete_calls = []
         self.get_calls = 0
@@ -309,6 +334,10 @@ class _Adapter:
     def get_group(self, rating_key):
         self.get_calls += 1
         self.rating_key = rating_key
+        if self.get_calls == 1 and self.pre_delete_entered is not None:
+            self.pre_delete_entered.set()
+            if not self.pre_delete_release.wait(5):
+                raise RuntimeError("pre-delete test gate timed out")
         if self.delete_calls:
             if self.post_delete_group is not None:
                 return self.post_delete_group
@@ -331,6 +360,10 @@ class _Adapter:
 
     def delete_media(self, rating_key, media_id):
         self.delete_calls.append((rating_key, media_id))
+        if self.delete_entered is not None:
+            self.delete_entered.set()
+            if not self.delete_release.wait(5):
+                raise RuntimeError("delete test gate timed out")
         if self.delete_error is not None:
             raise self.delete_error
         return types.SimpleNamespace(status_code=200)
@@ -354,6 +387,8 @@ class ModuleContractTests(unittest.TestCase):
         if hasattr(self.p, "logic"):
             delattr(self.p, "logic")
         _FakeActionModel.items = []
+        _FakeActionModel.create_entered = None
+        _FakeActionModel.create_release = None
 
     def _run_worker(self, mode, adapter):
         run = _FakeRun(mode)
@@ -632,6 +667,187 @@ class ModuleContractTests(unittest.TestCase):
         self.assertEqual(run.would_delete_bytes, 4096)
         self.assertEqual(run.status, "completed")
         self.assertFalse(module.status_payload()["running"])
+        self.assertEqual(module.status_payload()["status"], "completed")
+
+    def test_stop_response_immediately_exposes_stopping_status(self):
+        run = _FakeRun("live")
+        run.status = "running"
+        _FakeRunModel.current = run
+        module = self.cleanup.ModuleCleanup(self.p)
+        module.worker_thread = types.SimpleNamespace(is_alive=lambda: True)
+        module.current_run_id = run.id
+        module._status.update({"running": True, "status": "running"})
+
+        with mock.patch.object(self.cleanup, "ModelCleanupRun", _FakeRunModel):
+            response = module._stop()
+
+        self.assertEqual(response["ret"], "success")
+        self.assertEqual(response["data"]["status"], "stopping")
+        self.assertTrue(response["data"]["running"])
+        self.assertTrue(response["data"]["stop_requested"])
+        self.assertEqual(run.status, "stopping")
+        self.assertTrue(run.stop_requested)
+
+    def test_stop_during_pre_delete_read_prevents_delete_and_sidecar_unlink(self):
+        keep = _candidate("1", "/missing/keep.mkv", 100, 10)
+        duplicate = _candidate("2", "/missing/delete.mkv", 4096, 5)
+        entered = threading.Event()
+        release = threading.Event()
+        adapter = _Adapter(
+            _group(keep, duplicate),
+            sidecars={"2": ("/missing/delete.srt",)},
+            pre_delete_entered=entered,
+            pre_delete_release=release,
+        )
+        run = _FakeRun("live")
+        _FakeRunModel.current = run
+        module = self.cleanup.ModuleCleanup(self.p)
+        module.adapter_factory = lambda config: adapter
+        worker = threading.Thread(
+            target=module._worker,
+            args=(run.id, "live", {"library_ids": ["1"]}),
+        )
+        module.worker_thread = worker
+        module.current_run_id = run.id
+
+        with mock.patch.object(self.cleanup, "ModelCleanupRun", _FakeRunModel), mock.patch.object(
+            self.cleanup, "ModelCleanupAction", _FakeActionModel
+        ):
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2), "worker did not enter pre-delete read")
+                response = module._stop()
+                self.assertEqual(response["ret"], "success")
+            finally:
+                release.set()
+                worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(adapter.delete_calls, [])
+        self.assertEqual(adapter.sidecar_delete_calls, [])
+        self.assertEqual(_FakeActionModel.items, [])
+        self.assertEqual(run.processed_groups, 0)
+        self.assertEqual(run.status, "stopped")
+        self.assertTrue(run.stop_requested)
+        self.assertEqual(module.status_payload()["status"], "stopped")
+        self.assertFalse(module.status_payload()["running"])
+
+    def test_stop_during_delete_action_commit_prevents_plex_delete(self):
+        keep = _candidate("1", "/missing/keep.mkv", 100, 10)
+        duplicate = _candidate("2", "/missing/delete.mkv", 4096, 5)
+        entered = threading.Event()
+        release = threading.Event()
+        _FakeActionModel.create_entered = entered
+        _FakeActionModel.create_release = release
+        adapter = _Adapter(
+            _group(keep, duplicate),
+            sidecars={"2": ("/missing/delete.srt",)},
+        )
+        run = _FakeRun("live")
+        _FakeRunModel.current = run
+        module = self.cleanup.ModuleCleanup(self.p)
+        module.adapter_factory = lambda config: adapter
+        worker = threading.Thread(
+            target=module._worker,
+            args=(run.id, "live", {"library_ids": ["1"]}),
+        )
+        module.worker_thread = worker
+        module.current_run_id = run.id
+
+        with mock.patch.object(self.cleanup, "ModelCleanupRun", _FakeRunModel), mock.patch.object(
+            self.cleanup, "ModelCleanupAction", _FakeActionModel
+        ):
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2), "worker did not persist delete action")
+                response = module._stop()
+                self.assertEqual(response["ret"], "success")
+            finally:
+                release.set()
+                worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(adapter.delete_calls, [])
+        self.assertEqual(adapter.sidecar_delete_calls, [])
+        self.assertEqual(len(_FakeActionModel.items), 1)
+        self.assertEqual(_FakeActionModel.items[0].status, "skipped")
+        self.assertEqual(
+            _FakeActionModel.items[0].message,
+            "stop_requested_before_delete",
+        )
+        self.assertEqual(run.deleted_count, 0)
+        self.assertEqual(run.processed_groups, 0)
+        self.assertEqual(run.status, "stopped")
+
+    def test_stop_during_delete_finishes_current_cleanup_then_stops(self):
+        keep = _candidate("1", "/missing/keep.mkv", 100, 30)
+        first = _candidate("2", "/missing/delete-one.mkv", 200, 20)
+        second = _candidate("3", "/missing/delete-two.mkv", 300, 10)
+        entered = threading.Event()
+        release = threading.Event()
+        adapter = _Adapter(
+            _group(keep, first, second),
+            sidecars={
+                "2": ("/missing/delete-one.srt",),
+                "3": ("/missing/delete-two.srt",),
+            },
+            delete_entered=entered,
+            delete_release=release,
+        )
+        run = _FakeRun("live")
+        _FakeRunModel.current = run
+        module = self.cleanup.ModuleCleanup(self.p)
+        module.adapter_factory = lambda config: adapter
+        worker = threading.Thread(
+            target=module._worker,
+            args=(run.id, "live", {"library_ids": ["1"]}),
+        )
+        module.worker_thread = worker
+        module.current_run_id = run.id
+
+        with mock.patch.object(self.cleanup, "ModelCleanupRun", _FakeRunModel), mock.patch.object(
+            self.cleanup, "ModelCleanupAction", _FakeActionModel
+        ):
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2), "worker did not enter Plex DELETE")
+                response = module._stop()
+                self.assertEqual(response["ret"], "success")
+            finally:
+                release.set()
+                worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(adapter.delete_calls, [("42", "2")])
+        self.assertEqual(adapter.get_calls, 2)
+        self.assertEqual(
+            adapter.sidecar_delete_calls,
+            [("/missing/delete-one.srt",)],
+        )
+        self.assertEqual(len(_FakeActionModel.items), 1)
+        self.assertEqual(_FakeActionModel.items[0].status, "deleted")
+        self.assertEqual(run.deleted_count, 1)
+        self.assertEqual(run.processed_groups, 0)
+        self.assertEqual(run.status, "stopped")
+
+    def test_terminal_status_is_not_reported_running_or_changed_by_late_stop(self):
+        run = _FakeRun("live")
+        run.status = "completed"
+        _FakeRunModel.current = run
+        module = self.cleanup.ModuleCleanup(self.p)
+        module.worker_thread = types.SimpleNamespace(is_alive=lambda: True)
+        module.current_run_id = run.id
+        module._status.update(
+            {"running": False, "status": "completed", "message": "완료"}
+        )
+
+        with mock.patch.object(self.cleanup, "ModelCleanupRun", _FakeRunModel):
+            response = module._stop()
+
+        self.assertEqual(response["ret"], "warning")
+        self.assertEqual(run.status, "completed")
+        self.assertFalse(module.stop_event.is_set())
+        self.assertFalse(module.status_payload()["running"])
 
     def test_delete_transport_error_reconciles_once_without_retry(self):
         keep = _candidate("1", "/missing/keep.mkv", 100, 10)
@@ -725,6 +941,7 @@ class ModuleContractTests(unittest.TestCase):
         status = module.process_command("status", "", "", "", None)["data"]
         for key in (
             "running",
+            "status",
             "mode",
             "stop_requested",
             "started_at",

@@ -125,6 +125,30 @@ class ModelCleanupRun(ModelBase):
         )
 
     @classmethod
+    def request_stop(cls, run_id: Any) -> bool:
+        """Atomically mark an active run as stopping.
+
+        The status predicate prevents a late stop request from overwriting a
+        terminal status committed by the worker at the same time.
+        """
+
+        count = (
+            db.session.query(cls)
+            .filter(cls.id == int(run_id))
+            .filter(cls.status.in_(ACTIVE_RUN_STATUSES))
+            .update(
+                {
+                    cls.stop_requested: True,
+                    cls.status: "stopping",
+                    cls.status_message: "중지 요청됨",
+                },
+                synchronize_session=False,
+            )
+        )
+        db.session.commit()
+        return bool(count)
+
+    @classmethod
     def latest(cls) -> Optional["ModelCleanupRun"]:
         return db.session.query(cls).order_by(cls.id.desc()).first()
 

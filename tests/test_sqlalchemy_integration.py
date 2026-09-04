@@ -103,6 +103,32 @@ class SqlAlchemyIntegrationTests(unittest.TestCase):
                 },
             )
 
+    def test_stop_request_only_updates_an_active_run(self):
+        with self.app.app_context():
+            self.db.create_all()
+            run = self.models.ModelCleanupRun.create(
+                "live", {"library_ids": ["1"]}
+            )
+            run.status = "running"
+            run.status_message = "실행 중"
+            self.db.session.commit()
+
+            self.assertTrue(self.models.ModelCleanupRun.request_stop(run.id))
+            self.db.session.expire_all()
+            stopping = self.models.ModelCleanupRun.get(run.id)
+            self.assertEqual(stopping.status, "stopping")
+            self.assertTrue(stopping.stop_requested)
+
+            stopping.status = "stopped"
+            stopping.status_message = "사용자 요청으로 중지됨"
+            self.db.session.commit()
+
+            self.assertFalse(self.models.ModelCleanupRun.request_stop(run.id))
+            self.db.session.expire_all()
+            terminal = self.models.ModelCleanupRun.get(run.id)
+            self.assertEqual(terminal.status, "stopped")
+            self.assertEqual(terminal.status_message, "사용자 요청으로 중지됨")
+
 
 if __name__ == "__main__":
     unittest.main()
